@@ -77,6 +77,7 @@ deadpool-redis = "0.14"
 
 # System calls (for local backend)
 nix = { version = "0.28", features = ["fs", "user"] }
+libc = "0.2"
 
 # Testing
 tempfile = "3.10"

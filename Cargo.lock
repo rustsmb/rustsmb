@@ -1540,6 +1540,7 @@ name = "rustsmb-backend-local"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "libc",
  "nix",
  "rustsmb-core",
  "rustsmb-vfs",

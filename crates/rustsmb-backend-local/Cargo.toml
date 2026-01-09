@@ -9,9 +9,10 @@ description = "Local filesystem backend for RustSMB"
 [dependencies]
 rustsmb-core = { workspace = true }
 rustsmb-vfs = { workspace = true }
-tokio = { workspace = true, features = ["fs", "sync"] }
+tokio = { workspace = true, features = ["fs", "sync", "io-util", "rt"] }
 futures = { workspace = true }
 nix = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
