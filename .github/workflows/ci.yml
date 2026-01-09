@@ -64,6 +64,33 @@ jobs:
       - name: Run smbclient integration tests
         run: cargo test --test integration_smbclient -- --ignored
 
+  ha-test:
+    name: HA Integration Tests (Redis)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install smbclient
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y smbclient
+      - name: Run HA integration tests with Redis
+        env:
+          RUSTSMB_REDIS_URL: redis://127.0.0.1:6379
+          RUSTSMB_HA_TEST_BACKEND: redis
+        run: cargo test --test integration_ha -- --ignored
+
   # Build Linux server binary for Windows integration tests
   build-linux-server:
     name: Build Linux Server

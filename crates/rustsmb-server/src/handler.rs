@@ -377,6 +377,11 @@ where
         let request = SessionSetupRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse session_setup: {}", e)))?;
 
+        // Check for session binding request (HA failover)
+        if request.flags.is_binding() {
+            return self.handle_session_binding(header, &request).await;
+        }
+
         // Parse security buffer from after the fixed structure
         let sec_offset = request.security_buffer_offset as usize;
         let sec_len = request.security_buffer_length as usize;
@@ -489,6 +494,96 @@ where
                 Err(HandlerError::Status(NtStatus::LogonFailure))
             }
         }
+    }
+
+    /// Handle session binding for HA failover.
+    ///
+    /// When a client reconnects to a different server after failover, it sends
+    /// SESSION_SETUP with the SESSION_BINDING flag to bind to an existing session.
+    /// The server looks up the session in the shared StateStore.
+    async fn handle_session_binding(
+        &mut self,
+        header: &Smb2Header,
+        request: &rustsmb_protocol::session_setup::SessionSetupRequest,
+    ) -> Result<Vec<u8>, HandlerError> {
+        use rustsmb_protocol::session_setup::{SessionFlags, SessionSetupResponse};
+
+        let previous_session_id = request.previous_session_id;
+
+        debug!(
+            conn_id = self.connection.id,
+            previous_session_id, "SESSION_SETUP binding request (HA failover)"
+        );
+
+        // Look up existing session in StateStore
+        let session = self
+            .session_manager
+            .get_session(previous_session_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or_else(|| {
+                warn!(
+                    conn_id = self.connection.id,
+                    previous_session_id, "Session binding failed: session not found"
+                );
+                HandlerError::Status(NtStatus::UserSessionDeleted)
+            })?;
+
+        // Verify session hasn't expired
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if now > session.expires_at {
+            warn!(
+                conn_id = self.connection.id,
+                previous_session_id,
+                expires_at = session.expires_at,
+                now,
+                "Session binding failed: session expired"
+            );
+            return Err(HandlerError::Status(NtStatus::UserSessionDeleted));
+        }
+
+        // Bind session to this connection
+        self.connection.add_session(previous_session_id);
+
+        // Restore negotiated dialect from session
+        if self.connection.dialect.is_none() {
+            self.connection.negotiate(session.dialect);
+        }
+
+        info!(
+            conn_id = self.connection.id,
+            session_id = previous_session_id,
+            user = %session.user_id,
+            "Session bound (HA failover)"
+        );
+
+        // Refresh session TTL
+        let _ = self
+            .session_manager
+            .refresh_session(previous_session_id)
+            .await;
+
+        // Build success response
+        let mut resp_header = self.build_response_header(header, NtStatus::Success);
+        resp_header.session_id = previous_session_id;
+
+        let mut session_flags = 0u16;
+        if session.is_guest {
+            session_flags |= SessionFlags::IS_GUEST;
+        }
+
+        let response = SessionSetupResponse {
+            structure_size: 9,
+            session_flags: SessionFlags::new(session_flags),
+            security_buffer_offset: 72,
+            security_buffer_length: 0,
+        };
+
+        self.serialize_response(&resp_header, &response)
     }
 
     async fn handle_logoff(

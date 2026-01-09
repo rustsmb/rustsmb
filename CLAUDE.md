@@ -13,6 +13,7 @@ All project documentation is maintained in the `docs/` directory:
 | [CLAUDE.md](./CLAUDE.md) | Project guidelines, coding conventions, and quick reference (this file) |
 | [docs/architecture.md](./docs/architecture.md) | Detailed system architecture, core traits, data flow, and design decisions |
 | [docs/ksmbd-research.md](./docs/ksmbd-research.md) | Linux kernel ksmbd research notes and lessons learned |
+| [docs/ha-design.md](./docs/ha-design.md) | High availability design, session binding, Redis state store |
 
 ### Documentation Update Policy
 
@@ -423,7 +424,7 @@ Do not commit code that fails any of these checks.
 - [x] rustsmb-state-redis: Atomic ID generation (INCR)
 - [x] rustsmb-state-redis: 6 integration tests (require Redis)
 
-### Phase 9: Testing & Hardening - IN PROGRESS
+### Phase 9: Testing & Hardening - COMPLETED
 - [x] Integration tests with smbclient (16 tests - requires smbclient installed)
 - [x] Integration tests with Windows client (10 tests - requires Windows with admin privileges)
 - [x] Fuzz testing infrastructure (cargo-fuzz targets for headers and commands)
@@ -432,3 +433,11 @@ Do not commit code that fails any of these checks.
 - [x] Security tests (path traversal prevention, input validation - 25 tests)
 - [x] Performance benchmarks (protocol parsing, throughput)
 - [ ] Documentation (rustdoc, examples, deployment guide)
+
+### Phase 10: High Availability - COMPLETED
+- [x] docs/ha-design.md: HA design document (architecture, session binding, Redis)
+- [x] Session binding support in server (SESSION_SETUP with SESSION_BINDING flag)
+- [x] NT_STATUS UserSessionDeleted code for binding failures
+- [x] Custom SMB2 test client (tests/ha_client.rs) for session binding tests
+- [x] HA integration tests (tests/integration_ha.rs) with Redis state store
+- [x] CI workflow for HA tests with Redis service container
