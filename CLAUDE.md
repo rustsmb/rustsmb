@@ -15,6 +15,7 @@ All project documentation is maintained in the `docs/` directory:
 | [docs/ksmbd-research.md](./docs/ksmbd-research.md) | Linux kernel ksmbd research notes and lessons learned |
 | [docs/ha-design.md](./docs/ha-design.md) | High availability design, session binding, Redis state store |
 | [docs/persistent-handles-leases.md](./docs/persistent-handles-leases.md) | Persistent handles and leases for enterprise HA |
+| [docs/state-store-design.md](./docs/state-store-design.md) | Hyperscale state store with embedded Raft and local caching |
 
 ### Documentation Update Policy
 
@@ -55,6 +56,8 @@ All project documentation is maintained in the `docs/` directory:
 | `rustsmb-state` | StateStore trait for HA support |
 | `rustsmb-state-memory` | In-memory state store (dev/testing) |
 | `rustsmb-state-redis` | Redis state store (production) |
+| `rustsmb-state-cached` | Cached state store with LRU + epoch invalidation (Phase 12) |
+| `rustsmb-coord-raft` | Embedded Raft coordination with openraft (Phase 12) |
 | `rustsmb-backend-local` | Local filesystem backend |
 | `rustsmb-backend-memory` | In-memory filesystem (testing) |
 | `rustsmb-session` | Session/connection management |
@@ -454,3 +457,15 @@ Do not commit code that fails any of these checks.
 - [x] Phase 11C: Persistent handles validation (SMB 3.0+ requirement)
 - [ ] Phase 11B (Advanced): Full LeaseManager state machine with conflict detection
 - [ ] Phase 11B (Advanced): Oplock break notifications to clients
+
+### Phase 12: Hyperscale State Store - PLANNED
+- [x] docs/state-store-design.md: Design document for hyperscale state store
+- [ ] Phase 12A: Extend rustsmb-state with CoordinationBackend trait
+- [ ] Phase 12A: Add bound_server_id to SessionState and HandleState
+- [ ] Phase 12B: Create rustsmb-state-cached crate (LocalCache with LRU + epoch)
+- [ ] Phase 12C: Create rustsmb-coord-raft crate (embedded Raft with openraft)
+- [ ] Phase 12C: Implement Raft state machine (epochs, leases, locks)
+- [ ] Phase 12C: Implement Raft network transport (TCP)
+- [ ] Phase 12D: Server failure detection and cache invalidation
+- [ ] Phase 12E: Lease/lock coordination through Raft
+- [ ] Phase 12F: Server integration and testing
