@@ -2,10 +2,18 @@
 //!
 //! This is the main entry point for the rustsmb server binary.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use rustsmb_auth::AnonymousAuthProvider;
+use rustsmb_backend_memory::MemoryBackend;
+use rustsmb_server::{ServerConfig, ShareConfig, SmbServer};
+use rustsmb_state_memory::MemoryStateStore;
+use rustsmb_vfs::StorageBackend;
 
 /// RustSMB Server - SMB2/SMB3 file server
 #[derive(Parser, Debug)]
@@ -19,6 +27,10 @@ struct Args {
     /// Listen address
     #[arg(short, long, default_value = "0.0.0.0:445")]
     listen: String,
+
+    /// Share path (directory to share)
+    #[arg(short, long, default_value = "/tmp/rustsmb")]
+    share_path: String,
 
     /// Enable debug logging
     #[arg(short, long)]
@@ -44,15 +56,47 @@ async fn main() -> Result<()> {
         .init();
 
     info!("RustSMB starting...");
-    info!("Config file: {}", args.config);
     info!("Listen address: {}", args.listen);
+    info!("Share path: {}", args.share_path);
 
-    // TODO: Load configuration
-    // TODO: Initialize state store
-    // TODO: Initialize storage backend
-    // TODO: Start server
+    // Initialize state store (in-memory for now)
+    let state: Arc<dyn rustsmb_state::StateStore + Send + Sync> = Arc::new(MemoryStateStore::new());
 
-    info!("Server implementation pending - Phase 2+");
+    // Initialize auth provider (anonymous/guest for simplicity)
+    let auth: Arc<dyn rustsmb_auth::AuthProvider> =
+        Arc::new(AnonymousAuthProvider::allow_both().with_guest_fallback());
+
+    // Create server config
+    let config = ServerConfig {
+        listen_addr: args.listen.parse()?,
+        require_signing: false,
+        enable_signing: false,
+        enable_encryption: false,
+        ..Default::default()
+    };
+
+    // Create server
+    let server = SmbServer::new(config, state, auth);
+
+    // Add a test share with memory backend
+    let share_config = ShareConfig {
+        name: "test".to_string(),
+        path: args.share_path.clone(),
+        read_only: false,
+        guest_ok: true,
+        valid_users: vec![],
+        browseable: true,
+    };
+
+    // Use memory backend for simplicity (LocalBackend requires Unix)
+    let backend: Arc<dyn StorageBackend + Send + Sync> = Arc::new(MemoryBackend::new());
+    server.shares().add_share("test", backend, share_config);
+
+    info!("Share 'test' configured");
+
+    // Run server
+    info!("Starting SMB server...");
+    server.run().await?;
 
     Ok(())
 }

@@ -97,8 +97,11 @@ description = "A Rust SMB2/SMB3 server with pluggable storage backends"
 [dependencies]
 rustsmb-server = { workspace = true }
 rustsmb-core = { workspace = true }
+rustsmb-auth = { workspace = true }
+rustsmb-state = { workspace = true }
 rustsmb-state-memory = { workspace = true }
-rustsmb-backend-local = { workspace = true }
+rustsmb-vfs = { workspace = true }
+rustsmb-backend-memory = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

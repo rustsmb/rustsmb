@@ -1,12 +1,17 @@
 //! Integration tests using Windows native SMB client tools.
 //!
 //! These tests require Windows with PowerShell and SMB client support.
-//! They start a RustSMB server and use PowerShell/net use to verify functionality.
+//! They use PowerShell/net use to verify SMB functionality.
 //!
 //! Run with: cargo test --test integration_windows -- --ignored
 //!
-//! Note: Windows `net use` doesn't support custom ports, so these tests
-//! bind to port 445 which requires administrator privileges.
+//! ## Test Modes
+//!
+//! - **Embedded mode** (default): Starts an in-process server on port 445.
+//!   Requires administrator privileges.
+//!
+//! - **External mode** (`RUSTSMB_TEST_MODE=external`): Connects to an external
+//!   server on localhost:445. Used in CI with WSL2 server + port forwarding.
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -20,6 +25,13 @@ use rustsmb_auth::AnonymousAuthProvider;
 use rustsmb_backend_memory::MemoryBackend;
 use rustsmb_server::{ServerConfig, ShareConfig, SmbServer};
 use rustsmb_state_memory::MemoryStateStore;
+
+/// Check if running in external server mode (server started separately).
+fn is_external_mode() -> bool {
+    std::env::var("RUSTSMB_TEST_MODE")
+        .map(|v| v == "external")
+        .unwrap_or(false)
+}
 
 /// Check if running on Windows.
 fn is_windows() -> bool {
@@ -56,11 +68,29 @@ struct TestServer {
 
 impl TestServer {
     /// Create a new test server with memory backend on port 445.
+    /// In external mode, assumes server is already running.
     async fn new() -> Option<Self> {
+        if is_external_mode() {
+            // External mode: server is already running (e.g., in WSL2)
+            return Some(Self::external(445));
+        }
+
+        // Embedded mode: start server locally
         if !can_bind_smb_port() {
             return None;
         }
         Some(Self::start(445).await)
+    }
+
+    /// Create a client-only test context for external server.
+    fn external(port: u16) -> Self {
+        let local_temp = TempDir::new().ok();
+        TestServer {
+            port,
+            shutdown_tx: None,
+            handle: None,
+            local_temp,
+        }
     }
 
     async fn start(port: u16) -> Self {
@@ -247,17 +277,17 @@ fn test_windows_detection() {
     let is_win = is_windows();
     let has_ps = has_powershell();
     let can_bind = can_bind_smb_port();
+    let external = is_external_mode();
 
     println!("Running on Windows: {}", is_win);
     println!("PowerShell available: {}", has_ps);
     println!("Can bind port 445: {}", can_bind);
+    println!("External server mode: {}", external);
+
+    let can_run = is_win && has_ps && (external || can_bind);
     println!(
         "Tests will {} if requirements not met",
-        if is_win && has_ps && can_bind {
-            "run"
-        } else {
-            "be skipped"
-        }
+        if can_run { "run" } else { "be skipped" }
     );
 }
 
