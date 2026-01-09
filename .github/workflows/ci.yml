@@ -78,17 +78,17 @@ jobs:
 
       - name: Install Ubuntu in WSL2
         run: |
-          wsl --install -d Ubuntu-22.04 --no-launch
-          wsl -d Ubuntu-22.04 -- echo "WSL2 Ubuntu ready"
+          wsl --install -d Ubuntu --no-launch
+          wsl -d Ubuntu -- echo "WSL2 Ubuntu ready"
 
       - name: Install Rust in WSL2
         run: |
-          wsl -d Ubuntu-22.04 -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
-          wsl -d Ubuntu-22.04 -- bash -c "source ~/.cargo/env && rustc --version"
+          wsl -d Ubuntu -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+          wsl -d Ubuntu -- bash -c "source ~/.cargo/env && rustc --version"
 
       - name: Build server in WSL2
         run: |
-          wsl -d Ubuntu-22.04 -- bash -c "
+          wsl -d Ubuntu -- bash -c "
             source ~/.cargo/env
             cd /mnt/c/Users/runneradmin/work/rustsmb/rustsmb
             cargo build --release --package rustsmb-server
@@ -98,11 +98,11 @@ jobs:
         shell: pwsh
         run: |
           # Get WSL2 IP address
-          $wslIp = (wsl -d Ubuntu-22.04 -- hostname -I).Trim().Split()[0]
+          $wslIp = (wsl -d Ubuntu -- hostname -I).Trim().Split()[0]
           echo "WSL2 IP: $wslIp"
 
           # Start server in background on port 445
-          Start-Process -NoNewWindow wsl -ArgumentList "-d", "Ubuntu-22.04", "--", "bash", "-c", @"
+          Start-Process -NoNewWindow wsl -ArgumentList "-d", "Ubuntu", "--", "bash", "-c", @"
             source ~/.cargo/env
             cd /mnt/c/Users/runneradmin/work/rustsmb/rustsmb
             RUST_LOG=info ./target/release/rustsmb --listen 0.0.0.0:445 2>&1 | tee /tmp/smb-server.log
@@ -129,7 +129,7 @@ jobs:
 
       - name: Show server logs on failure
         if: failure()
-        run: wsl -d Ubuntu-22.04 -- cat /tmp/smb-server.log
+        run: wsl -d Ubuntu -- cat /tmp/smb-server.log
 
   doc:
     name: Documentation
