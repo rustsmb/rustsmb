@@ -89,8 +89,9 @@ jobs:
       - name: Build server in WSL2
         shell: pwsh
         run: |
-          # Convert Windows path to WSL path
-          $wslPath = wsl -d Ubuntu -- wslpath -u '${{ github.workspace }}'
+          # Convert Windows path to WSL path (D:\a\repo\repo -> /mnt/d/a/repo/repo)
+          $winPath = '${{ github.workspace }}'
+          $wslPath = '/mnt/' + $winPath.Substring(0,1).ToLower() + $winPath.Substring(2).Replace('\', '/')
           echo "WSL workspace path: $wslPath"
           wsl -d Ubuntu -- bash -c "source `$HOME/.cargo/env && cd $wslPath && cargo build --release --package rustsmb-server"
 
@@ -98,7 +99,8 @@ jobs:
         shell: pwsh
         run: |
           # Convert Windows path to WSL path
-          $wslPath = wsl -d Ubuntu -- wslpath -u '${{ github.workspace }}'
+          $winPath = '${{ github.workspace }}'
+          $wslPath = '/mnt/' + $winPath.Substring(0,1).ToLower() + $winPath.Substring(2).Replace('\', '/')
 
           # Get WSL2 IP address
           $wslIp = (wsl -d Ubuntu -- hostname -I).Trim().Split()[0]
