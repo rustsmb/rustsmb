@@ -26,6 +26,8 @@ pub mod commands;
 pub mod crypto;
 pub mod dialect;
 pub mod header;
+#[cfg(test)]
+mod proptests;
 pub mod transform;
 
 // Re-export commonly used types

@@ -1,0 +1,58 @@
+[package]
+name = "rustsmb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.rustsmb-protocol]
+path = "../crates/rustsmb-protocol"
+
+[dependencies.binrw]
+version = "0.14"
+
+# Fuzz targets for SMB2 header parsing
+[[bin]]
+name = "fuzz_smb2_header"
+path = "fuzz_targets/fuzz_smb2_header.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzz targets for SMB2 commands
+[[bin]]
+name = "fuzz_negotiate"
+path = "fuzz_targets/fuzz_negotiate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_create"
+path = "fuzz_targets/fuzz_create.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_read_write"
+path = "fuzz_targets/fuzz_read_write.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_transform_header"
+path = "fuzz_targets/fuzz_transform_header.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

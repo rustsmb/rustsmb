@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["fuzz"]
 members = [
     "crates/rustsmb-core",
     "crates/rustsmb-protocol",
@@ -112,7 +113,13 @@ path = "src/main.rs"
 tempfile = { workspace = true }
 criterion = { workspace = true }
 rustsmb-protocol = { workspace = true }
+rustsmb-vfs = { workspace = true }
+rustsmb-state = { workspace = true }
+rustsmb-state-memory = { workspace = true }
+rustsmb-backend-local = { workspace = true }
+rustsmb-backend-memory = { workspace = true }
 binrw = { workspace = true }
+tokio = { workspace = true }
 
 [[bench]]
 name = "protocol"

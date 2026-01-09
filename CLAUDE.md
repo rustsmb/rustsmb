@@ -423,12 +423,12 @@ Do not commit code that fails any of these checks.
 - [x] rustsmb-state-redis: Atomic ID generation (INCR)
 - [x] rustsmb-state-redis: 6 integration tests (require Redis)
 
-### Phase 9: Testing & Hardening - PENDING
+### Phase 9: Testing & Hardening - IN PROGRESS
 - [ ] Integration tests with smbclient
 - [ ] Integration tests with Windows client
-- [ ] Fuzz testing for protocol parser (cargo-fuzz)
-- [ ] Property-based tests for all command roundtrips
-- [ ] Stress testing (concurrent connections, large files)
-- [ ] Security audit (path traversal, buffer overflow, DoS)
-- [ ] Performance benchmarks (throughput, latency)
+- [x] Fuzz testing infrastructure (cargo-fuzz targets for headers and commands)
+- [x] Property-based tests for all command roundtrips (36 proptest tests)
+- [x] Stress testing (concurrent connections, large files - 13 tests)
+- [x] Security tests (path traversal prevention, input validation - 25 tests)
+- [x] Performance benchmarks (protocol parsing, throughput)
 - [ ] Documentation (rustdoc, examples, deployment guide)

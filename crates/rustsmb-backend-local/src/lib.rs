@@ -126,7 +126,8 @@ impl LocalBackend {
     /// This function performs security validation to prevent directory traversal attacks.
     fn resolve_path(&self, path: &str) -> Result<PathBuf, VfsError> {
         // Normalize the path: remove leading slashes and handle . and ..
-        let normalized = Self::normalize_path(path);
+        // This also validates that the path doesn't escape the root
+        let normalized = Self::normalize_path(path)?;
 
         // Build the full path
         let full_path = if normalized.is_empty() {
@@ -189,23 +190,35 @@ impl LocalBackend {
     }
 
     /// Normalize a path by removing leading/trailing slashes and handling ".." and ".".
-    fn normalize_path(path: &str) -> String {
+    ///
+    /// Returns an error if the path would escape the root directory (too many ".." components).
+    fn normalize_path(path: &str) -> Result<String, VfsError> {
         let path = path.trim_matches('/');
         if path.is_empty() {
-            return String::new();
+            return Ok(String::new());
         }
 
+        let mut depth: i32 = 0;
         let mut components = Vec::new();
         for part in path.split('/') {
             match part {
                 "." | "" => continue,
                 ".." => {
+                    if depth <= 0 {
+                        return Err(VfsError::AccessDenied(
+                            "Path traversal outside root directory".to_string(),
+                        ));
+                    }
+                    depth -= 1;
                     components.pop();
                 }
-                _ => components.push(part),
+                _ => {
+                    depth += 1;
+                    components.push(part);
+                }
             }
         }
-        components.join("/")
+        Ok(components.join("/"))
     }
 
     /// Convert std::fs::Metadata to our Metadata type.
@@ -321,11 +334,15 @@ impl StorageBackend for LocalBackend {
 
                 let fd = file.as_raw_fd();
 
+                // Path was already validated in resolve_path, unwrap is safe here
+                let normalized_path =
+                    Self::normalize_path(path).unwrap_or_else(|_| path.to_string());
+
                 handles.insert(
                     handle.id,
                     OpenFile {
                         file,
-                        path: Self::normalize_path(path),
+                        path: normalized_path,
                         fd,
                         writable: false,
                     },
@@ -341,12 +358,15 @@ impl StorageBackend for LocalBackend {
             let fd = file.as_raw_fd();
             let handle = FileHandle::new();
 
+            // Path was already validated in resolve_path, unwrap is safe here
+            let normalized_path = Self::normalize_path(path).unwrap_or_else(|_| path.to_string());
+
             let mut handles = self.handles.write().await;
             handles.insert(
                 handle.id,
                 OpenFile {
                     file,
-                    path: Self::normalize_path(path),
+                    path: normalized_path,
                     fd,
                     writable: flags.is_write(),
                 },
