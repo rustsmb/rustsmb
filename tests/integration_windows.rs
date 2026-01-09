@@ -64,11 +64,13 @@ impl TestServer {
     }
 
     async fn start(port: u16) -> Self {
-        let mut config = ServerConfig::default();
-        config.listen_addr = format!("127.0.0.1:{}", port).parse().unwrap();
-        config.require_signing = false;
-        config.enable_signing = false;
-        config.enable_encryption = false;
+        let config = ServerConfig {
+            listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+            require_signing: false,
+            enable_signing: false,
+            enable_encryption: false,
+            ..Default::default()
+        };
 
         let state: Arc<dyn rustsmb_state::StateStore + Send + Sync> =
             Arc::new(MemoryStateStore::new());

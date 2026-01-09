@@ -5,6 +5,9 @@
 //!
 //! Run with: cargo test --test integration_smbclient -- --ignored
 //! Or: cargo test smbclient -- --ignored
+//!
+//! Note: This test only compiles on Unix (uses LocalBackend which requires Unix APIs).
+#![cfg(unix)]
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -64,11 +67,13 @@ impl TestServer {
     }
 
     async fn start(port: u16, temp_dir: Option<TempDir>) -> Self {
-        let mut config = ServerConfig::default();
-        config.listen_addr = format!("127.0.0.1:{}", port).parse().unwrap();
-        config.require_signing = false;
-        config.enable_signing = false;
-        config.enable_encryption = false;
+        let config = ServerConfig {
+            listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+            require_signing: false,
+            enable_signing: false,
+            enable_encryption: false,
+            ..Default::default()
+        };
 
         let state: Arc<dyn rustsmb_state::StateStore + Send + Sync> =
             Arc::new(MemoryStateStore::new());
