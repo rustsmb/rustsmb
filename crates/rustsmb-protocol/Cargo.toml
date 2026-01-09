@@ -12,5 +12,13 @@ binrw = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 
+# Cryptography for signing and encryption
+aes = "0.8"
+aes-gcm = { workspace = true }
+ccm = "0.5"
+cmac = "0.7"
+hmac = { workspace = true }
+rand = "0.9"
+
 [dev-dependencies]
 proptest = { workspace = true }

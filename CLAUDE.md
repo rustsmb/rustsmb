@@ -328,11 +328,20 @@ cargo bench
 - [x] rustsmb-state-memory: In-memory state store (full implementation)
 - [x] rustsmb-backend-memory: In-memory filesystem (full StorageBackend implementation with 9 tests)
 
-### Phase 3: Protocol Layer - PENDING
-- [ ] SMB2 header parsing with binrw
-- [ ] All 19 SMB2 commands
-- [ ] Dialect negotiation
-- [ ] Message signing/encryption
+### Phase 3: Protocol Layer - COMPLETED
+- [x] SMB2 header parsing with binrw (64-byte header)
+- [x] SMB2 transform header for encryption (52-byte header)
+- [x] All 19 SMB2 commands with request/response structures:
+  - NEGOTIATE, SESSION_SETUP, LOGOFF
+  - TREE_CONNECT, TREE_DISCONNECT
+  - CREATE, CLOSE, FLUSH, READ, WRITE
+  - LOCK, IOCTL, CANCEL, ECHO
+  - QUERY_DIRECTORY, CHANGE_NOTIFY, QUERY_INFO, SET_INFO
+  - OPLOCK_BREAK (with lease support)
+- [x] Dialect negotiation helpers (DialectNegotiator, context parsing)
+- [x] Message signing (AES-CMAC for SMB 3.0, AES-GMAC for SMB 3.1.1)
+- [x] Message encryption (AES-128-CCM, AES-128-GCM, AES-256-GCM)
+- [x] 100 unit tests passing
 
 ### Phase 4-6: Session, Auth, Server - PENDING
 ### Phase 7: Local Filesystem Backend - PENDING
