@@ -64,6 +64,16 @@ jobs:
       - name: Run smbclient integration tests
         run: cargo test --test integration_smbclient -- --ignored
 
+  integration-test-windows:
+    name: Integration Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Windows integration tests
+        run: cargo test --test integration_windows -- --ignored
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest

@@ -425,7 +425,7 @@ Do not commit code that fails any of these checks.
 
 ### Phase 9: Testing & Hardening - IN PROGRESS
 - [x] Integration tests with smbclient (16 tests - requires smbclient installed)
-- [ ] Integration tests with Windows client
+- [x] Integration tests with Windows client (10 tests - requires Windows with admin privileges)
 - [x] Fuzz testing infrastructure (cargo-fuzz targets for headers and commands)
 - [x] Property-based tests for all command roundtrips (36 proptest tests)
 - [x] Stress testing (concurrent connections, large files - 13 tests)
