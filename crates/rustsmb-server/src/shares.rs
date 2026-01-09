@@ -148,10 +148,10 @@ mod tests {
             Box::pin(async { Ok(0) })
         }
 
-        fn close<'a>(
-            &'a self,
+        fn close(
+            &self,
             _handle: rustsmb_vfs::FileHandle,
-        ) -> rustsmb_vfs::BoxFuture<'a, Result<(), rustsmb_core::VfsError>> {
+        ) -> rustsmb_vfs::BoxFuture<'_, Result<(), rustsmb_core::VfsError>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -325,9 +325,9 @@ mod tests {
             rustsmb_vfs::BackendCapabilities::default()
         }
 
-        fn statfs<'a>(
-            &'a self,
-        ) -> rustsmb_vfs::BoxFuture<'a, Result<rustsmb_vfs::FsStats, rustsmb_core::VfsError>>
+        fn statfs(
+            &self,
+        ) -> rustsmb_vfs::BoxFuture<'_, Result<rustsmb_vfs::FsStats, rustsmb_core::VfsError>>
         {
             Box::pin(async { Ok(rustsmb_vfs::FsStats::default()) })
         }
