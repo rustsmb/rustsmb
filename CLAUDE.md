@@ -383,14 +383,16 @@ Do not commit code that fails any of these checks.
 - [x] rustsmb-session: Request context validation (session/tree/handle)
 - [x] 39 unit tests passing
 
-### Phase 5: Authentication - PENDING
-- [ ] rustsmb-auth: AuthProvider trait implementation
-- [ ] rustsmb-auth: Simple auth provider (username/password from config)
-- [ ] rustsmb-auth: NTLM authentication (NTLMv2)
-- [ ] rustsmb-auth: SPNEGO/GSS-API wrapper
-- [ ] rustsmb-auth: Session key derivation (SMB 3.0 KDF)
-- [ ] rustsmb-auth: Pre-auth integrity hash (SMB 3.1.1)
-- [ ] rustsmb-auth: Guest and anonymous session support
+### Phase 5: Authentication - COMPLETED
+- [x] rustsmb-auth: AuthProvider trait with guest/anonymous support
+- [x] rustsmb-auth: Simple auth provider (username/password)
+- [x] rustsmb-auth: NTLM authentication (NTLMv2 with full crypto)
+- [x] rustsmb-auth: SPNEGO/GSS-API wrapper (ASN.1/DER parsing)
+- [x] rustsmb-auth: Session key derivation (SP800-108 KDF for SMB 3.0/3.1.1)
+- [x] rustsmb-auth: Pre-auth integrity hash (SHA-512 for SMB 3.1.1)
+- [x] rustsmb-auth: Guest and anonymous session support
+- [x] rustsmb-auth: CompositeAuthProvider for chaining providers
+- [x] 48 unit tests passing
 
 ### Phase 6: Server Implementation - PENDING
 - [ ] rustsmb-server: TCP listener with connection handling

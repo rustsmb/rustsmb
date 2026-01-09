@@ -33,15 +33,8 @@ impl SimpleAuthProvider {
 
     /// Add a user.
     pub fn add_user(&self, username: &str, password: &str, is_admin: bool) {
-        let user_info = UserInfo {
-            id: username.to_string(),
-            username: username.to_string(),
-            domain: None,
-            display_name: Some(username.to_string()),
-            is_admin,
-            is_guest: false,
-            groups: Vec::new(),
-        };
+        let mut user_info = UserInfo::authenticated(username, None);
+        user_info.is_admin = is_admin;
         let mut users = self.users.write().unwrap();
         users.insert(username.to_string(), (password.to_string(), user_info));
     }
@@ -80,14 +73,9 @@ impl AuthProvider for SimpleAuthProvider {
             if parts.len() != 2 {
                 // Check for guest
                 if self.allow_guest && (token_str.is_empty() || token_str == "guest") {
-                    context.state = AuthState::Complete;
+                    context.state = AuthState::Guest;
                     return Ok(AuthResult::Success {
-                        user: UserInfo {
-                            id: "guest".to_string(),
-                            username: "guest".to_string(),
-                            is_guest: true,
-                            ..Default::default()
-                        },
+                        user: UserInfo::guest(),
                         session_key: vec![0; 16],
                     });
                 }
@@ -144,6 +132,10 @@ impl AuthProvider for SimpleAuthProvider {
 
     fn supported_mechanisms(&self) -> Vec<AuthMechanism> {
         vec![AuthMechanism::Simple]
+    }
+
+    fn allows_guest(&self) -> bool {
+        self.allow_guest
     }
 }
 

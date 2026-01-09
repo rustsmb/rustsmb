@@ -12,10 +12,14 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+tracing = { workspace = true }
 
-# Cryptography for NTLM
+# Cryptography for NTLM and session keys
 hmac = { workspace = true }
 md-5 = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+hex-literal = "0.4"
