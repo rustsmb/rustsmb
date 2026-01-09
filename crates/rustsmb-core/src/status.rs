@@ -3,11 +3,12 @@
 use crate::error::VfsError;
 
 /// NT_STATUS codes as defined in MS-ERREF.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u32)]
 pub enum NtStatus {
     // Success codes
     /// The operation completed successfully.
+    #[default]
     Success = 0x00000000,
     /// The operation is pending.
     Pending = 0x00000103,
@@ -120,7 +121,7 @@ impl NtStatus {
     #[inline]
     pub fn is_warning(self) -> bool {
         let code = self as u32;
-        code >= 0x80000000 && code < 0xC0000000
+        (0x80000000..0xC0000000).contains(&code)
     }
 
     /// Create NtStatus from raw code.
@@ -200,12 +201,6 @@ impl From<VfsError> for NtStatus {
     }
 }
 
-impl Default for NtStatus {
-    fn default() -> Self {
-        Self::Success
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,14 +226,20 @@ mod tests {
     #[test]
     fn test_is_warning() {
         assert!(!NtStatus::Success.is_warning());
-        assert!(NtStatus::MoreProcessingRequired.is_warning());
+        // BufferOverflow (0x80000005) is in the warning range (0x80000000 - 0xBFFFFFFF)
+        assert!(NtStatus::BufferOverflow.is_warning());
+        // MoreProcessingRequired (0xC0000016) is actually an error, not a warning
+        assert!(!NtStatus::MoreProcessingRequired.is_warning());
         assert!(!NtStatus::AccessDenied.is_warning());
     }
 
     #[test]
     fn test_from_code() {
         assert_eq!(NtStatus::from_code(0x00000000), Some(NtStatus::Success));
-        assert_eq!(NtStatus::from_code(0xC0000022), Some(NtStatus::AccessDenied));
+        assert_eq!(
+            NtStatus::from_code(0xC0000022),
+            Some(NtStatus::AccessDenied)
+        );
         assert_eq!(NtStatus::from_code(0xDEADBEEF), None);
     }
 

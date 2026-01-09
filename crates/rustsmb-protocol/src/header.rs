@@ -3,7 +3,7 @@
 //! The SMB2 header is a 64-byte fixed structure that appears at the start
 //! of every SMB2 message.
 
-use binrw::{BinRead, BinWrite};
+use binrw::{binrw, BinRead, BinWrite};
 
 /// SMB2 protocol magic bytes (0xFE 'S' 'M' 'B').
 pub const SMB2_MAGIC: [u8; 4] = [0xFE, b'S', b'M', b'B'];
@@ -14,17 +14,11 @@ pub const SMB2_HEADER_SIZE: usize = 64;
 /// SMB2 packet header (64 bytes).
 ///
 /// See MS-SMB2 Section 2.2.1.
-#[derive(Debug, Clone, BinRead, BinWrite)]
-#[brw(little)]
+#[binrw]
+#[brw(little, magic = b"\xFESMB")]
+#[derive(Debug, Clone)]
 pub struct Smb2Header {
-    /// Protocol ID (must be 0xFE534D42 for SMB2).
-    #[brw(magic = b"\xFESMB")]
-    #[br(temp)]
-    #[bw(ignore)]
-    _protocol_id: (),
-
     /// Structure size (must be 64).
-    #[brw(assert(structure_size == 64))]
     pub structure_size: u16,
 
     /// Credit charge for this operation.

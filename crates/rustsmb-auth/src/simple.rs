@@ -3,9 +3,7 @@
 //! This provider uses a simple username/password map for authentication.
 //! Suitable for testing and simple deployments.
 
-use crate::{
-    AuthContext, AuthMechanism, AuthProvider, AuthResult, AuthState, BoxFuture, UserInfo,
-};
+use crate::{AuthContext, AuthMechanism, AuthProvider, AuthResult, AuthState, BoxFuture, UserInfo};
 use rustsmb_core::AuthError;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -75,7 +73,8 @@ impl AuthProvider for SimpleAuthProvider {
     ) -> BoxFuture<'a, Result<AuthResult, AuthError>> {
         Box::pin(async move {
             // Simple auth: token is "username:password"
-            let token_str = std::str::from_utf8(token).map_err(|_| AuthError::InvalidCredentials)?;
+            let token_str =
+                std::str::from_utf8(token).map_err(|_| AuthError::InvalidCredentials)?;
 
             let parts: Vec<&str> = token_str.splitn(2, ':').collect();
             if parts.len() != 2 {

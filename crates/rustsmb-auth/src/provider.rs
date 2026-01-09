@@ -73,17 +73,13 @@ pub enum AuthResult {
         session_key: Vec<u8>,
     },
     /// More data needed, send response token.
-    Continue {
-        response_token: Vec<u8>,
-    },
+    Continue { response_token: Vec<u8> },
     /// Authentication failed.
-    Failure {
-        reason: AuthError,
-    },
+    Failure { reason: AuthError },
 }
 
 /// User information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserInfo {
     /// User ID/SID.
     pub id: String,
@@ -99,20 +95,6 @@ pub struct UserInfo {
     pub is_guest: bool,
     /// Group memberships.
     pub groups: Vec<String>,
-}
-
-impl Default for UserInfo {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            username: String::new(),
-            domain: None,
-            display_name: None,
-            is_admin: false,
-            is_guest: false,
-            groups: Vec::new(),
-        }
-    }
 }
 
 /// Authentication mechanisms.

@@ -24,7 +24,7 @@ fn benchmark_header_write(c: &mut Criterion) {
     c.bench_function("smb2_header_write", |b| {
         b.iter(|| {
             let mut buf = Vec::with_capacity(SMB2_HEADER_SIZE);
-            binrw::BinWrite::write(&black_box(&header), &mut Cursor::new(&mut buf)).unwrap();
+            binrw::BinWrite::write_le(black_box(&header), &mut Cursor::new(&mut buf)).unwrap();
         })
     });
 }

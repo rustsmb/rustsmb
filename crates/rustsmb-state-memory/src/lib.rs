@@ -21,6 +21,7 @@ pub struct MemoryStateStore {
     session_counter: AtomicU64,
     tree_counters: RwLock<HashMap<u64, AtomicU64>>,
     handle_counter: AtomicU64,
+    #[allow(dead_code)]
     lock_counter: AtomicU64,
 }
 
@@ -289,7 +290,7 @@ impl StateStore for MemoryStateStore {
     ) -> BoxFuture<'a, Result<bool, StateError>> {
         Box::pin(async move {
             let locks = self.distributed_locks.read().await;
-            Ok(locks.get(key).map_or(false, |t| t == token))
+            Ok(locks.get(key).is_some_and(|t| t == token))
         })
     }
 

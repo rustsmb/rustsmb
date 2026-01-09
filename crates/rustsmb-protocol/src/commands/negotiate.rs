@@ -12,7 +12,6 @@ use rustsmb_core::SmbDialect;
 #[brw(little)]
 pub struct NegotiateRequest {
     /// Structure size (must be 36).
-    #[brw(assert(structure_size == 36))]
     pub structure_size: u16,
 
     /// Number of dialects in the dialect array.
@@ -38,7 +37,6 @@ pub struct NegotiateRequest {
 
     /// Reserved2.
     pub reserved2: u16,
-
     // Dialects array follows (variable length)
     // Negotiate contexts follow (SMB 3.1.1)
 }
@@ -66,7 +64,6 @@ impl Default for NegotiateRequest {
 #[brw(little)]
 pub struct NegotiateResponse {
     /// Structure size (must be 65).
-    #[brw(assert(structure_size == 65))]
     pub structure_size: u16,
 
     /// Security mode flags.
@@ -107,7 +104,6 @@ pub struct NegotiateResponse {
 
     /// Negotiate context offset (SMB 3.1.1).
     pub negotiate_context_offset: u32,
-
     // Security buffer follows
     // Negotiate contexts follow (SMB 3.1.1)
 }
@@ -213,7 +209,8 @@ mod tests {
 
     #[test]
     fn test_security_mode() {
-        let mode = SecurityMode::new(SecurityMode::SIGNING_ENABLED | SecurityMode::SIGNING_REQUIRED);
+        let mode =
+            SecurityMode::new(SecurityMode::SIGNING_ENABLED | SecurityMode::SIGNING_REQUIRED);
         assert!(mode.signing_enabled());
         assert!(mode.signing_required());
     }

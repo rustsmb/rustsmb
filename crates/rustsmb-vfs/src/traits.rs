@@ -4,7 +4,7 @@ use crate::types::*;
 use rustsmb_core::VfsError;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 /// Type alias for boxed async results (object-safe async trait pattern).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -123,8 +123,11 @@ pub trait StorageBackend: Send + Sync + 'static {
     fn link<'a>(&'a self, src: &'a str, dst: &'a str) -> BoxFuture<'a, Result<(), VfsError>>;
 
     /// Create a symbolic link.
-    fn symlink<'a>(&'a self, target: &'a str, linkpath: &'a str)
-        -> BoxFuture<'a, Result<(), VfsError>>;
+    fn symlink<'a>(
+        &'a self,
+        target: &'a str,
+        linkpath: &'a str,
+    ) -> BoxFuture<'a, Result<(), VfsError>>;
 
     /// Read the target of a symbolic link.
     fn readlink<'a>(&'a self, path: &'a str) -> BoxFuture<'a, Result<String, VfsError>>;

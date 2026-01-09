@@ -72,9 +72,10 @@ impl Connection {
 }
 
 /// Connection state machine states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
     /// Initial state, awaiting NEGOTIATE.
+    #[default]
     AwaitingNegotiate,
     /// Negotiate complete, awaiting SESSION_SETUP.
     Negotiated,
@@ -82,12 +83,6 @@ pub enum ConnectionState {
     SessionActive,
     /// Connection being torn down.
     Disconnecting,
-}
-
-impl Default for ConnectionState {
-    fn default() -> Self {
-        Self::AwaitingNegotiate
-    }
 }
 
 #[cfg(test)]

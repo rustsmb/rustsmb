@@ -13,10 +13,12 @@ use tokio::sync::RwLock;
 
 /// In-memory filesystem backend.
 pub struct MemoryBackend {
+    #[allow(dead_code)]
     root: Arc<RwLock<MemoryNode>>,
 }
 
 /// A node in the in-memory filesystem.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum MemoryNode {
     File {

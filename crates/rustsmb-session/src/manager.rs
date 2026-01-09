@@ -1,10 +1,8 @@
 //! Stateless session manager.
 
-use crate::Connection;
 use rustsmb_core::{SessionError, StateError};
 use rustsmb_state::{DynStateStore, HandleState, SessionState, TreeState};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -36,10 +34,10 @@ pub struct SessionManagerConfig {
 impl Default for SessionManagerConfig {
     fn default() -> Self {
         Self {
-            session_timeout: Duration::from_secs(3600),      // 1 hour
-            idle_timeout: Duration::from_secs(300),          // 5 minutes
+            session_timeout: Duration::from_secs(3600), // 1 hour
+            idle_timeout: Duration::from_secs(300),     // 5 minutes
             max_sessions: 10000,
-            refresh_interval: Duration::from_secs(60),       // 1 minute
+            refresh_interval: Duration::from_secs(60), // 1 minute
         }
     }
 }
@@ -70,10 +68,7 @@ impl SessionManager {
     }
 
     /// Create a new session.
-    pub async fn create_session(
-        &self,
-        session: SessionState,
-    ) -> Result<SessionState, StateError> {
+    pub async fn create_session(&self, session: SessionState) -> Result<SessionState, StateError> {
         debug!("Creating session: {}", session.session_id);
         self.state_store.create_session(&session).await?;
         Ok(session)
@@ -177,10 +172,7 @@ impl SessionManager {
 
     /// Create a file handle.
     pub async fn create_handle(&self, handle: HandleState) -> Result<HandleState, StateError> {
-        debug!(
-            "Creating handle: persistent_id={}",
-            handle.persistent_id
-        );
+        debug!("Creating handle: persistent_id={}", handle.persistent_id);
         self.state_store.create_handle(&handle).await?;
         Ok(handle)
     }

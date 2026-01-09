@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
 /// SMB dialect versions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[repr(u16)]
 pub enum SmbDialect {
     /// SMB 2.0.2
@@ -16,6 +18,7 @@ pub enum SmbDialect {
     /// SMB 3.0.2
     Smb302 = 0x0302,
     /// SMB 3.1.1
+    #[default]
     Smb311 = 0x0311,
 }
 
@@ -60,12 +63,6 @@ impl SmbDialect {
     #[inline]
     pub fn requires_preauth_integrity(self) -> bool {
         self >= Self::Smb311
-    }
-}
-
-impl Default for SmbDialect {
-    fn default() -> Self {
-        Self::Smb311
     }
 }
 
@@ -208,7 +205,7 @@ impl ShareAccess {
 }
 
 /// Create disposition values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u32)]
 pub enum CreateDisposition {
     /// If the file exists, supersede it. If not, create it.
@@ -218,17 +215,12 @@ pub enum CreateDisposition {
     /// If the file exists, fail. If not, create it.
     Create = 2,
     /// If the file exists, open it. If not, create it.
+    #[default]
     OpenIf = 3,
     /// If the file exists, open and truncate it. If not, fail.
     Overwrite = 4,
     /// If the file exists, open and truncate it. If not, create it.
     OverwriteIf = 5,
-}
-
-impl Default for CreateDisposition {
-    fn default() -> Self {
-        Self::OpenIf
-    }
 }
 
 /// Result action for create operations.
