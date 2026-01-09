@@ -1299,12 +1299,18 @@ where
     {
         let mut buf = Vec::with_capacity(256);
 
+        // Serialize header to a temp buffer first
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
         header
-            .write(&mut Cursor::new(&mut buf))
+            .write(&mut Cursor::new(&mut header_buf))
             .map_err(|e| HandlerError::Protocol(format!("Failed to write header: {}", e)))?;
+        buf.extend_from_slice(&header_buf);
 
-        body.write(&mut Cursor::new(&mut buf))
+        // Serialize body to a temp buffer and append
+        let mut body_buf = Vec::with_capacity(128);
+        body.write(&mut Cursor::new(&mut body_buf))
             .map_err(|e| HandlerError::Protocol(format!("Failed to write body: {}", e)))?;
+        buf.extend_from_slice(&body_buf);
 
         Ok(buf)
     }
