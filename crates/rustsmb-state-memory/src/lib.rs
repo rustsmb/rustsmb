@@ -65,10 +65,10 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn get_session<'a>(
-        &'a self,
+    fn get_session(
+        &self,
         session_id: u64,
-    ) -> BoxFuture<'a, Result<Option<SessionState>, StateError>> {
+    ) -> BoxFuture<'_, Result<Option<SessionState>, StateError>> {
         Box::pin(async move {
             let sessions = self.sessions.read().await;
             Ok(sessions.get(&session_id).cloned())
@@ -86,7 +86,7 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn delete_session<'a>(&'a self, session_id: u64) -> BoxFuture<'a, Result<(), StateError>> {
+    fn delete_session(&self, session_id: u64) -> BoxFuture<'_, Result<(), StateError>> {
         Box::pin(async move {
             let mut sessions = self.sessions.write().await;
             sessions.remove(&session_id);
@@ -94,11 +94,11 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn refresh_session<'a>(
-        &'a self,
+    fn refresh_session(
+        &self,
         session_id: u64,
         ttl: Duration,
-    ) -> BoxFuture<'a, Result<(), StateError>> {
+    ) -> BoxFuture<'_, Result<(), StateError>> {
         Box::pin(async move {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&session_id) {
@@ -136,21 +136,21 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn get_tree<'a>(
-        &'a self,
+    fn get_tree(
+        &self,
         session_id: u64,
         tree_id: u32,
-    ) -> BoxFuture<'a, Result<Option<TreeState>, StateError>> {
+    ) -> BoxFuture<'_, Result<Option<TreeState>, StateError>> {
         Box::pin(async move {
             let trees = self.trees.read().await;
             Ok(trees.get(&(session_id, tree_id)).cloned())
         })
     }
 
-    fn get_trees_by_session<'a>(
-        &'a self,
+    fn get_trees_by_session(
+        &self,
         session_id: u64,
-    ) -> BoxFuture<'a, Result<Vec<TreeState>, StateError>> {
+    ) -> BoxFuture<'_, Result<Vec<TreeState>, StateError>> {
         Box::pin(async move {
             let trees = self.trees.read().await;
             let result: Vec<TreeState> = trees
@@ -162,11 +162,7 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn delete_tree<'a>(
-        &'a self,
-        session_id: u64,
-        tree_id: u32,
-    ) -> BoxFuture<'a, Result<(), StateError>> {
+    fn delete_tree(&self, session_id: u64, tree_id: u32) -> BoxFuture<'_, Result<(), StateError>> {
         Box::pin(async move {
             let mut trees = self.trees.write().await;
             trees.remove(&(session_id, tree_id));
@@ -185,20 +181,20 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn get_handle<'a>(
-        &'a self,
+    fn get_handle(
+        &self,
         persistent_id: u128,
-    ) -> BoxFuture<'a, Result<Option<HandleState>, StateError>> {
+    ) -> BoxFuture<'_, Result<Option<HandleState>, StateError>> {
         Box::pin(async move {
             let handles = self.handles.read().await;
             Ok(handles.get(&persistent_id).cloned())
         })
     }
 
-    fn get_handles_by_session<'a>(
-        &'a self,
+    fn get_handles_by_session(
+        &self,
         session_id: u64,
-    ) -> BoxFuture<'a, Result<Vec<HandleState>, StateError>> {
+    ) -> BoxFuture<'_, Result<Vec<HandleState>, StateError>> {
         Box::pin(async move {
             let handles = self.handles.read().await;
             let result: Vec<HandleState> = handles
@@ -210,7 +206,7 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn delete_handle<'a>(&'a self, persistent_id: u128) -> BoxFuture<'a, Result<(), StateError>> {
+    fn delete_handle(&self, persistent_id: u128) -> BoxFuture<'_, Result<(), StateError>> {
         Box::pin(async move {
             let mut handles = self.handles.write().await;
             handles.remove(&persistent_id);
@@ -226,10 +222,7 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn get_locks<'a>(
-        &'a self,
-        persistent_id: u128,
-    ) -> BoxFuture<'a, Result<Vec<LockState>, StateError>> {
+    fn get_locks(&self, persistent_id: u128) -> BoxFuture<'_, Result<Vec<LockState>, StateError>> {
         Box::pin(async move {
             let locks = self.locks.read().await;
             let result: Vec<LockState> = locks
@@ -241,7 +234,7 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn delete_lock<'a>(&'a self, lock_id: u64) -> BoxFuture<'a, Result<(), StateError>> {
+    fn delete_lock(&self, lock_id: u64) -> BoxFuture<'_, Result<(), StateError>> {
         Box::pin(async move {
             let mut locks = self.locks.write().await;
             locks.remove(&lock_id);
@@ -294,11 +287,11 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn next_session_id<'a>(&'a self) -> BoxFuture<'a, Result<u64, StateError>> {
+    fn next_session_id(&self) -> BoxFuture<'_, Result<u64, StateError>> {
         Box::pin(async move { Ok(self.session_counter.fetch_add(1, Ordering::Relaxed)) })
     }
 
-    fn next_tree_id<'a>(&'a self, session_id: u64) -> BoxFuture<'a, Result<u32, StateError>> {
+    fn next_tree_id(&self, session_id: u64) -> BoxFuture<'_, Result<u32, StateError>> {
         Box::pin(async move {
             let mut counters = self.tree_counters.write().await;
             let counter = counters
@@ -308,7 +301,7 @@ impl StateStore for MemoryStateStore {
         })
     }
 
-    fn next_handle_id<'a>(&'a self) -> BoxFuture<'a, Result<u128, StateError>> {
+    fn next_handle_id(&self) -> BoxFuture<'_, Result<u128, StateError>> {
         Box::pin(async move { Ok(self.handle_counter.fetch_add(1, Ordering::Relaxed) as u128) })
     }
 }

@@ -154,7 +154,11 @@ impl MessageEncryptor {
     }
 
     /// Encrypt using AES-GCM.
-    fn encrypt_gcm(&self, plaintext: &[u8], nonce: &[u8]) -> Result<(Vec<u8>, [u8; 16]), EncryptionError> {
+    fn encrypt_gcm(
+        &self,
+        plaintext: &[u8],
+        nonce: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 16]), EncryptionError> {
         use aes_gcm::{
             aead::{Aead, KeyInit},
             Aes128Gcm, Aes256Gcm, Nonce,
@@ -236,13 +240,17 @@ impl MessageEncryptor {
     }
 
     /// Encrypt using AES-CCM.
-    fn encrypt_ccm(&self, plaintext: &[u8], nonce: &[u8]) -> Result<(Vec<u8>, [u8; 16]), EncryptionError> {
+    fn encrypt_ccm(
+        &self,
+        plaintext: &[u8],
+        nonce: &[u8],
+    ) -> Result<(Vec<u8>, [u8; 16]), EncryptionError> {
+        use aes::Aes128;
         use ccm::{
             aead::{Aead, KeyInit},
             consts::{U11, U16},
             Ccm,
         };
-        use aes::Aes128;
 
         type Aes128Ccm = Ccm<Aes128, U16, U11>;
 
@@ -280,12 +288,12 @@ impl MessageEncryptor {
         nonce: &[u8],
         tag: &[u8; 16],
     ) -> Result<Vec<u8>, EncryptionError> {
+        use aes::Aes128;
         use ccm::{
             aead::{Aead, KeyInit},
             consts::{U11, U16},
             Ccm,
         };
-        use aes::Aes128;
 
         type Aes128Ccm = Ccm<Aes128, U16, U11>;
 
@@ -302,11 +310,9 @@ impl MessageEncryptor {
                     .decrypt(nonce, ciphertext_with_tag.as_slice())
                     .map_err(|_| EncryptionError::DecryptionFailed)
             }
-            EncryptionAlgorithm::Aes256Ccm => {
-                Err(EncryptionError::CryptoError(
-                    "AES-256-CCM not yet implemented".into(),
-                ))
-            }
+            EncryptionAlgorithm::Aes256Ccm => Err(EncryptionError::CryptoError(
+                "AES-256-CCM not yet implemented".into(),
+            )),
             _ => Err(EncryptionError::CryptoError("Not a CCM algorithm".into())),
         }
     }
@@ -334,7 +340,10 @@ mod tests {
     #[test]
     fn test_encryptor_invalid_key_size() {
         let result = MessageEncryptor::new_symmetric(EncryptionAlgorithm::Aes128Gcm, &[0u8; 8]);
-        assert!(matches!(result, Err(EncryptionError::InvalidKeySize { .. })));
+        assert!(matches!(
+            result,
+            Err(EncryptionError::InvalidKeySize { .. })
+        ));
     }
 
     #[test]
@@ -346,7 +355,9 @@ mod tests {
         let plaintext = b"Hello, SMB3 encryption!";
         let nonce = [1u8; 12];
 
-        let (header, ciphertext) = encryptor.encrypt(0x123456789ABCDEF0, plaintext, &nonce).unwrap();
+        let (header, ciphertext) = encryptor
+            .encrypt(0x123456789ABCDEF0, plaintext, &nonce)
+            .unwrap();
 
         assert_eq!(header.session_id, 0x123456789ABCDEF0);
         assert_eq!(header.original_message_size, plaintext.len() as u32);
@@ -364,7 +375,9 @@ mod tests {
         let plaintext = b"Hello, SMB3 encryption!";
         let nonce = [1u8; 12];
 
-        let (header, mut ciphertext) = encryptor.encrypt(0x123456789ABCDEF0, plaintext, &nonce).unwrap();
+        let (header, mut ciphertext) = encryptor
+            .encrypt(0x123456789ABCDEF0, plaintext, &nonce)
+            .unwrap();
 
         // Tamper with ciphertext
         ciphertext[0] ^= 0xFF;
@@ -382,7 +395,9 @@ mod tests {
         let plaintext = b"Hello, SMB3 CCM encryption!";
         let nonce = [1u8; 11];
 
-        let (header, ciphertext) = encryptor.encrypt(0x123456789ABCDEF0, plaintext, &nonce).unwrap();
+        let (header, ciphertext) = encryptor
+            .encrypt(0x123456789ABCDEF0, plaintext, &nonce)
+            .unwrap();
 
         assert_eq!(header.session_id, 0x123456789ABCDEF0);
         assert_eq!(header.original_message_size, plaintext.len() as u32);
@@ -402,6 +417,9 @@ mod tests {
 
     #[test]
     fn test_encrypted_message_size() {
-        assert_eq!(encrypted_message_size(100), SMB2_TRANSFORM_HEADER_SIZE + 100);
+        assert_eq!(
+            encrypted_message_size(100),
+            SMB2_TRANSFORM_HEADER_SIZE + 100
+        );
     }
 }

@@ -61,7 +61,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<u32, VfsError>>;
 
     /// Close a file handle.
-    fn close<'a>(&'a self, handle: FileHandle) -> BoxFuture<'a, Result<(), VfsError>>;
+    fn close(&self, handle: FileHandle) -> BoxFuture<'_, Result<(), VfsError>>;
 
     /// Flush pending writes to storage.
     fn fsync<'a>(&'a self, handle: &'a FileHandle) -> BoxFuture<'a, Result<(), VfsError>>;
@@ -181,7 +181,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     fn capabilities(&self) -> BackendCapabilities;
 
     /// Get filesystem statistics.
-    fn statfs<'a>(&'a self) -> BoxFuture<'a, Result<FsStats, VfsError>>;
+    fn statfs(&self) -> BoxFuture<'_, Result<FsStats, VfsError>>;
 }
 
 /// Dynamic dispatch wrapper for storage backends.

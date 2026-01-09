@@ -2,8 +2,8 @@
 //!
 //! This module provides message signing and encryption for SMB 3.0+.
 
-pub mod signing;
 pub mod encryption;
+pub mod signing;
 
-pub use signing::*;
 pub use encryption::*;
+pub use signing::*;

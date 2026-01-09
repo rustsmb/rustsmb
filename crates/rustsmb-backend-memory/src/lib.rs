@@ -436,7 +436,7 @@ impl StorageBackend for MemoryBackend {
         })
     }
 
-    fn close<'a>(&'a self, handle: FileHandle) -> BoxFuture<'a, Result<(), VfsError>> {
+    fn close(&self, handle: FileHandle) -> BoxFuture<'_, Result<(), VfsError>> {
         Box::pin(async move {
             let mut handles = self.handles.write().await;
             handles.remove(&handle.id);
@@ -1141,7 +1141,7 @@ impl StorageBackend for MemoryBackend {
         }
     }
 
-    fn statfs<'a>(&'a self) -> BoxFuture<'a, Result<FsStats, VfsError>> {
+    fn statfs(&self) -> BoxFuture<'_, Result<FsStats, VfsError>> {
         Box::pin(async move {
             Ok(FsStats {
                 blocks: u64::MAX,

@@ -404,10 +404,7 @@ mod tests {
             highest_dialect(&[0x0202, 0x0311, 0x0300]),
             Some(SmbDialect::Smb311)
         );
-        assert_eq!(
-            highest_dialect(&[0x0202, 0x0210]),
-            Some(SmbDialect::Smb210)
-        );
+        assert_eq!(highest_dialect(&[0x0202, 0x0210]), Some(SmbDialect::Smb210));
         assert_eq!(highest_dialect(&[0x1234]), None);
     }
 

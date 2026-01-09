@@ -158,10 +158,13 @@ impl MessageSigner {
         // GMAC: encrypt empty data with AAD
         // We use the message as AAD (additional authenticated data)
         let result = cipher
-            .encrypt(nonce, aes_gcm::aead::Payload {
-                msg: &[],
-                aad: message,
-            })
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: &[],
+                    aad: message,
+                },
+            )
             .map_err(|e| SigningError::CryptoError(e.to_string()))?;
 
         // The result is just the authentication tag

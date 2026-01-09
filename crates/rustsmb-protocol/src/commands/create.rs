@@ -412,7 +412,8 @@ mod tests {
 
     #[test]
     fn test_create_options() {
-        let opts = CreateOptions::new(CreateOptions::DIRECTORY_FILE | CreateOptions::DELETE_ON_CLOSE);
+        let opts =
+            CreateOptions::new(CreateOptions::DIRECTORY_FILE | CreateOptions::DELETE_ON_CLOSE);
         assert!(opts.is_directory());
         assert!(opts.delete_on_close());
         assert!(!opts.is_non_directory());

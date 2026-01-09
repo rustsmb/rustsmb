@@ -232,7 +232,10 @@ mod tests {
     #[test]
     fn test_file_information_class() {
         assert_eq!(FileInformationClass::FileDirectoryInformation as u8, 1);
-        assert_eq!(FileInformationClass::FileIdBothDirectoryInformation as u8, 37);
+        assert_eq!(
+            FileInformationClass::FileIdBothDirectoryInformation as u8,
+            37
+        );
     }
 
     #[test]
