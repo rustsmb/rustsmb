@@ -432,6 +432,7 @@ where
                     created_at: now,
                     last_access: now,
                     expires_at: now + 3600, // 1 hour
+                    bound_server_id: None,
                 };
 
                 self.session_manager
@@ -944,7 +945,6 @@ where
             is_persistent,
             created_at: now,
             last_access: now,
-            // Phase 11 fields
             create_guid: None, // Set below if durable
             file_offset: 0,
             share_name: tree.share_name.clone(),
@@ -955,6 +955,7 @@ where
             reconnect_deadline: None,
             lease_key: None, // Set below if lease requested
             oplock_level: requested_oplock.as_u8(),
+            bound_server_id: None,
         };
 
         // Set create GUID if durable

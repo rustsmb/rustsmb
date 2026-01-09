@@ -39,6 +39,8 @@ pub struct ServerConfig {
     pub require_signing: bool,
     /// Supported SMB dialects.
     pub dialects: Vec<String>,
+    /// Coordination configuration (for multi-server deployments).
+    pub coordination: CoordinationConfig,
 }
 
 /// Session configuration.
@@ -57,6 +59,62 @@ pub struct SessionConfig {
     /// Idle timeout in seconds.
     #[serde(with = "duration_secs_serde")]
     pub idle_timeout: Duration,
+}
+
+/// Coordination configuration for multi-server deployments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CoordinationConfig {
+    /// Enable coordination (requires coordinator backend).
+    pub enabled: bool,
+    /// This server's unique ID (auto-generated if empty).
+    pub server_id: String,
+    /// Address for Raft peer communication.
+    pub raft_addr: String,
+    /// Heartbeat interval in seconds.
+    pub heartbeat_interval_secs: u64,
+    /// Heartbeat timeout in seconds (server considered dead after this).
+    pub heartbeat_timeout_secs: u64,
+    /// Local cache configuration.
+    pub cache: CacheLayerConfig,
+}
+
+impl Default for CoordinationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_id: String::new(),
+            raft_addr: "127.0.0.1:8080".to_string(),
+            heartbeat_interval_secs: 5,
+            heartbeat_timeout_secs: 15,
+            cache: CacheLayerConfig::default(),
+        }
+    }
+}
+
+/// Local cache layer configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheLayerConfig {
+    /// Maximum cached sessions.
+    pub max_sessions: usize,
+    /// Maximum cached handles.
+    pub max_handles: usize,
+    /// Maximum cached tree connections.
+    pub max_trees: usize,
+    /// Default cache entry TTL in seconds.
+    pub default_ttl_secs: u64,
+}
+
+impl Default for CacheLayerConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: 10_000,
+            max_handles: 1_000_000,
+            max_trees: 50_000,
+            default_ttl_secs: 300,
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -81,6 +139,7 @@ impl Default for ServerConfig {
                 "SMB 2.1".to_string(),
                 "SMB 2.0.2".to_string(),
             ],
+            coordination: CoordinationConfig::default(),
         }
     }
 }

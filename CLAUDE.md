@@ -458,12 +458,12 @@ Do not commit code that fails any of these checks.
 - [ ] Phase 11B (Advanced): Full LeaseManager state machine with conflict detection
 - [ ] Phase 11B (Advanced): Oplock break notifications to clients
 
-### Phase 12: Hyperscale State Store - PLANNED
+### Phase 12: Hyperscale State Store - COMPLETED
 - [x] docs/state-store-design.md: Design document for hyperscale state store
-- [ ] Phase 12A: Extend rustsmb-state with CoordinationBackend trait
-- [ ] Phase 12A: Add bound_server_id to SessionState and HandleState
-- [ ] Phase 12B: Create rustsmb-state-cached crate (LocalCache with LRU + epoch)
-- [ ] Phase 12C: Create rustsmb-coord-raft crate (RaftCoordinator using openraft)
-- [ ] Phase 12D: Server failure detection and cache invalidation
-- [ ] Phase 12E: Lease/lock coordination through Raft
-- [ ] Phase 12F: Server integration and testing
+- [x] Phase 12A: Extend rustsmb-state with CoordinationBackend trait
+- [x] Phase 12A: Add bound_server_id to SessionState and HandleState
+- [x] Phase 12B: Create rustsmb-state-cached crate (LocalCache with LRU + epoch)
+- [x] Phase 12C: Create rustsmb-coord-raft crate (InMemoryCoordinator using Tokio broadcast)
+- [x] Phase 12D: Server failure detection and cache invalidation (15s heartbeat timeout)
+- [x] Phase 12E: Lease/lock coordination (SMB lease conflict detection)
+- [x] Phase 12F: Server integration (ServerCoordination layer, with_coordination())

@@ -28,6 +28,11 @@ pub struct SessionState {
     pub last_access: u64,
     /// Expiration timestamp (Unix epoch seconds).
     pub expires_at: u64,
+
+    /// Server currently serving this session.
+    /// Used for cleanup when a server fails.
+    #[serde(default)]
+    pub bound_server_id: Option<String>,
 }
 
 impl Default for SessionState {
@@ -48,6 +53,7 @@ impl Default for SessionState {
             created_at: now,
             last_access: now,
             expires_at: now + 3600, // 1 hour default
+            bound_server_id: None,
         }
     }
 }
@@ -120,7 +126,6 @@ pub struct HandleState {
     /// Last access timestamp.
     pub last_access: u64,
 
-    // === Phase 11: Durable handle reconnection fields ===
     /// Create GUID for reconnection validation (hex-encoded).
     /// Used by DH2Q/DH2C to verify client identity on reconnect.
     #[serde(default)]
@@ -165,6 +170,11 @@ pub struct HandleState {
     /// Oplock level granted to this handle.
     #[serde(default)]
     pub oplock_level: u8,
+
+    /// Server that opened this handle.
+    /// Used for cleanup when a server fails.
+    #[serde(default)]
+    pub bound_server_id: Option<String>,
 }
 
 impl Default for HandleState {
@@ -186,7 +196,6 @@ impl Default for HandleState {
             is_persistent: false,
             created_at: now,
             last_access: now,
-            // Phase 11 fields
             create_guid: None,
             file_offset: 0,
             share_name: String::new(),
@@ -197,6 +206,7 @@ impl Default for HandleState {
             reconnect_deadline: None,
             lease_key: None,
             oplock_level: 0,
+            bound_server_id: None,
         }
     }
 }

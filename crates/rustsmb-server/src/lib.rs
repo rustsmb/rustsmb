@@ -37,11 +37,13 @@
 //! ```
 
 pub mod config;
+pub mod coordination;
 pub mod handler;
 pub mod server;
 pub mod shares;
 
-pub use config::{ConfigError, ServerConfig, SessionConfig};
+pub use config::{CacheLayerConfig, ConfigError, CoordinationConfig, ServerConfig, SessionConfig};
+pub use coordination::{CoordinationError, ServerCoordination};
 pub use handler::{ConnectionHandler, HandlerError};
 pub use server::{ServerError, SmbServer};
 pub use shares::{Share, ShareConfig, ShareManager};

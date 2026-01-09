@@ -2,6 +2,7 @@
 //!
 //! Provides the SMB server with TCP listener, TLS support, and graceful shutdown.
 
+use crate::coordination::ServerCoordination;
 use crate::handler::ConnectionHandler;
 use crate::{ServerConfig, ShareManager};
 use rustsmb_auth::DynAuthProvider;
@@ -36,6 +37,8 @@ pub struct SmbServer {
     active_connections: Arc<AtomicUsize>,
     /// Connection semaphore for limiting concurrent connections.
     connection_semaphore: Arc<Semaphore>,
+    /// Coordination layer (optional, for multi-server deployments).
+    coordination: Option<Arc<ServerCoordination>>,
 }
 
 impl SmbServer {
@@ -57,6 +60,47 @@ impl SmbServer {
             shutdown: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
             connection_semaphore,
+            coordination: None,
+        }
+    }
+
+    /// Create a new SMB server with coordination support for multi-server deployments.
+    ///
+    /// This enables:
+    /// - Local caching with LRU eviction
+    /// - Server heartbeats for failure detection
+    /// - Cache invalidation on server failure
+    /// - Coordination for leases and locks
+    pub fn with_coordination(
+        config: ServerConfig,
+        bulk_store: DynStateStore,
+        auth_provider: DynAuthProvider,
+    ) -> Self {
+        let connection_semaphore = Arc::new(Semaphore::new(config.max_connections));
+
+        // Create coordination layer
+        let coordination = Arc::new(ServerCoordination::new(
+            &config.coordination,
+            &config.server_name,
+            config.listen_addr.port(),
+            bulk_store,
+        ));
+
+        // Use the cached state store from coordination
+        let state_store = coordination.state_store();
+        let session_manager = Arc::new(SessionManager::with_defaults(state_store));
+
+        let config = Arc::new(config);
+
+        Self {
+            config,
+            session_manager,
+            auth_provider,
+            shares: Arc::new(ShareManager::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            connection_semaphore,
+            coordination: Some(coordination),
         }
     }
 
@@ -77,6 +121,7 @@ impl SmbServer {
             shutdown: Arc::new(AtomicBool::new(false)),
             active_connections: Arc::new(AtomicUsize::new(0)),
             connection_semaphore,
+            coordination: None,
         }
     }
 
@@ -93,6 +138,11 @@ impl SmbServer {
     /// Get the auth provider.
     pub fn auth_provider(&self) -> &DynAuthProvider {
         &self.auth_provider
+    }
+
+    /// Get the coordination layer (if enabled).
+    pub fn coordination(&self) -> Option<&Arc<ServerCoordination>> {
+        self.coordination.as_ref()
     }
 
     /// Get the number of active connections.
@@ -119,8 +169,21 @@ impl SmbServer {
             addr = %self.config.listen_addr,
             max_connections = self.config.max_connections,
             tls = self.config.tls_enabled,
+            coordination = self.coordination.is_some(),
             "Starting SMB server"
         );
+
+        // Start coordination if enabled
+        if let Some(ref coord) = self.coordination {
+            coord
+                .start()
+                .await
+                .map_err(|e| ServerError::Config(format!("Coordination error: {}", e)))?;
+            info!(
+                server_id = %coord.server_id(),
+                "Coordination started"
+            );
+        }
 
         // Create TCP listener
         let listener = TcpListener::bind(self.config.listen_addr)
@@ -211,6 +274,12 @@ impl SmbServer {
 
         // Wait for active connections to drain
         self.drain_connections().await;
+
+        // Stop coordination if enabled
+        if let Some(ref coord) = self.coordination {
+            coord.stop().await;
+            info!("Coordination stopped");
+        }
 
         info!("Server stopped");
         Ok(())

@@ -25,6 +25,10 @@ pub enum SmbError {
     #[error("Session error: {0}")]
     Session(#[from] SessionError),
 
+    /// Coordination layer error.
+    #[error("Coordination error: {0}")]
+    Coord(#[from] CoordError),
+
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -214,6 +218,46 @@ pub enum StateError {
     Conflict(String),
 
     /// Internal state store error.
+    #[error("Internal error: {0}")]
+    Internal(String),
+}
+
+/// Coordination layer errors (Raft/distributed coordination).
+#[derive(Debug, Error)]
+pub enum CoordError {
+    /// Not the leader - operation must be forwarded.
+    #[error("Not leader, leader is: {0:?}")]
+    NotLeader(Option<String>),
+
+    /// No leader currently elected.
+    #[error("No leader elected")]
+    NoLeader,
+
+    /// Cluster is not healthy (not enough nodes).
+    #[error("Cluster unhealthy: {0}")]
+    ClusterUnhealthy(String),
+
+    /// Operation timed out waiting for consensus.
+    #[error("Consensus timeout")]
+    Timeout,
+
+    /// Network error communicating with cluster.
+    #[error("Network error: {0}")]
+    Network(String),
+
+    /// Conflict detected (e.g., lock conflict, lease conflict).
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
+    /// Server not found in cluster.
+    #[error("Server not found: {0}")]
+    ServerNotFound(String),
+
+    /// Lease not found.
+    #[error("Lease not found")]
+    LeaseNotFound,
+
+    /// Internal coordination error.
     #[error("Internal error: {0}")]
     Internal(String),
 }

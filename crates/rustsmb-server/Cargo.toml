@@ -13,11 +13,14 @@ rustsmb-vfs = { workspace = true }
 rustsmb-state = { workspace = true }
 rustsmb-auth = { workspace = true }
 rustsmb-session = { workspace = true }
+rustsmb-state-cached = { workspace = true }
+rustsmb-coord-raft = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "signal"] }
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2.1"
 futures = { workspace = true }
+tokio-stream = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 binrw = { workspace = true }

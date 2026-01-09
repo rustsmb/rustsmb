@@ -9,6 +9,8 @@ members = [
     "crates/rustsmb-state",
     "crates/rustsmb-state-memory",
     "crates/rustsmb-state-redis",
+    "crates/rustsmb-state-cached",
+    "crates/rustsmb-coord-raft",
     "crates/rustsmb-backend-local",
     "crates/rustsmb-backend-memory",
     "crates/rustsmb-session",
@@ -32,6 +34,8 @@ rustsmb-vfs = { path = "crates/rustsmb-vfs" }
 rustsmb-state = { path = "crates/rustsmb-state" }
 rustsmb-state-memory = { path = "crates/rustsmb-state-memory" }
 rustsmb-state-redis = { path = "crates/rustsmb-state-redis" }
+rustsmb-state-cached = { path = "crates/rustsmb-state-cached" }
+rustsmb-coord-raft = { path = "crates/rustsmb-coord-raft" }
 rustsmb-backend-local = { path = "crates/rustsmb-backend-local" }
 rustsmb-backend-memory = { path = "crates/rustsmb-backend-memory" }
 rustsmb-session = { path = "crates/rustsmb-session" }
@@ -76,6 +80,12 @@ hex = "0.4"
 # Redis for state store
 redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 deadpool-redis = "0.14"
+
+# Caching
+lru = "0.12"
+
+# Distributed coordination
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # System calls (for local backend)
 nix = { version = "0.28", features = ["fs", "user"] }

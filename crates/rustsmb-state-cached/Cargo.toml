@@ -1,0 +1,19 @@
+[package]
+name = "rustsmb-state-cached"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cached state store with LRU eviction and epoch-based invalidation"
+
+[dependencies]
+rustsmb-core = { workspace = true }
+rustsmb-state = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+lru = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rustsmb-state-memory = { workspace = true }
+tokio = { workspace = true }

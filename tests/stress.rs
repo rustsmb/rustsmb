@@ -354,6 +354,7 @@ mod state_store_stress {
                 created_at: now,
                 last_access: now,
                 expires_at: now + 3600,
+                bound_server_id: None,
             };
             StateStore::create_session(&store, &session)
                 .await
@@ -401,6 +402,7 @@ mod state_store_stress {
             created_at: now,
             last_access: now,
             expires_at: now + 3600,
+            bound_server_id: None,
         };
         StateStore::create_session(&store, &session)
             .await
