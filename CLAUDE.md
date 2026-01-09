@@ -1,0 +1,340 @@
+# RustSMB - Project Guidelines
+
+## Project Overview
+
+RustSMB is a Rust-based SMB2/SMB3 server with pluggable storage backends, designed as a stateless gateway for high availability deployments.
+
+## Documentation
+
+All project documentation is maintained in the `docs/` directory:
+
+| Document | Description |
+|----------|-------------|
+| [CLAUDE.md](./CLAUDE.md) | Project guidelines, coding conventions, and quick reference (this file) |
+| [docs/architecture.md](./docs/architecture.md) | Detailed system architecture, core traits, data flow, and design decisions |
+| [docs/ksmbd-research.md](./docs/ksmbd-research.md) | Linux kernel ksmbd research notes and lessons learned |
+
+### Documentation Update Policy
+
+- Update relevant docs after completing each task
+- Commit changes after completing each phase
+- Keep CLAUDE.md as the entry point referencing all other docs
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Configuration Layer                          │
+├─────────────────────────────────────────────────────────────────┤
+│                    Transport Layer (TCP/TLS)                    │
+├─────────────────────────────────────────────────────────────────┤
+│                    Protocol Layer (rustsmb-protocol)            │
+│  (SMB2/3 message parsing, command dispatch, signing/encryption)│
+├─────────────────────────────────────────────────────────────────┤
+│                    Session Layer (rustsmb-session)              │
+│  (Stateless - via StateStore trait)                            │
+├─────────────────────────────────────────────────────────────────┤
+│                    VFS Layer (rustsmb-vfs)                      │
+│  (StorageBackend trait - POSIX-like interface)                 │
+├─────────────────────────────────────────────────────────────────┤
+│                    Storage Backend Layer                        │
+│  (rustsmb-backend-local, rustsmb-backend-memory)               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Crate Structure
+
+| Crate | Description |
+|-------|-------------|
+| `rustsmb-core` | Core types, errors, NT_STATUS codes |
+| `rustsmb-protocol` | SMB2/3 protocol parsing and commands |
+| `rustsmb-auth` | Authentication (NTLM, Simple) |
+| `rustsmb-vfs` | StorageBackend trait definition |
+| `rustsmb-state` | StateStore trait for HA support |
+| `rustsmb-state-memory` | In-memory state store (dev/testing) |
+| `rustsmb-state-redis` | Redis state store (production) |
+| `rustsmb-backend-local` | Local filesystem backend |
+| `rustsmb-backend-memory` | In-memory filesystem (testing) |
+| `rustsmb-session` | Session/connection management |
+| `rustsmb-server` | Main server implementation |
+
+## Coding Conventions
+
+### Rust Style
+
+- Follow standard Rust formatting (`cargo fmt`)
+- Use `clippy` with default lints (`cargo clippy`)
+- Prefer `&str` over `String` for function parameters when ownership isn't needed
+- Use `thiserror` for error types in library crates
+- Use `anyhow` only in the binary crate
+
+### Naming Conventions
+
+```rust
+// Types: PascalCase
+pub struct SessionState { ... }
+pub enum NtStatus { ... }
+pub trait StorageBackend { ... }
+
+// Functions/methods: snake_case
+pub fn create_session() { ... }
+pub async fn read_file() { ... }
+
+// Constants: SCREAMING_SNAKE_CASE
+pub const SMB2_MAGIC: [u8; 4] = [0xFE, b'S', b'M', b'B'];
+pub const MAX_READ_SIZE: u32 = 8 * 1024 * 1024;
+
+// Modules: snake_case
+mod session_manager;
+mod protocol_handler;
+```
+
+### Async Patterns
+
+```rust
+// Use BoxFuture for object-safe async traits
+use std::future::Future;
+use std::pin::Pin;
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+// Trait methods return BoxFuture
+pub trait StorageBackend: Send + Sync + 'static {
+    fn read<'a>(
+        &'a self,
+        handle: &'a FileHandle,
+        offset: u64,
+        length: u32,
+    ) -> BoxFuture<'a, Result<ReadResult, VfsError>>;
+}
+
+// Implementation wraps async block in Box::pin
+impl StorageBackend for LocalBackend {
+    fn read<'a>(
+        &'a self,
+        handle: &'a FileHandle,
+        offset: u64,
+        length: u32,
+    ) -> BoxFuture<'a, Result<ReadResult, VfsError>> {
+        Box::pin(async move {
+            // async implementation
+        })
+    }
+}
+```
+
+### Error Handling
+
+```rust
+// Define errors with thiserror
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum VfsError {
+    #[error("File not found: {0}")]
+    NotFound(String),
+
+    #[error("Access denied: {0}")]
+    AccessDenied(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+// Map to NT_STATUS for protocol responses
+impl From<&VfsError> for NtStatus {
+    fn from(err: &VfsError) -> Self {
+        match err {
+            VfsError::NotFound(_) => NtStatus::ObjectNameNotFound,
+            VfsError::AccessDenied(_) => NtStatus::AccessDenied,
+            _ => NtStatus::InternalError,
+        }
+    }
+}
+```
+
+### Documentation
+
+```rust
+/// Brief description of the item.
+///
+/// More detailed explanation if needed.
+///
+/// # Arguments
+///
+/// * `param` - Description of the parameter
+///
+/// # Returns
+///
+/// Description of what is returned.
+///
+/// # Errors
+///
+/// Describes when this function returns an error.
+///
+/// # Examples
+///
+/// ```rust
+/// let result = function(arg);
+/// assert!(result.is_ok());
+/// ```
+pub fn function(param: Type) -> Result<Output, Error> { ... }
+```
+
+### Testing
+
+```rust
+// Unit tests in the same file
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_functionality() {
+        // Arrange
+        let input = create_test_input();
+
+        // Act
+        let result = function_under_test(input);
+
+        // Assert
+        assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn test_async_functionality() {
+        let result = async_function().await;
+        assert!(result.is_ok());
+    }
+}
+
+// Integration tests in tests/ directory
+// Property-based tests with proptest
+#[cfg(test)]
+mod proptests {
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn test_roundtrip(input in any::<u64>()) {
+            let encoded = encode(input);
+            let decoded = decode(&encoded).unwrap();
+            prop_assert_eq!(input, decoded);
+        }
+    }
+}
+```
+
+### Binary Protocol Parsing
+
+```rust
+use binrw::{BinRead, BinWrite};
+
+/// SMB2 Header (64 bytes)
+#[derive(Debug, Clone, BinRead, BinWrite)]
+#[brw(little)]
+pub struct Smb2Header {
+    #[brw(magic = b"\xFESMB")]
+    pub protocol_id: (),
+
+    #[brw(assert(structure_size == 64))]
+    pub structure_size: u16,
+
+    pub credit_charge: u16,
+    pub status: u32,
+    pub command: u16,
+    // ... rest of header
+}
+```
+
+## Key Commands
+
+```bash
+# Build all crates
+cargo build --workspace
+
+# Run tests
+cargo test --workspace
+
+# Run clippy
+cargo clippy --workspace -- -D warnings
+
+# Format code
+cargo fmt --all
+
+# Run the server
+cargo run -- --config config.toml
+
+# Run benchmarks
+cargo bench
+```
+
+## Protocol References
+
+- [MS-SMB2 Specification](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/)
+- [Linux ksmbd Documentation](https://docs.kernel.org/filesystems/smb/ksmbd.html)
+
+## SMB2 Commands (19 total)
+
+| Command | Code | Description |
+|---------|------|-------------|
+| NEGOTIATE | 0x00 | Protocol negotiation |
+| SESSION_SETUP | 0x01 | Authentication |
+| LOGOFF | 0x02 | Session termination |
+| TREE_CONNECT | 0x03 | Connect to share |
+| TREE_DISCONNECT | 0x04 | Disconnect from share |
+| CREATE | 0x05 | Open/create file |
+| CLOSE | 0x06 | Close file handle |
+| FLUSH | 0x07 | Flush pending writes |
+| READ | 0x08 | Read file data |
+| WRITE | 0x09 | Write file data |
+| LOCK | 0x0A | File locking |
+| IOCTL | 0x0B | IO control |
+| CANCEL | 0x0C | Cancel pending request |
+| ECHO | 0x0D | Keep-alive |
+| QUERY_DIRECTORY | 0x0E | List directory |
+| CHANGE_NOTIFY | 0x0F | Directory watch |
+| QUERY_INFO | 0x10 | Get file info |
+| SET_INFO | 0x11 | Set file info |
+| OPLOCK_BREAK | 0x12 | Oplock notification |
+
+## Git Workflow
+
+- Use conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`
+- Keep commits atomic and focused
+- Write descriptive commit messages
+
+## Security Considerations
+
+- Never log sensitive data (passwords, session keys)
+- Validate all paths to prevent directory traversal
+- Use constant-time comparison for signatures
+- Encrypt session keys in state store
+
+## Implementation Status
+
+### Phase 1: Project Setup & Documentation - COMPLETED
+- [x] Workspace Cargo.toml with all crate definitions
+- [x] CLAUDE.md with coding conventions
+- [x] docs/ksmbd-research.md with kernel research
+- [x] docs/architecture.md with detailed design
+- [x] CI configuration (.github/workflows/ci.yml)
+- [x] All crate structures created
+
+### Phase 2: Core Infrastructure - PENDING
+- [ ] rustsmb-core: Complete error types and NT_STATUS
+- [ ] rustsmb-vfs: StorageBackend trait implementation
+- [ ] rustsmb-state: StateStore trait implementation
+- [ ] rustsmb-state-memory: In-memory state store
+- [ ] rustsmb-backend-memory: In-memory filesystem
+
+### Phase 3: Protocol Layer - PENDING
+- [ ] SMB2 header parsing with binrw
+- [ ] All 19 SMB2 commands
+- [ ] Dialect negotiation
+- [ ] Message signing/encryption
+
+### Phase 4-6: Session, Auth, Server - PENDING
+### Phase 7: Local Filesystem Backend - PENDING
+### Phase 8: Redis State Store - PENDING
+### Phase 9: Testing & Hardening - PENDING

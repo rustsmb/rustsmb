@@ -1,0 +1,123 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustsmb-core",
+    "crates/rustsmb-protocol",
+    "crates/rustsmb-auth",
+    "crates/rustsmb-vfs",
+    "crates/rustsmb-state",
+    "crates/rustsmb-state-memory",
+    "crates/rustsmb-state-redis",
+    "crates/rustsmb-backend-local",
+    "crates/rustsmb-backend-memory",
+    "crates/rustsmb-session",
+    "crates/rustsmb-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/rustsmb"
+authors = ["RustSMB Contributors"]
+
+[workspace.dependencies]
+# Internal crates
+rustsmb-core = { path = "crates/rustsmb-core" }
+rustsmb-protocol = { path = "crates/rustsmb-protocol" }
+rustsmb-auth = { path = "crates/rustsmb-auth" }
+rustsmb-vfs = { path = "crates/rustsmb-vfs" }
+rustsmb-state = { path = "crates/rustsmb-state" }
+rustsmb-state-memory = { path = "crates/rustsmb-state-memory" }
+rustsmb-state-redis = { path = "crates/rustsmb-state-redis" }
+rustsmb-backend-local = { path = "crates/rustsmb-backend-local" }
+rustsmb-backend-memory = { path = "crates/rustsmb-backend-memory" }
+rustsmb-session = { path = "crates/rustsmb-session" }
+rustsmb-server = { path = "crates/rustsmb-server" }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Binary parsing
+binrw = "0.14"
+bytes = "1.5"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Cryptography
+ring = "0.17"
+aes-gcm = "0.10"
+hmac = "0.12"
+md-5 = "0.10"
+sha2 = "0.10"
+
+# Authentication
+ntlmclient = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Redis for state store
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
+deadpool-redis = "0.14"
+
+# System calls (for local backend)
+nix = { version = "0.28", features = ["fs", "user"] }
+
+# Testing
+tempfile = "3.10"
+proptest = "1.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio-test = "0.4"
+
+[package]
+name = "rustsmb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A Rust SMB2/SMB3 server with pluggable storage backends"
+
+[dependencies]
+rustsmb-server = { workspace = true }
+rustsmb-core = { workspace = true }
+rustsmb-state-memory = { workspace = true }
+rustsmb-backend-local = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4.4", features = ["derive"] }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "rustsmb"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+# Faster builds during development
+opt-level = 0
+debug = true

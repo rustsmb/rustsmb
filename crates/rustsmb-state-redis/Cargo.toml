@@ -1,0 +1,20 @@
+[package]
+name = "rustsmb-state-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Redis state store for RustSMB (production HA)"
+
+[dependencies]
+rustsmb-core = { workspace = true }
+rustsmb-state = { workspace = true }
+redis = { workspace = true }
+deadpool-redis = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

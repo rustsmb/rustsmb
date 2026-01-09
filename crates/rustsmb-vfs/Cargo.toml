@@ -1,0 +1,16 @@
+[package]
+name = "rustsmb-vfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Virtual filesystem abstraction layer for RustSMB"
+
+[dependencies]
+rustsmb-core = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

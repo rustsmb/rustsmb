@@ -1,0 +1,16 @@
+[package]
+name = "rustsmb-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SMB2/SMB3 protocol parsing and command handling"
+
+[dependencies]
+rustsmb-core = { workspace = true }
+binrw = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

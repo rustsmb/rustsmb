@@ -1,0 +1,18 @@
+[package]
+name = "rustsmb-backend-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Local filesystem backend for RustSMB"
+
+[dependencies]
+rustsmb-core = { workspace = true }
+rustsmb-vfs = { workspace = true }
+tokio = { workspace = true, features = ["fs", "sync"] }
+futures = { workspace = true }
+nix = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = { workspace = true }

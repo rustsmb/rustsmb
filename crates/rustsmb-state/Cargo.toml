@@ -1,0 +1,16 @@
+[package]
+name = "rustsmb-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "State store abstraction for RustSMB (HA support)"
+
+[dependencies]
+rustsmb-core = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

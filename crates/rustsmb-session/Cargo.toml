@@ -1,0 +1,18 @@
+[package]
+name = "rustsmb-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Session and connection management for RustSMB"
+
+[dependencies]
+rustsmb-core = { workspace = true }
+rustsmb-state = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+rustsmb-state-memory = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "rustsmb-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Authentication providers for RustSMB"
+
+[dependencies]
+rustsmb-core = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+# Cryptography for NTLM
+hmac = { workspace = true }
+md-5 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
