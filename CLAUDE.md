@@ -424,7 +424,7 @@ Do not commit code that fails any of these checks.
 - [x] rustsmb-state-redis: 6 integration tests (require Redis)
 
 ### Phase 9: Testing & Hardening - IN PROGRESS
-- [ ] Integration tests with smbclient
+- [x] Integration tests with smbclient (16 tests - requires smbclient installed)
 - [ ] Integration tests with Windows client
 - [x] Fuzz testing infrastructure (cargo-fuzz targets for headers and commands)
 - [x] Property-based tests for all command roundtrips (36 proptest tests)

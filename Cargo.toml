@@ -118,6 +118,9 @@ rustsmb-state = { workspace = true }
 rustsmb-state-memory = { workspace = true }
 rustsmb-backend-local = { workspace = true }
 rustsmb-backend-memory = { workspace = true }
+rustsmb-server = { workspace = true }
+rustsmb-auth = { workspace = true }
+rustsmb-session = { workspace = true }
 binrw = { workspace = true }
 tokio = { workspace = true }
 
