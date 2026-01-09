@@ -321,12 +321,12 @@ cargo bench
 - [x] CI configuration (.github/workflows/ci.yml)
 - [x] All crate structures created
 
-### Phase 2: Core Infrastructure - PENDING
-- [ ] rustsmb-core: Complete error types and NT_STATUS
-- [ ] rustsmb-vfs: StorageBackend trait implementation
-- [ ] rustsmb-state: StateStore trait implementation
-- [ ] rustsmb-state-memory: In-memory state store
-- [ ] rustsmb-backend-memory: In-memory filesystem
+### Phase 2: Core Infrastructure - COMPLETED
+- [x] rustsmb-core: Complete error types and NT_STATUS (40+ status codes, 6 error types)
+- [x] rustsmb-vfs: StorageBackend trait with 27 POSIX-like methods
+- [x] rustsmb-state: StateStore trait with 24 methods for HA support
+- [x] rustsmb-state-memory: In-memory state store (full implementation)
+- [x] rustsmb-backend-memory: In-memory filesystem (full StorageBackend implementation with 9 tests)
 
 ### Phase 3: Protocol Layer - PENDING
 - [ ] SMB2 header parsing with binrw
