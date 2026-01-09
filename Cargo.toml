@@ -87,6 +87,18 @@ lru = "0.12"
 # Distributed coordination
 tokio-stream = { version = "0.1", features = ["sync"] }
 
+# Raft consensus (tikv/raft-rs)
+raft = { version = "0.7", default-features = true }
+protobuf = "2"
+slog = "2"
+slog-stdlog = "4"
+
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+
 # System calls (for local backend)
 nix = { version = "0.28", features = ["fs", "user"] }
 libc = "0.2"

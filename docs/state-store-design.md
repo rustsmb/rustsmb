@@ -553,8 +553,8 @@ lru = "0.12"
 # Async utilities
 tokio-stream = "0.1"
 
-# Raft library (if using external crate)
-# openraft, raft-rs, or custom implementation
+# Raft library (using tikv/raft-rs)
+raft = "0.7"
 ```
 
 ## Performance Expectations

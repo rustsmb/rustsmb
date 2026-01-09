@@ -383,6 +383,11 @@ impl CoordStateMachine {
     pub async fn state(&self) -> tokio::sync::RwLockReadGuard<'_, CoordinationState> {
         self.state.read().await
     }
+
+    /// Get a write lock on the state.
+    pub async fn state_mut(&self) -> tokio::sync::RwLockWriteGuard<'_, CoordinationState> {
+        self.state.write().await
+    }
 }
 
 impl Default for CoordStateMachine {

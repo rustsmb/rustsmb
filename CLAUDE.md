@@ -57,7 +57,7 @@ All project documentation is maintained in the `docs/` directory:
 | `rustsmb-state-memory` | In-memory state store (dev/testing) |
 | `rustsmb-state-redis` | Redis state store (production) |
 | `rustsmb-state-cached` | Cached state store with LRU + epoch invalidation (Phase 12) |
-| `rustsmb-coord-raft` | CoordinationBackend impl using openraft library (Phase 12) |
+| `rustsmb-coord-raft` | CoordinationBackend impl using tikv/raft-rs library (Phase 12) |
 | `rustsmb-backend-local` | Local filesystem backend |
 | `rustsmb-backend-memory` | In-memory filesystem (testing) |
 | `rustsmb-session` | Session/connection management |

@@ -8,9 +8,11 @@
 //! - Graceful shutdown with cluster leave
 
 use crate::config::CoordinationConfig;
-use rustsmb_coord_raft::{CoordinatorConfig, InMemoryCoordinator};
+use rustsmb_coord_raft::{CoordinatorConfig, RaftCoordinator};
 use rustsmb_state::{CoordinationBackend, DynStateStore, ServerRegistration};
 use rustsmb_state_cached::{CacheConfig, CachedStateStore};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +24,7 @@ use tracing::{debug, info, warn};
 /// Manages the connection to the coordinator and handles cache invalidation.
 pub struct ServerCoordination {
     /// The coordinator backend.
-    coordinator: Arc<InMemoryCoordinator>,
+    coordinator: Arc<RaftCoordinator>,
     /// The cached state store.
     cached_store: Arc<CachedStateStore>,
     /// Server registration info.
@@ -31,6 +33,19 @@ pub struct ServerCoordination {
     shutdown: Arc<AtomicBool>,
     /// Heartbeat interval.
     heartbeat_interval: Duration,
+}
+
+/// Convert a string server ID to a u64 node ID for Raft.
+fn string_to_node_id(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    // Ensure non-zero (Raft requires node_id > 0)
+    let hash = hasher.finish();
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
 }
 
 impl ServerCoordination {
@@ -48,16 +63,24 @@ impl ServerCoordination {
             config.server_id.clone()
         };
 
+        // Convert string server_id to u64 node_id for Raft
+        let node_id = string_to_node_id(&server_id);
+
         // Create coordinator config
         let coord_config = CoordinatorConfig {
-            node_id: server_id.clone(),
+            node_id,
             node_addr: config.raft_addr.clone(),
             heartbeat_timeout_secs: config.heartbeat_timeout_secs,
             heartbeat_check_interval_secs: config.heartbeat_interval_secs,
+            raft_tick_interval_ms: 100,
+            election_tick: 10,
+            heartbeat_tick: 3,
         };
 
         // Create the coordinator
-        let coordinator = Arc::new(InMemoryCoordinator::new(coord_config));
+        let coordinator = Arc::new(
+            RaftCoordinator::new(coord_config).expect("Failed to create Raft coordinator"),
+        );
 
         // Create cache config
         let cache_config = CacheConfig {
@@ -93,7 +116,7 @@ impl ServerCoordination {
     }
 
     /// Get the coordinator.
-    pub fn coordinator(&self) -> &Arc<InMemoryCoordinator> {
+    pub fn coordinator(&self) -> &Arc<RaftCoordinator> {
         &self.coordinator
     }
 
@@ -143,8 +166,8 @@ impl ServerCoordination {
         // Signal shutdown
         self.shutdown.store(true, Ordering::Release);
 
-        // Stop the coordinator's heartbeat monitor
-        self.coordinator.stop_heartbeat_monitor();
+        // Stop the coordinator (stops heartbeat monitor and other background tasks)
+        self.coordinator.stop();
 
         // Leave the cluster gracefully
         if let Err(e) = self.coordinator.leave_cluster().await {

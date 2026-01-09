@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "In-memory coordination backend (upgradeable to Raft)"
+description = "Raft-based coordination backend using tikv/raft-rs"
 
 [dependencies]
 rustsmb-core = { workspace = true }
@@ -16,5 +16,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
+# Raft consensus (tikv/raft-rs)
+raft = { workspace = true }
+protobuf = { workspace = true }
+slog = { workspace = true }
+slog-stdlog = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = { workspace = true }
