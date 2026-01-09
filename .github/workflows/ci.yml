@@ -64,11 +64,36 @@ jobs:
       - name: Run smbclient integration tests
         run: cargo test --test integration_smbclient -- --ignored
 
+  # Build Linux server binary for Windows integration tests
+  build-linux-server:
+    name: Build Linux Server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --package rustsmb
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustsmb-linux
+          path: target/release/rustsmb
+          retention-days: 1
+
   integration-test-windows:
     name: Integration Tests (Windows → WSL2)
     runs-on: windows-latest
+    needs: build-linux-server
     steps:
       - uses: actions/checkout@v4
+
+      # Download pre-built Linux server binary
+      - name: Download Linux server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rustsmb-linux
+          path: linux-bin
 
       # Setup WSL2 with Ubuntu
       - name: Enable WSL2
@@ -81,36 +106,26 @@ jobs:
           wsl --install -d Ubuntu --no-launch
           wsl -d Ubuntu -- echo "WSL2 Ubuntu ready"
 
-      - name: Install Rust in WSL2
-        run: |
-          wsl -d Ubuntu -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
-          wsl -d Ubuntu -- bash -c 'source $HOME/.cargo/env && rustc --version'
-
-      - name: Build server in WSL2
+      - name: Start SMB server in WSL2
         shell: pwsh
         run: |
           # Convert Windows path to WSL path (D:\a\repo\repo -> /mnt/d/a/repo/repo)
           $winPath = '${{ github.workspace }}'
           $wslPath = '/mnt/' + $winPath.Substring(0,1).ToLower() + $winPath.Substring(2).Replace('\', '/')
           echo "WSL workspace path: $wslPath"
-          wsl -d Ubuntu -- bash -c "source `$HOME/.cargo/env && cd $wslPath && cargo build --release --package rustsmb-server"
 
-      - name: Start SMB server in WSL2
-        shell: pwsh
-        run: |
-          # Convert Windows path to WSL path
-          $winPath = '${{ github.workspace }}'
-          $wslPath = '/mnt/' + $winPath.Substring(0,1).ToLower() + $winPath.Substring(2).Replace('\', '/')
+          # Make binary executable and copy to WSL
+          wsl -d Ubuntu -- chmod +x $wslPath/linux-bin/rustsmb
 
           # Get WSL2 IP address
           $wslIp = (wsl -d Ubuntu -- hostname -I).Trim().Split()[0]
           echo "WSL2 IP: $wslIp"
 
           # Start server in background on port 445
-          Start-Process -NoNewWindow wsl -ArgumentList "-d", "Ubuntu", "--", "bash", "-c", "source `$HOME/.cargo/env && cd $wslPath && RUST_LOG=info ./target/release/rustsmb --listen 0.0.0.0:445 2>&1 | tee /tmp/smb-server.log"
+          Start-Process -NoNewWindow wsl -ArgumentList "-d", "Ubuntu", "--", "bash", "-c", "cd $wslPath && RUST_LOG=info ./linux-bin/rustsmb --listen 0.0.0.0:445 2>&1 | tee /tmp/smb-server.log"
 
           # Wait for server to start
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 3
 
           # Setup port forwarding from Windows localhost:445 to WSL2:445
           netsh interface portproxy add v4tov4 listenport=445 listenaddress=127.0.0.1 connectport=445 connectaddress=$wslIp
