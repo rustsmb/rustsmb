@@ -372,14 +372,16 @@ Do not commit code that fails any of these checks.
 - [x] Message encryption (AES-128-CCM, AES-128-GCM, AES-256-GCM)
 - [x] 100 unit tests passing
 
-### Phase 4: Session Management - PENDING
-- [ ] rustsmb-session: Connection state machine
-- [ ] rustsmb-session: Session manager with StateStore integration
-- [ ] rustsmb-session: Tree connection manager
-- [ ] rustsmb-session: File handle manager (volatile + persistent IDs)
-- [ ] rustsmb-session: Credit management for multi-credit operations
-- [ ] rustsmb-session: Compound request handling
-- [ ] rustsmb-session: Async request tracking (for CHANGE_NOTIFY, etc.)
+### Phase 4: Session Management - COMPLETED
+- [x] rustsmb-session: Connection state machine (multi-session support, idle tracking)
+- [x] rustsmb-session: Session manager with StateStore integration
+- [x] rustsmb-session: Tree connection manager
+- [x] rustsmb-session: File handle manager (volatile + persistent IDs)
+- [x] rustsmb-session: Credit management for multi-credit operations
+- [x] rustsmb-session: Compound request handling (related/unrelated)
+- [x] rustsmb-session: Async request tracking (for CHANGE_NOTIFY, LOCK, etc.)
+- [x] rustsmb-session: Request context validation (session/tree/handle)
+- [x] 39 unit tests passing
 
 ### Phase 5: Authentication - PENDING
 - [ ] rustsmb-auth: AuthProvider trait implementation
