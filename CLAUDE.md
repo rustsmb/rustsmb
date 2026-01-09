@@ -414,14 +414,14 @@ Do not commit code that fails any of these checks.
 - [x] rustsmb-backend-local: Large file support (>4GB via sparse file writes)
 - [x] 13 unit tests for local backend
 
-### Phase 8: Redis State Store - PENDING
-- [ ] rustsmb-state-redis: Full StateStore implementation
-- [ ] rustsmb-state-redis: Connection pooling (deadpool-redis)
-- [ ] rustsmb-state-redis: Session state serialization (bincode or msgpack)
-- [ ] rustsmb-state-redis: TTL-based session expiration
-- [ ] rustsmb-state-redis: Distributed locking (Redlock algorithm)
-- [ ] rustsmb-state-redis: Atomic ID generation (INCR)
-- [ ] rustsmb-state-redis: Cluster support (optional)
+### Phase 8: Redis State Store - COMPLETED
+- [x] rustsmb-state-redis: Full StateStore implementation (24 methods)
+- [x] rustsmb-state-redis: Connection pooling (deadpool-redis)
+- [x] rustsmb-state-redis: Session state serialization (serde_json)
+- [x] rustsmb-state-redis: TTL-based session expiration
+- [x] rustsmb-state-redis: Distributed locking (SET NX EX with Lua scripts)
+- [x] rustsmb-state-redis: Atomic ID generation (INCR)
+- [x] rustsmb-state-redis: 6 integration tests (require Redis)
 
 ### Phase 9: Testing & Hardening - PENDING
 - [ ] Integration tests with smbclient
