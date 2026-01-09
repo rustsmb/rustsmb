@@ -57,7 +57,7 @@ All project documentation is maintained in the `docs/` directory:
 | `rustsmb-state-memory` | In-memory state store (dev/testing) |
 | `rustsmb-state-redis` | Redis state store (production) |
 | `rustsmb-state-cached` | Cached state store with LRU + epoch invalidation (Phase 12) |
-| `rustsmb-coord-raft` | Embedded Raft coordination with openraft (Phase 12) |
+| `rustsmb-coord-raft` | CoordinationBackend impl using openraft library (Phase 12) |
 | `rustsmb-backend-local` | Local filesystem backend |
 | `rustsmb-backend-memory` | In-memory filesystem (testing) |
 | `rustsmb-session` | Session/connection management |
@@ -463,9 +463,7 @@ Do not commit code that fails any of these checks.
 - [ ] Phase 12A: Extend rustsmb-state with CoordinationBackend trait
 - [ ] Phase 12A: Add bound_server_id to SessionState and HandleState
 - [ ] Phase 12B: Create rustsmb-state-cached crate (LocalCache with LRU + epoch)
-- [ ] Phase 12C: Create rustsmb-coord-raft crate (embedded Raft with openraft)
-- [ ] Phase 12C: Implement Raft state machine (epochs, leases, locks)
-- [ ] Phase 12C: Implement Raft network transport (TCP)
+- [ ] Phase 12C: Create rustsmb-coord-raft crate (RaftCoordinator using openraft)
 - [ ] Phase 12D: Server failure detection and cache invalidation
 - [ ] Phase 12E: Lease/lock coordination through Raft
 - [ ] Phase 12F: Server integration and testing

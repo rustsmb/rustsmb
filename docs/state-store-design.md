@@ -112,6 +112,50 @@ We use [openraft](https://github.com/datafuselabs/openraft) because:
 - Production-proven (Databend, CnosDB)
 - 92% test coverage
 
+### What openraft Provides vs What We Build
+
+openraft is a **Raft consensus library** - it provides the core distributed consensus algorithm. We use it as a dependency, not implement Raft ourselves.
+
+| openraft Provides | We Implement |
+|-------------------|--------------|
+| Raft consensus algorithm | `CoordinationBackend` trait |
+| Leader election | `RaftCoordinator` (implements trait using openraft) |
+| Log replication | `CoordinationState` (our application state) |
+| Heartbeat/failure detection | Business logic (leases, locks, epochs) |
+| Membership changes | |
+| Linearizable reads | |
+
+**Design principle:** The rest of RustSMB only sees `CoordinationBackend` trait. The openraft implementation details (storage, network, state machine) are encapsulated inside `RaftCoordinator`.
+
+```rust
+// The ONLY trait the rest of the system sees
+pub trait CoordinationBackend: Send + Sync + 'static {
+    fn register_server(...) -> BoxFuture<...>;
+    fn get_epoch(...) -> BoxFuture<...>;
+    fn create_lease(...) -> BoxFuture<...>;
+    // ... other coordination operations
+}
+
+// RaftCoordinator implements this trait using openraft internally
+pub struct RaftCoordinator {
+    raft: openraft::Raft<...>,           // openraft instance
+    state: Arc<RwLock<CoordinationState>>, // our application state
+    // ... internal details hidden
+}
+
+impl CoordinationBackend for RaftCoordinator {
+    // All coordination operations go through Raft consensus
+}
+```
+
+**What we don't implement:**
+- Leader election algorithm
+- Log replication protocol
+- Heartbeat/timeout logic
+- Raft consensus correctness guarantees
+
+All of these are handled by openraft internally.
+
 ### Coordination State Machine
 
 The Raft state machine manages coordination data (small dataset):
@@ -507,25 +551,24 @@ crates/
 │   └── src/
 │       ├── traits.rs                # StateStore, CoordinationBackend
 │       ├── types.rs                 # SessionState, HandleState, etc.
-│       ├── coordination.rs          # Coordination types
-│       └── invalidation.rs          # InvalidationEvent
+│       ├── coordination.rs          # Coordination types (LeaseEntry, etc.)
+│       └── lib.rs                   # Re-exports
 
 ├── rustsmb-state-cached/            # Cached state store
 │   └── src/
-│       ├── cached_store.rs          # CachedStateStore wrapper
-│       ├── cache.rs                 # LocalCache (LRU + epoch)
-│       └── watcher.rs               # Epoch change watcher
+│       ├── lib.rs                   # CachedStateStore wrapper
+│       └── cache.rs                 # LocalCache (LRU + epoch)
 
 ├── rustsmb-coord-raft/              # Embedded Raft coordination
 │   └── src/
-│       ├── raft_coordinator.rs      # RaftCoordinator
-│       ├── state_machine.rs         # CoordinationState
-│       ├── network.rs               # TCP transport
-│       ├── membership.rs            # Server membership
-│       └── storage.rs               # Raft log storage
+│       ├── lib.rs                   # RaftCoordinator (implements CoordinationBackend)
+│       └── state.rs                 # CoordinationState (application state)
+│   # Note: openraft handles storage, network, consensus internally
 
 ├── rustsmb-state-redis/             # Bulk data storage (existing)
 ```
+
+**Key simplification:** `RaftCoordinator` is the only public type from `rustsmb-coord-raft`. It implements `CoordinationBackend` and encapsulates all openraft internals (storage, network, state machine traits).
 
 ## Dependencies
 
