@@ -1172,8 +1172,15 @@ impl StorageBackend for LocalBackend {
 
                 #[cfg(target_os = "linux")]
                 fn get_fsid(stat: &libc::statfs) -> u64 {
-                    let fsid = stat.f_fsid;
-                    ((fsid.__val[0] as u64) << 32) | (fsid.__val[1] as u64)
+                    // On Linux, f_fsid is a struct with __val array (private field)
+                    // Use raw byte access to avoid accessing private fields
+                    let fsid_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            &stat.f_fsid as *const _ as *const u8,
+                            std::mem::size_of_val(&stat.f_fsid),
+                        )
+                    };
+                    u64::from_ne_bytes(fsid_bytes[..8].try_into().unwrap_or([0; 8]))
                 }
 
                 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
