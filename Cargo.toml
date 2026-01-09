@@ -107,6 +107,8 @@ path = "src/main.rs"
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+rustsmb-protocol = { workspace = true }
+binrw = { workspace = true }
 
 [[bench]]
 name = "protocol"
