@@ -343,7 +343,58 @@ cargo bench
 - [x] Message encryption (AES-128-CCM, AES-128-GCM, AES-256-GCM)
 - [x] 100 unit tests passing
 
-### Phase 4-6: Session, Auth, Server - PENDING
+### Phase 4: Session Management - PENDING
+- [ ] rustsmb-session: Connection state machine
+- [ ] rustsmb-session: Session manager with StateStore integration
+- [ ] rustsmb-session: Tree connection manager
+- [ ] rustsmb-session: File handle manager (volatile + persistent IDs)
+- [ ] rustsmb-session: Credit management for multi-credit operations
+- [ ] rustsmb-session: Compound request handling
+- [ ] rustsmb-session: Async request tracking (for CHANGE_NOTIFY, etc.)
+
+### Phase 5: Authentication - PENDING
+- [ ] rustsmb-auth: AuthProvider trait implementation
+- [ ] rustsmb-auth: Simple auth provider (username/password from config)
+- [ ] rustsmb-auth: NTLM authentication (NTLMv2)
+- [ ] rustsmb-auth: SPNEGO/GSS-API wrapper
+- [ ] rustsmb-auth: Session key derivation (SMB 3.0 KDF)
+- [ ] rustsmb-auth: Pre-auth integrity hash (SMB 3.1.1)
+- [ ] rustsmb-auth: Guest and anonymous session support
+
+### Phase 6: Server Implementation - PENDING
+- [ ] rustsmb-server: TCP listener with connection handling
+- [ ] rustsmb-server: TLS support (optional)
+- [ ] rustsmb-server: Configuration loading (TOML)
+- [ ] rustsmb-server: Share manager (share definitions, access control)
+- [ ] rustsmb-server: Command dispatcher (route to handlers)
+- [ ] rustsmb-server: All 19 command handlers implementation
+- [ ] rustsmb-server: Graceful shutdown and connection draining
+- [ ] rustsmb-server: Metrics and logging
+
 ### Phase 7: Local Filesystem Backend - PENDING
+- [ ] rustsmb-backend-local: Full StorageBackend implementation
+- [ ] rustsmb-backend-local: Path validation (prevent traversal attacks)
+- [ ] rustsmb-backend-local: File locking (advisory locks via flock)
+- [ ] rustsmb-backend-local: Extended attributes support (xattr)
+- [ ] rustsmb-backend-local: Proper permission mapping (Unix to SMB)
+- [ ] rustsmb-backend-local: Symlink handling
+- [ ] rustsmb-backend-local: Large file support (>4GB)
+
 ### Phase 8: Redis State Store - PENDING
+- [ ] rustsmb-state-redis: Full StateStore implementation
+- [ ] rustsmb-state-redis: Connection pooling (deadpool-redis)
+- [ ] rustsmb-state-redis: Session state serialization (bincode or msgpack)
+- [ ] rustsmb-state-redis: TTL-based session expiration
+- [ ] rustsmb-state-redis: Distributed locking (Redlock algorithm)
+- [ ] rustsmb-state-redis: Atomic ID generation (INCR)
+- [ ] rustsmb-state-redis: Cluster support (optional)
+
 ### Phase 9: Testing & Hardening - PENDING
+- [ ] Integration tests with smbclient
+- [ ] Integration tests with Windows client
+- [ ] Fuzz testing for protocol parser (cargo-fuzz)
+- [ ] Property-based tests for all command roundtrips
+- [ ] Stress testing (concurrent connections, large files)
+- [ ] Security audit (path traversal, buffer overflow, DoS)
+- [ ] Performance benchmarks (throughput, latency)
+- [ ] Documentation (rustdoc, examples, deployment guide)
