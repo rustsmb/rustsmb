@@ -90,11 +90,14 @@ impl Default for TreeState {
 }
 
 /// File handle state for persistence (durable handles).
+///
+/// This structure stores all information needed to reconnect a durable
+/// or persistent handle after failover.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandleState {
-    /// Persistent file ID.
+    /// Persistent file ID (survives reconnection).
     pub persistent_id: u128,
-    /// Volatile file ID.
+    /// Volatile file ID (per-connection).
     pub volatile_id: u128,
     /// Parent tree ID.
     pub tree_id: u32,
@@ -116,6 +119,52 @@ pub struct HandleState {
     pub created_at: u64,
     /// Last access timestamp.
     pub last_access: u64,
+
+    // === Phase 11: Durable handle reconnection fields ===
+    /// Create GUID for reconnection validation (hex-encoded).
+    /// Used by DH2Q/DH2C to verify client identity on reconnect.
+    #[serde(default)]
+    pub create_guid: Option<String>,
+
+    /// Current file pointer offset.
+    /// Updated on READ/WRITE operations with seek.
+    #[serde(default)]
+    pub file_offset: u64,
+
+    /// Share name (for reopening file on reconnect).
+    #[serde(default)]
+    pub share_name: String,
+
+    /// Create disposition used when opening.
+    #[serde(default)]
+    pub create_disposition: u32,
+
+    /// File attributes at open time.
+    #[serde(default)]
+    pub file_attributes: u32,
+
+    /// App instance ID for cluster failover (hex-encoded).
+    #[serde(default)]
+    pub app_instance_id: Option<String>,
+
+    /// Durable timeout in milliseconds.
+    /// How long to keep handle after disconnect before expiring.
+    #[serde(default)]
+    pub durable_timeout: u32,
+
+    /// Reconnect deadline (Unix epoch seconds).
+    /// After this time, the handle expires and cannot be reconnected.
+    #[serde(default)]
+    pub reconnect_deadline: Option<u64>,
+
+    /// Lease key for this handle (hex-encoded).
+    /// Links the handle to a lease for client caching.
+    #[serde(default)]
+    pub lease_key: Option<String>,
+
+    /// Oplock level granted to this handle.
+    #[serde(default)]
+    pub oplock_level: u8,
 }
 
 impl Default for HandleState {
@@ -137,7 +186,99 @@ impl Default for HandleState {
             is_persistent: false,
             created_at: now,
             last_access: now,
+            // Phase 11 fields
+            create_guid: None,
+            file_offset: 0,
+            share_name: String::new(),
+            create_disposition: 0,
+            file_attributes: 0,
+            app_instance_id: None,
+            durable_timeout: 0,
+            reconnect_deadline: None,
+            lease_key: None,
+            oplock_level: 0,
         }
+    }
+}
+
+impl HandleState {
+    /// Convert a 16-byte GUID to hex string for storage.
+    pub fn guid_to_hex(guid: &[u8; 16]) -> String {
+        hex::encode(guid)
+    }
+
+    /// Parse a hex string back to 16-byte GUID.
+    pub fn hex_to_guid(hex_str: &str) -> Option<[u8; 16]> {
+        let bytes = hex::decode(hex_str).ok()?;
+        if bytes.len() != 16 {
+            return None;
+        }
+        let mut guid = [0u8; 16];
+        guid.copy_from_slice(&bytes);
+        Some(guid)
+    }
+
+    /// Set create GUID from bytes.
+    pub fn set_create_guid(&mut self, guid: &[u8; 16]) {
+        self.create_guid = Some(Self::guid_to_hex(guid));
+    }
+
+    /// Get create GUID as bytes.
+    pub fn get_create_guid(&self) -> Option<[u8; 16]> {
+        self.create_guid.as_ref().and_then(|s| Self::hex_to_guid(s))
+    }
+
+    /// Set lease key from bytes.
+    pub fn set_lease_key(&mut self, key: &[u8; 16]) {
+        self.lease_key = Some(Self::guid_to_hex(key));
+    }
+
+    /// Get lease key as bytes.
+    pub fn get_lease_key(&self) -> Option<[u8; 16]> {
+        self.lease_key.as_ref().and_then(|s| Self::hex_to_guid(s))
+    }
+
+    /// Set app instance ID from bytes.
+    pub fn set_app_instance_id(&mut self, id: &[u8; 16]) {
+        self.app_instance_id = Some(Self::guid_to_hex(id));
+    }
+
+    /// Get app instance ID as bytes.
+    pub fn get_app_instance_id(&self) -> Option<[u8; 16]> {
+        self.app_instance_id
+            .as_ref()
+            .and_then(|s| Self::hex_to_guid(s))
+    }
+
+    /// Check if this handle can be reconnected.
+    pub fn can_reconnect(&self) -> bool {
+        if !self.is_durable && !self.is_persistent {
+            return false;
+        }
+
+        // Check if reconnect deadline has passed
+        if let Some(deadline) = self.reconnect_deadline {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if now > deadline {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Set reconnect deadline based on timeout.
+    pub fn set_durable_timeout(&mut self, timeout_ms: u32) {
+        self.durable_timeout = timeout_ms;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Convert ms to seconds for deadline
+        self.reconnect_deadline = Some(now + (timeout_ms as u64 / 1000));
     }
 }
 

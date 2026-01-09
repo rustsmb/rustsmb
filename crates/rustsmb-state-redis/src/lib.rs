@@ -441,6 +441,14 @@ impl StateStore for RedisStateStore {
         })
     }
 
+    fn update_handle<'a>(
+        &'a self,
+        handle: &'a HandleState,
+    ) -> BoxFuture<'a, Result<(), StateError>> {
+        // Update is the same as create - just overwrite
+        self.create_handle(handle)
+    }
+
     fn get_handles_by_session(
         &self,
         session_id: u64,

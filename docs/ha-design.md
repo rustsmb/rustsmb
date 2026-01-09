@@ -399,8 +399,8 @@ INFO conn_id=42 session_id=1000 user="alice" "Session bound (HA failover)"
 | StateStore trait | Complete |
 | MemoryStateStore | Complete |
 | RedisStateStore | Complete |
-| Session binding (server) | **TODO** |
-| HA integration tests | **TODO** |
+| Session binding (server) | Complete |
+| HA integration tests | Complete |
 
 ## References
 

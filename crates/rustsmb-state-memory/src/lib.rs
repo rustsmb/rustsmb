@@ -191,6 +191,17 @@ impl StateStore for MemoryStateStore {
         })
     }
 
+    fn update_handle<'a>(
+        &'a self,
+        handle: &'a HandleState,
+    ) -> BoxFuture<'a, Result<(), StateError>> {
+        Box::pin(async move {
+            let mut handles = self.handles.write().await;
+            handles.insert(handle.persistent_id, handle.clone());
+            Ok(())
+        })
+    }
+
     fn get_handles_by_session(
         &self,
         session_id: u64,

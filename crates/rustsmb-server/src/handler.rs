@@ -734,7 +734,8 @@ where
         body: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
         use rustsmb_protocol::create::{
-            CreateRequest, CreateResponse, CreateResponseFlags, OplockLevel,
+            parse_create_contexts, CreateContext, CreateContextBuilder, CreateRequest,
+            CreateResponse, CreateResponseFlags, OplockLevel,
         };
 
         debug!(conn_id = self.connection.id, "CREATE request");
@@ -755,6 +756,50 @@ where
         };
 
         let filename = decode_utf16le(name_bytes);
+
+        // Parse CREATE contexts if present
+        let contexts = if request.create_contexts_length > 0 {
+            let ctx_offset = request.create_contexts_offset as usize;
+            let ctx_body_offset = ctx_offset.saturating_sub(SMB2_HEADER_SIZE);
+            let ctx_len = request.create_contexts_length as usize;
+            if ctx_body_offset + ctx_len <= body.len() {
+                let ctx_data = &body[ctx_body_offset..ctx_body_offset + ctx_len];
+                parse_create_contexts(ctx_data).unwrap_or_else(|e| {
+                    warn!(conn_id = self.connection.id, error = %e, "Failed to parse CREATE contexts");
+                    vec![]
+                })
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        // Check for durable handle reconnect requests first
+        for ctx in &contexts {
+            match ctx {
+                CreateContext::DurableHandleReconnect { file_id } => {
+                    return self
+                        .handle_durable_reconnect(header, file_id.persistent_id(), None, &filename)
+                        .await;
+                }
+                CreateContext::DurableHandleReconnectV2 {
+                    file_id,
+                    create_guid,
+                    ..
+                } => {
+                    return self
+                        .handle_durable_reconnect(
+                            header,
+                            file_id.persistent_id(),
+                            Some(*create_guid),
+                            &filename,
+                        )
+                        .await;
+                }
+                _ => {}
+            }
+        }
 
         // Get share backend
         let tree = self
@@ -785,13 +830,108 @@ where
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
-        // Create handle state
+        // Check for durable handle request in contexts
+        let mut is_durable = false;
+        let mut is_persistent = false;
+        let mut create_guid: Option<[u8; 16]> = None;
+        let mut durable_timeout: u32 = 0;
+        let mut requested_oplock = OplockLevel::None;
+        let mut lease_key: Option<[u8; 16]> = None;
+        let mut lease_state: u32 = 0;
+
+        for ctx in &contexts {
+            match ctx {
+                CreateContext::DurableHandleRequest => {
+                    is_durable = true;
+                    debug!(
+                        conn_id = self.connection.id,
+                        "Durable handle requested (DHnQ)"
+                    );
+                }
+                CreateContext::DurableHandleRequestV2 {
+                    timeout,
+                    flags,
+                    create_guid: guid,
+                    ..
+                } => {
+                    is_durable = true;
+                    create_guid = Some(*guid);
+                    durable_timeout = *timeout;
+                    if flags.is_persistent() {
+                        // Persistent handles require SMB 3.0+
+                        if let Some(dialect) = self.connection.dialect {
+                            if dialect >= SmbDialect::Smb300 {
+                                is_persistent = true;
+                                debug!(
+                                    conn_id = self.connection.id,
+                                    "Persistent handle requested (DH2Q)"
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            conn_id = self.connection.id,
+                            timeout = timeout,
+                            "Durable handle V2 requested (DH2Q)"
+                        );
+                    }
+                }
+                CreateContext::LeaseRequest {
+                    lease_key: key,
+                    lease_state: state,
+                    ..
+                } => {
+                    lease_key = Some(*key);
+                    lease_state = *state;
+                    // Grant READ lease for now (simplified)
+                    if *state & 0x01 != 0 {
+                        requested_oplock = OplockLevel::Lease;
+                    }
+                    debug!(
+                        conn_id = self.connection.id,
+                        lease_state = state,
+                        "Lease requested"
+                    );
+                }
+                CreateContext::LeaseRequestV2 {
+                    lease_key: key,
+                    lease_state: state,
+                    ..
+                } => {
+                    lease_key = Some(*key);
+                    lease_state = *state;
+                    if *state & 0x01 != 0 {
+                        requested_oplock = OplockLevel::Lease;
+                    }
+                    debug!(
+                        conn_id = self.connection.id,
+                        lease_state = state,
+                        "Lease V2 requested"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Generate create GUID if durable but client didn't provide one
+        let final_create_guid = create_guid.unwrap_or_else(|| {
+            if is_durable {
+                let mut guid = [0u8; 16];
+                use rand::RngCore;
+                rand::thread_rng().fill_bytes(&mut guid);
+                guid
+            } else {
+                [0u8; 16]
+            }
+        });
+
+        // Create handle state with Phase 11 fields
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let handle = HandleState {
+        let mut handle = HandleState {
             persistent_id: handle_id,
             volatile_id: handle_id,
             tree_id: header.tree_id,
@@ -800,11 +940,39 @@ where
             access_mask: request.desired_access,
             share_access: request.share_access,
             create_options: request.create_options,
-            is_durable: false,
-            is_persistent: false,
+            is_durable,
+            is_persistent,
             created_at: now,
             last_access: now,
+            // Phase 11 fields
+            create_guid: None, // Set below if durable
+            file_offset: 0,
+            share_name: tree.share_name.clone(),
+            create_disposition: request.create_disposition,
+            file_attributes: request.file_attributes,
+            app_instance_id: None,
+            durable_timeout,
+            reconnect_deadline: None,
+            lease_key: None, // Set below if lease requested
+            oplock_level: requested_oplock.as_u8(),
         };
+
+        // Set create GUID if durable
+        if is_durable {
+            handle.set_create_guid(&final_create_guid);
+            // Set reconnect deadline based on timeout (or default 60 seconds)
+            let timeout_ms = if durable_timeout > 0 {
+                durable_timeout
+            } else {
+                60_000
+            };
+            handle.set_durable_timeout(timeout_ms);
+        }
+
+        // Set lease key if requested
+        if let Some(key) = lease_key {
+            handle.set_lease_key(&key);
+        }
 
         self.session_manager
             .create_handle(handle)
@@ -815,6 +983,8 @@ where
             conn_id = self.connection.id,
             handle_id,
             path = %filename,
+            is_durable,
+            is_persistent,
             "File opened"
         );
 
@@ -824,9 +994,45 @@ where
         let file_id_persistent = handle_id as u64;
         let file_id_volatile = (handle_id >> 64) as u64;
 
+        // Build response CREATE contexts
+        let mut ctx_builder = CreateContextBuilder::new();
+
+        // Add durable handle response if requested
+        if is_durable {
+            if is_persistent {
+                // DH2Q response for persistent handles
+                ctx_builder = ctx_builder.add_durable_handle_response_v2(durable_timeout, 0x02);
+            // PERSISTENT flag
+            } else if create_guid.is_some() {
+                // DH2Q response for durable V2
+                ctx_builder = ctx_builder.add_durable_handle_response_v2(durable_timeout, 0);
+            } else {
+                // DHnQ response for simple durable
+                ctx_builder = ctx_builder.add_durable_handle_response();
+            }
+        }
+
+        // Add lease response if requested
+        if let Some(key) = lease_key {
+            // Grant reduced lease state (simplified - just grant what was requested)
+            // In a full implementation, we'd check for conflicts and potentially break existing leases
+            let granted_state = lease_state & 0x07; // Mask to valid lease bits
+            ctx_builder = ctx_builder.add_lease_response(key, granted_state, 0);
+        }
+
+        let ctx_data = ctx_builder.build();
+        let (ctx_offset, ctx_len) = if ctx_data.is_empty() {
+            (0u32, 0u32)
+        } else {
+            // Context offset is from start of SMB2 header
+            // Header (64) + CreateResponse fixed part (88) = 152
+            // But CreateResponse structure_size is 89 which includes variable parts
+            (152u32, ctx_data.len() as u32)
+        };
+
         let response = CreateResponse {
             structure_size: 89,
-            oplock_level: OplockLevel::None,
+            oplock_level: requested_oplock,
             flags: CreateResponseFlags(0),
             create_action: 1, // Opened
             creation_time: current_filetime(),
@@ -839,11 +1045,215 @@ where
             reserved2: 0,
             file_id_persistent,
             file_id_volatile,
-            create_contexts_offset: 0,
-            create_contexts_length: 0,
+            create_contexts_offset: ctx_offset,
+            create_contexts_length: ctx_len,
         };
 
-        self.serialize_response(&resp_header, &response)
+        let mut result = self.serialize_response(&resp_header, &response)?;
+
+        // Append CREATE contexts if any
+        if !ctx_data.is_empty() {
+            result.extend_from_slice(&ctx_data);
+        }
+
+        Ok(result)
+    }
+
+    /// Handle durable handle reconnection.
+    ///
+    /// This is called when a client sends CREATE with DurableHandleReconnect
+    /// or DurableHandleReconnectV2 to reconnect to an existing handle after
+    /// failover or network disconnection.
+    async fn handle_durable_reconnect(
+        &mut self,
+        header: &Smb2Header,
+        persistent_id: u64,
+        create_guid: Option<[u8; 16]>,
+        filename: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        use rustsmb_protocol::create::{
+            CreateContextBuilder, CreateResponse, CreateResponseFlags, OplockLevel,
+        };
+
+        debug!(
+            conn_id = self.connection.id,
+            persistent_id,
+            path = %filename,
+            "Durable handle reconnect request"
+        );
+
+        // Look up the existing handle by persistent_id
+        let handle_id = persistent_id as u128;
+        let mut handle = self
+            .session_manager
+            .get_handle(handle_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or_else(|| {
+                warn!(
+                    conn_id = self.connection.id,
+                    persistent_id, "Durable handle reconnect failed: handle not found"
+                );
+                HandlerError::Status(NtStatus::ObjectNameNotFound)
+            })?;
+
+        // Verify handle is durable
+        if !handle.is_durable && !handle.is_persistent {
+            warn!(
+                conn_id = self.connection.id,
+                persistent_id, "Durable handle reconnect failed: handle not durable"
+            );
+            return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+        }
+
+        // Check if handle can still be reconnected (within timeout)
+        if !handle.can_reconnect() {
+            warn!(
+                conn_id = self.connection.id,
+                persistent_id, "Durable handle reconnect failed: handle expired"
+            );
+            // Clean up expired handle
+            let _ = self.session_manager.delete_handle(handle_id).await;
+            return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+        }
+
+        // Validate create GUID for V2 reconnect
+        if let Some(client_guid) = create_guid {
+            if let Some(stored_guid) = handle.get_create_guid() {
+                if client_guid != stored_guid {
+                    warn!(
+                        conn_id = self.connection.id,
+                        persistent_id, "Durable handle reconnect failed: GUID mismatch"
+                    );
+                    return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+                }
+            }
+        }
+
+        // Verify the path matches (security check)
+        if !filename.is_empty() && handle.path != filename {
+            warn!(
+                conn_id = self.connection.id,
+                persistent_id,
+                expected = %handle.path,
+                got = %filename,
+                "Durable handle reconnect failed: path mismatch"
+            );
+            return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+        }
+
+        // Get the backend and verify we can still open the file
+        let tree = self
+            .session_manager
+            .get_tree(header.session_id, header.tree_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
+
+        let backend = self
+            .shares
+            .get_share(&tree.share_name)
+            .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
+
+        // Re-open the file with original access mask
+        let open_flags = rustsmb_vfs::OpenFlags::new(
+            rustsmb_vfs::OpenFlags::READ | rustsmb_vfs::OpenFlags::WRITE,
+        );
+        let _file_handle = backend
+            .open(&handle.path, open_flags, 0o644)
+            .await
+            .map_err(|e| {
+                warn!(
+                    conn_id = self.connection.id,
+                    persistent_id,
+                    error = %e,
+                    "Durable handle reconnect failed: cannot reopen file"
+                );
+                HandlerError::Status(NtStatus::ObjectNameNotFound)
+            })?;
+
+        // Update handle state for new connection
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        handle.session_id = header.session_id;
+        handle.tree_id = header.tree_id;
+        handle.last_access = now;
+        // Generate new volatile ID for this connection
+        handle.volatile_id = handle.persistent_id; // Simplified - use same ID
+
+        // Update handle in state store
+        self.session_manager
+            .update_handle(handle.clone())
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+        info!(
+            conn_id = self.connection.id,
+            session_id = header.session_id,
+            persistent_id,
+            path = %handle.path,
+            "Durable handle reconnected"
+        );
+
+        // Build response
+        let resp_header = self.build_response_header(header, NtStatus::Success);
+
+        let file_id_persistent = handle.persistent_id as u64;
+        let file_id_volatile = (handle.persistent_id >> 64) as u64;
+
+        // Build response contexts
+        let mut ctx_builder = CreateContextBuilder::new();
+        if handle.is_persistent {
+            ctx_builder = ctx_builder.add_durable_handle_response_v2(handle.durable_timeout, 0x02);
+        } else if create_guid.is_some() {
+            ctx_builder = ctx_builder.add_durable_handle_response_v2(handle.durable_timeout, 0);
+        } else {
+            ctx_builder = ctx_builder.add_durable_handle_response();
+        }
+
+        // Add lease response if handle had a lease
+        if let Some(key) = handle.get_lease_key() {
+            // Restore previous lease state (simplified)
+            ctx_builder = ctx_builder.add_lease_response(key, 0x01, 0); // Grant READ caching
+        }
+
+        let ctx_data = ctx_builder.build();
+        let (ctx_offset, ctx_len) = if ctx_data.is_empty() {
+            (0u32, 0u32)
+        } else {
+            (152u32, ctx_data.len() as u32)
+        };
+
+        let oplock_level = OplockLevel::from_u8(handle.oplock_level);
+
+        let response = CreateResponse {
+            structure_size: 89,
+            oplock_level,
+            flags: CreateResponseFlags(0),
+            create_action: 1, // Opened
+            creation_time: current_filetime(),
+            last_access_time: current_filetime(),
+            last_write_time: current_filetime(),
+            change_time: current_filetime(),
+            allocation_size: 0,
+            end_of_file: 0,
+            file_attributes: handle.file_attributes,
+            reserved2: 0,
+            file_id_persistent,
+            file_id_volatile,
+            create_contexts_offset: ctx_offset,
+            create_contexts_length: ctx_len,
+        };
+
+        let mut result = self.serialize_response(&resp_header, &response)?;
+        if !ctx_data.is_empty() {
+            result.extend_from_slice(&ctx_data);
+        }
+
+        Ok(result)
     }
 
     async fn handle_close(

@@ -14,6 +14,7 @@ All project documentation is maintained in the `docs/` directory:
 | [docs/architecture.md](./docs/architecture.md) | Detailed system architecture, core traits, data flow, and design decisions |
 | [docs/ksmbd-research.md](./docs/ksmbd-research.md) | Linux kernel ksmbd research notes and lessons learned |
 | [docs/ha-design.md](./docs/ha-design.md) | High availability design, session binding, Redis state store |
+| [docs/persistent-handles-leases.md](./docs/persistent-handles-leases.md) | Persistent handles and leases for enterprise HA |
 
 ### Documentation Update Policy
 
@@ -441,3 +442,14 @@ Do not commit code that fails any of these checks.
 - [x] Custom SMB2 test client (tests/ha_client.rs) for session binding tests
 - [x] HA integration tests (tests/integration_ha.rs) with Redis state store
 - [x] CI workflow for HA tests with Redis service container
+
+### Phase 11: Persistent Handles & Leases - PLANNED
+- [x] docs/persistent-handles-leases.md: Design document for persistent handles and leases
+- [ ] Phase 11A: CREATE context parsing (DHnQ, DHnC, DH2Q, DH2C, RqLs)
+- [ ] Phase 11A: Durable handle request/reconnect support
+- [ ] Phase 11A: Extend HandleState with reconnection fields
+- [ ] Phase 11B: Lease request/response contexts (LeaseV1, LeaseV2)
+- [ ] Phase 11B: LeaseManager state machine
+- [ ] Phase 11B: Oplock break notifications and acknowledgment
+- [ ] Phase 11C: Persistent handles (SMB3 Continuous Availability)
+- [ ] Integration tests for handle failover

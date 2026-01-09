@@ -27,8 +27,10 @@ pub use cancel::*;
 pub use change_notify::*;
 pub use close::*;
 pub use create::{
-    CreateAction, CreateDisposition, CreateOptions, CreateRequest, CreateResponse,
-    CreateResponseFlags, ImpersonationLevel, CREATE_REQUEST_SIZE, CREATE_RESPONSE_SIZE,
+    create_context_name, parse_create_contexts, CreateAction, CreateContext, CreateContextBuilder,
+    CreateContextError, CreateContextHeader, CreateDisposition, CreateOptions, CreateRequest,
+    CreateResponse, CreateResponseFlags, DurableHandleFlags, FileId, ImpersonationLevel,
+    CREATE_REQUEST_SIZE, CREATE_RESPONSE_SIZE,
 };
 // OplockLevel is in both create and oplock_break - use oplock_break's version
 pub use create::OplockLevel as CreateOplockLevel;

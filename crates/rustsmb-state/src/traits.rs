@@ -85,6 +85,12 @@ pub trait StateStore: Send + Sync + 'static {
         persistent_id: u128,
     ) -> BoxFuture<'_, Result<Option<HandleState>, StateError>>;
 
+    /// Update an existing handle.
+    fn update_handle<'a>(
+        &'a self,
+        handle: &'a HandleState,
+    ) -> BoxFuture<'a, Result<(), StateError>>;
+
     /// List handles for a session.
     fn get_handles_by_session(
         &self,

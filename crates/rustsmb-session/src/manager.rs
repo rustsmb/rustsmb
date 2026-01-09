@@ -182,6 +182,12 @@ impl SessionManager {
         self.state_store.get_handle(persistent_id).await
     }
 
+    /// Update an existing file handle.
+    pub async fn update_handle(&self, handle: HandleState) -> Result<(), StateError> {
+        debug!("Updating handle: persistent_id={}", handle.persistent_id);
+        self.state_store.update_handle(&handle).await
+    }
+
     /// Delete a file handle.
     pub async fn delete_handle(&self, persistent_id: u128) -> Result<(), StateError> {
         debug!("Deleting handle: persistent_id={}", persistent_id);
