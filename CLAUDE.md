@@ -17,7 +17,7 @@ All project documentation is maintained in the `docs/` directory:
 ### Documentation Update Policy
 
 - Update relevant docs after completing each task
-- Commit changes after completing each phase
+- Run `make ci doc` and commit changes after completing each phase
 - Keep CLAUDE.md as the entry point referencing all other docs
 
 ## Architecture
@@ -394,15 +394,15 @@ Do not commit code that fails any of these checks.
 - [x] rustsmb-auth: CompositeAuthProvider for chaining providers
 - [x] 48 unit tests passing
 
-### Phase 6: Server Implementation - PENDING
-- [ ] rustsmb-server: TCP listener with connection handling
-- [ ] rustsmb-server: TLS support (optional)
-- [ ] rustsmb-server: Configuration loading (TOML)
-- [ ] rustsmb-server: Share manager (share definitions, access control)
-- [ ] rustsmb-server: Command dispatcher (route to handlers)
-- [ ] rustsmb-server: All 19 command handlers implementation
-- [ ] rustsmb-server: Graceful shutdown and connection draining
-- [ ] rustsmb-server: Metrics and logging
+### Phase 6: Server Implementation - COMPLETED
+- [x] rustsmb-server: TCP listener with connection handling
+- [x] rustsmb-server: TLS support (optional)
+- [x] rustsmb-server: Configuration loading (TOML)
+- [x] rustsmb-server: Share manager (share definitions, access control)
+- [x] rustsmb-server: Command dispatcher (route to handlers)
+- [x] rustsmb-server: All 19 command handlers implementation
+- [x] rustsmb-server: Graceful shutdown and connection draining
+- [x] rustsmb-server: Metrics and logging (via tracing)
 
 ### Phase 7: Local Filesystem Backend - PENDING
 - [ ] rustsmb-backend-local: Full StorageBackend implementation

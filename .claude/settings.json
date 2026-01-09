@@ -2,6 +2,7 @@
   "permissions": {
     "allow": [
       "Bash(cargo:*)",
+      "Bash(make:*)",
       "Bash(git:*)",
       "Bash(rustup:*)",
       "Bash(rustc:*)",
