@@ -267,7 +267,36 @@ cargo run -- --config config.toml
 
 # Run benchmarks
 cargo bench
+
+# Or use Makefile shortcuts
+make test      # Run all tests
+make clippy    # Run clippy
+make fmt       # Format code
+make ci        # Run fmt-check + clippy + test (full CI)
 ```
+
+## Development Workflow
+
+**IMPORTANT: After completing each task, always run:**
+
+```bash
+make ci
+```
+
+Or manually:
+
+```bash
+cargo fmt --all
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
+```
+
+This ensures:
+1. Code is properly formatted
+2. No clippy warnings
+3. All tests pass
+
+Do not commit code that fails any of these checks.
 
 ## Protocol References
 
