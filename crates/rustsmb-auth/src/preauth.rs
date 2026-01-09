@@ -14,11 +14,11 @@
 //! The pre-auth integrity hash is computed as:
 //!
 //! ```text
-//! PreauthHash[n+1] = SHA-512(PreauthHash[n] || Message)
+//! PreauthHash\[n+1\] = SHA-512(PreauthHash\[n\] || Message)
 //! ```
 //!
 //! Where:
-//! - PreauthHash[0] = all zeros (64 bytes)
+//! - `PreauthHash[0]` = all zeros (64 bytes)
 //! - Message = SMB2 message including header and body
 
 use sha2::{Digest, Sha512};
@@ -109,7 +109,7 @@ impl PreauthIntegrityHash {
 
     /// Update the hash with a message.
     ///
-    /// Computes: Hash[n+1] = SHA-512(Hash[n] || Message)
+    /// Computes: `Hash[n+1] = SHA-512(Hash[n] || Message)`
     ///
     /// # Arguments
     ///

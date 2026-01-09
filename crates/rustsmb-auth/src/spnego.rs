@@ -148,7 +148,10 @@ impl SpnegoProvider {
                         response_token: resp,
                     })
                 }
-                AuthResult::Success { user: _, session_key: _ } => {
+                AuthResult::Success {
+                    user: _,
+                    session_key: _,
+                } => {
                     let resp = build_neg_token_resp(
                         Some(NegState::AcceptCompleted),
                         Some(&self.mech_oid),
@@ -218,8 +221,7 @@ impl SpnegoProvider {
                 })
             }
             AuthResult::Success { user, session_key } => {
-                let _resp =
-                    build_neg_token_resp(Some(NegState::AcceptCompleted), None, None, None);
+                let _resp = build_neg_token_resp(Some(NegState::AcceptCompleted), None, None, None);
                 Ok(AuthResult::Success { user, session_key })
             }
             AuthResult::Failure { reason } => {
