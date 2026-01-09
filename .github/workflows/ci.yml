@@ -87,17 +87,25 @@ jobs:
           wsl -d Ubuntu -- bash -c 'source $HOME/.cargo/env && rustc --version'
 
       - name: Build server in WSL2
-        run: wsl -d Ubuntu -- bash -c 'source $HOME/.cargo/env && cd /mnt/c/Users/runneradmin/work/rustsmb/rustsmb && cargo build --release --package rustsmb-server'
+        shell: pwsh
+        run: |
+          # Convert Windows path to WSL path
+          $wslPath = wsl -d Ubuntu -- wslpath -u '${{ github.workspace }}'
+          echo "WSL workspace path: $wslPath"
+          wsl -d Ubuntu -- bash -c "source `$HOME/.cargo/env && cd $wslPath && cargo build --release --package rustsmb-server"
 
       - name: Start SMB server in WSL2
         shell: pwsh
         run: |
+          # Convert Windows path to WSL path
+          $wslPath = wsl -d Ubuntu -- wslpath -u '${{ github.workspace }}'
+
           # Get WSL2 IP address
           $wslIp = (wsl -d Ubuntu -- hostname -I).Trim().Split()[0]
           echo "WSL2 IP: $wslIp"
 
           # Start server in background on port 445
-          Start-Process -NoNewWindow wsl -ArgumentList "-d", "Ubuntu", "--", "bash", "-c", "source `$HOME/.cargo/env && cd /mnt/c/Users/runneradmin/work/rustsmb/rustsmb && RUST_LOG=info ./target/release/rustsmb --listen 0.0.0.0:445 2>&1 | tee /tmp/smb-server.log"
+          Start-Process -NoNewWindow wsl -ArgumentList "-d", "Ubuntu", "--", "bash", "-c", "source `$HOME/.cargo/env && cd $wslPath && RUST_LOG=info ./target/release/rustsmb --listen 0.0.0.0:445 2>&1 | tee /tmp/smb-server.log"
 
           # Wait for server to start
           Start-Sleep -Seconds 5
