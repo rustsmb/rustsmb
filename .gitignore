@@ -25,3 +25,8 @@ Thumbs.db
 tests/samba/
 tests/smbtorture-bin/
 test-results/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
