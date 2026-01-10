@@ -4,53 +4,189 @@ This document describes the design for RustSMB's hyperscale state store, enablin
 
 ## Overview
 
-The state store uses a three-tier architecture:
+The state management uses two separate subsystems with different responsibilities:
 
-1. **Local Cache** - LRU cache with epoch-based invalidation (~10μs reads)
-2. **Coordination Layer** - Embedded Raft for consensus (~1ms operations)
-3. **Bulk Data Layer** - Redis for persistent state storage (~1-5ms operations)
+| Subsystem | Trait | Implementation | Purpose |
+|-----------|-------|----------------|---------|
+| **State Store** | `StateStore` | `CachedStateStore` wrapping `RedisStateStore` | Session/handle/tree CRUD |
+| **Coordination** | `CoordinationBackend` | `RaftCoordinator` | Server membership, leases, locks, epochs |
+
+## Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                       SMB Clients (1000+)                       │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │
-                    ┌───────────▼───────────┐
-                    │    Load Balancer      │
-                    └───────────┬───────────┘
-                                │
-    ┌───────────────────────────┼───────────────────────────┐
-    │                           │                           │
-    ▼                           ▼                           ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  RustSMB #1     │     │  RustSMB #2     │     │  RustSMB #N     │
-│ ┌─────────────┐ │     │ ┌─────────────┐ │     │ ┌─────────────┐ │
-│ │ LocalCache  │ │     │ │ LocalCache  │ │     │ │ LocalCache  │ │
-│ │ (LRU+Epoch) │ │     │ │ (LRU+Epoch) │ │     │ │ (LRU+Epoch) │ │
-│ └──────┬──────┘ │     │ └──────┬──────┘ │     │ └──────┬──────┘ │
-│ ┌──────▼──────┐ │     │ ┌──────▼──────┐ │     │ ┌──────▼──────┐ │
-│ │CachedStore  │ │     │ │CachedStore  │ │     │ │CachedStore  │ │
-│ └──────┬──────┘ │     │ └──────┬──────┘ │     │ └──────┬──────┘ │
-│ ┌──────▼──────┐ │     │ ┌──────▼──────┐ │     │ ┌──────▼──────┐ │
-│ │ Raft Node   │◄┼─────┼►│ Raft Node   │◄┼─────┼►│ Raft Node   │ │
-│ │ (Embedded)  │ │     │ │ (Embedded)  │ │     │ │ (Embedded)  │ │
-│ └─────────────┘ │     │ └─────────────┘ │     │ └─────────────┘ │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │
-                                 ▼
-                  ┌─────────────────────────────┐
-                  │     Bulk Data Layer         │
-                  │  ┌───────────────────────┐  │
-                  │  │     Redis Cluster     │  │
-                  │  │  ─────────────────    │  │
-                  │  │  • SessionState       │  │
-                  │  │  • HandleState (10M+) │  │
-                  │  │  • TreeState          │  │
-                  │  │  • LockState          │  │
-                  │  └───────────────────────┘  │
-                  └─────────────────────────────┘
+                              SMB Clients (1000+)
+                                      │
+                            ┌─────────▼─────────┐
+                            │   Load Balancer   │
+                            └─────────┬─────────┘
+                                      │
+        ┌─────────────────────────────┼─────────────────────────────┐
+        │                             │                             │
+        ▼                             ▼                             ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                            RustSMB Server                                 │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                      ServerCoordination                             │  │
+│  │           (orchestrates both subsystems, listens to epoch)          │  │
+│  └───────────────────────────┬─────────────────────────────────────────┘  │
+│                              │                                            │
+│            ┌─────────────────┴─────────────────┐                          │
+│            │                                   │                          │
+│            ▼                                   ▼                          │
+│  ┌───────────────────────┐         ┌───────────────────────┐              │
+│  │                       │         │                       │              │
+│  │  StateStore Path      │         │ CoordinationBackend   │              │
+│  │                       │         │                       │              │
+│  │  ┌─────────────────┐  │ epoch   │  ┌─────────────────┐  │              │
+│  │  │CachedStateStore │◄─┼─changes─┼──│ RaftCoordinator │  │              │
+│  │  │ ┌─────────────┐ │  │         │  │ (tikv/raft-rs)  │  │              │
+│  │  │ │ LocalCache  │ │  │         │  └────────┬────────┘  │              │
+│  │  │ │ (LRU+Epoch) │ │  │         │           │           │              │
+│  │  │ └─────────────┘ │  │         │  ┌────────▼────────┐  │              │
+│  │  └────────┬────────┘  │         │  │CoordinationState│  │              │
+│  │           │           │         │  │   (in-memory,   │  │              │
+│  │  ┌────────▼────────┐  │         │  │    replicated)  │  │              │
+│  │  │ RedisStateStore │  │         │  └─────────────────┘  │              │
+│  │  │   (bulk data)   │  │         │                       │              │
+│  │  └─────────────────┘  │         └───────────────────────┘              │
+│  │                       │                    │                           │
+│  └───────────────────────┘                    │                           │
+│             │                                 │ Raft Protocol             │
+└─────────────┼─────────────────────────────────┼───────────────────────────┘
+              │                                 │
+              │                                 │ (consensus between servers)
+              │                                 │
+              ▼                                 │
+    ┌──────────────────┐                        │
+    │  Redis Cluster   │◄───────────────────────┘
+    │  ───────────────  │
+    │  • SessionState  │
+    │  • HandleState   │
+    │  • TreeState     │
+    │  • LockState     │
+    └──────────────────┘
+```
+
+## Crate Relationships
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              rustsmb-server                                 │
+│                         ServerCoordination struct                           │
+│    - Creates and owns both CachedStateStore and RaftCoordinator             │
+│    - Listens to epoch changes and invalidates cache                         │
+│    - Spawns heartbeat task                                                  │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │ uses
+              ┌─────────────────────┴─────────────────────┐
+              │                                           │
+              ▼                                           ▼
+┌──────────────────────────────┐            ┌──────────────────────────────┐
+│    rustsmb-state-cached      │            │     rustsmb-coord-raft       │
+│    ─────────────────────     │            │     ──────────────────       │
+│    CachedStateStore          │            │     RaftCoordinator          │
+│    • Wraps any StateStore    │            │     • Uses tikv/raft-rs      │
+│    • LRU cache per type      │            │     • Manages CoordinationState
+│    • Epoch-based invalidation│            │     • Broadcasts epoch changes│
+│    impl StateStore           │            │     impl CoordinationBackend │
+└──────────────┬───────────────┘            └──────────────────────────────┘
+               │ wraps                                     │
+               ▼                                           │ imports types
+┌──────────────────────────────┐                           │
+│    rustsmb-state-redis       │                           │
+│    ────────────────────      │                           │
+│    RedisStateStore           │                           │
+│    • Connection pooling      │                           │
+│    • JSON serialization      │                           │
+│    • TTL management          │                           │
+│    impl StateStore           │                           │
+└──────────────┬───────────────┘                           │
+               │ implements                                │
+               ▼                                           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              rustsmb-state                                  │
+│  ┌───────────────────────────────────┐ ┌───────────────────────────────────┐│
+│  │       trait StateStore            │ │    trait CoordinationBackend      ││
+│  │ ─────────────────────────────     │ │ ─────────────────────────────     ││
+│  │ Session CRUD:                     │ │ Server membership:                ││
+│  │  • create/get/update/delete_session│ │  • register_server               ││
+│  │  • list_sessions                  │ │  • leave_cluster                  ││
+│  │                                   │ │  • get_servers                    ││
+│  │ Tree CRUD:                        │ │  • subscribe_server_failures      ││
+│  │  • create/get/delete_tree         │ │                                   ││
+│  │                                   │ │ Cache epoch:                      ││
+│  │ Handle CRUD:                      │ │  • get_epoch                      ││
+│  │  • create/get/update/delete_handle│ │  • subscribe_epoch_changes        ││
+│  │                                   │ │                                   ││
+│  │ Lock persistence:                 │ │ Lease coordination:               ││
+│  │  • create/get/delete_lock         │ │  • create/get/update/delete_lease ││
+│  │  (per-handle, for recovery)       │ │  • check_lease_conflict           ││
+│  │                                   │ │  • request_lease_break            ││
+│  │ ID generation:                    │ │                                   ││
+│  │  • next_session_id/tree_id/handle_id│ │ Lock coordination:              ││
+│  │                                   │ │  • acquire_lock (conflict check)  ││
+│  └───────────────────────────────────┘ │  • release_lock                   ││
+│                                        │  • get_locks_for_file             ││
+│                                        └───────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Data Storage Separation
+
+| Data | StateStore (Redis) | Coordinator (Raft) | Purpose |
+|------|:------------------:|:------------------:|---------|
+| **SessionState** | Persisted | - | User auth, session keys, dialect |
+| **TreeState** | Persisted | - | Share connections |
+| **HandleState** | Persisted | - | File handles (10M+), durable info |
+| **LockState** | Per-handle | - | Lock persistence for reconnection |
+| **ServerRegistration** | - | Replicated | Cluster membership, heartbeats |
+| **LeaseEntry** | - | Replicated | SMB lease state & conflicts |
+| **DistributedLock** | - | Replicated | Cross-server lock conflicts |
+| **cache_epoch** | - | Replicated | Cache invalidation trigger |
+
+### Why Locks Exist in Both?
+
+| Layer | Type | Key | Purpose |
+|-------|------|-----|---------|
+| **Redis** | `LockState` | `persistent_id` (handle) | Persistence, recovery on reconnect |
+| **Raft** | `DistributedLock` | `file_path` | Real-time conflict detection |
+
+## Data Flow
+
+### Read (Cache Hit) - ~10us
+```
+Client -> Server -> CachedStateStore -> LocalCache (hit) -> Response
+```
+
+### Read (Cache Miss) - ~1-5ms
+```
+Client -> Server -> CachedStateStore -> LocalCache (miss)
+                                     -> RedisStateStore -> Update Cache -> Response
+```
+
+### Write - ~1-5ms
+```
+Client -> Server -> CachedStateStore -> RedisStateStore (write)
+                                     -> Update Cache -> Response
+```
+
+### Coordination (Lease/Lock) - ~1-5ms
+```
+Client -> Server -> RaftCoordinator -> Raft Consensus
+                                    -> CoordinationState (apply) -> Response
+```
+
+### Server Failure - ~15s detection
+```
+Server A crashes
+    -> Raft election timeout (10-15s)
+    -> New leader elected
+    -> RaftCoordinator.handle_server_failure()
+        -> Unregister server
+        -> Increment epoch        -----> All servers: CachedStateStore.invalidate_all()
+        -> Release server's locks
+        -> Release server's leases
 ```
 
 ## Requirements
@@ -62,28 +198,6 @@ The state store uses a three-tier architecture:
 | Failure detection | 15 seconds |
 | Cache invalidation | All caches invalidate on any server failure |
 | Deployment | Bare metal/VMs (no Kubernetes) |
-
-## Data Flow
-
-### Read (Cache Hit) - ~10μs
-```
-Client → Server → LocalCache (hit) → Response
-```
-
-### Read (Cache Miss) - ~1-5ms
-```
-Client → Server → LocalCache (miss) → Redis → Update Cache → Response
-```
-
-### Write - ~1-5ms
-```
-Client → Server → Redis (write) → Raft (invalidation) → Response
-```
-
-### Coordination (Lease/Lock) - ~1-5ms
-```
-Client → Server → Raft (consensus) → Redis (if needed) → Response
-```
 
 ## Embedded Raft Coordination
 
@@ -144,7 +258,7 @@ pub struct CoordinationState {
     pub servers: HashMap<String, ServerRegistration>,
 
     /// SMB lease table (lease_key -> LeaseEntry)
-    pub leases: HashMap<[u8; 16], LeaseEntry>,
+    pub leases: HashMap<String, LeaseEntry>,
 
     /// Active byte-range locks (for conflict detection)
     pub locks: HashMap<String, Vec<DistributedLock>>,
@@ -154,22 +268,28 @@ pub struct CoordinationState {
 ### Raft Commands
 
 ```rust
-pub enum RaftCommand {
+pub enum CoordRequest {
     // Server membership
-    AddServer(ServerRegistration),
-    RemoveServer(String),
+    RegisterServer(ServerRegistration),
+    UnregisterServer(String),
+    UpdateHeartbeat { server_id, timestamp },
 
     // Cache invalidation
     IncrementEpoch,
 
     // Lease management
     CreateLease(LeaseEntry),
-    BreakLease { lease_key: [u8; 16], new_state: u32 },
-    ReleaseLease([u8; 16]),
+    UpdateLease(LeaseEntry),
+    DeleteLease(String),
+    CheckLeaseConflict { file_path, requestor_lease_key, requested_state },
+    ReleaseLeasesForServer(String),
 
     // Lock management
     AcquireLock(DistributedLock),
     ReleaseLock(u64),
+    ReleaseLocksForSession(u64),
+    ReleaseLocksForHandle(u128),
+    ReleaseLocksForServer(String),
 }
 ```
 
@@ -273,25 +393,25 @@ pub struct CacheConfig {
 
 ```
 Server A                  Raft Cluster              Server B & C
-   │                          │                          │
-   ├──AppendEntries (5s)─────►│                          │
-   │◄─────────────────────────┤                          │
-   │                          │                          │
-   ├──AppendEntries (5s)─────►│                          │
-   │◄─────────────────────────┤                          │
-   │                          │                          │
-   ✗ [CRASH]                  │                          │
-                              │                          │
-              [election_timeout (10-15s)]                │
-                              │                          │
-                    [New leader elected]                 │
-                              │                          │
-                              ├──RemoveServer(A)────────►│
-                              ├──IncrementEpoch─────────►│
-                              │                          │
-                              │         ┌────────────────┤
-                              │         │ invalidate_all()
-                              │         └────────────────┤
+   |                          |                          |
+   |--AppendEntries (5s)----->|                          |
+   |<-------------------------|                          |
+   |                          |                          |
+   |--AppendEntries (5s)----->|                          |
+   |<-------------------------|                          |
+   |                          |                          |
+   X [CRASH]                  |                          |
+                              |                          |
+              [election_timeout (10-15s)]                |
+                              |                          |
+                    [New leader elected]                 |
+                              |                          |
+                              |--RemoveServer(A)-------->|
+                              |--IncrementEpoch--------->|
+                              |                          |
+                              |         +----------------+
+                              |         | invalidate_all()
+                              |         +----------------+
 ```
 
 ### Timing Parameters
@@ -302,62 +422,6 @@ Server A                  Raft Cluster              Server B & C
 | Election timeout | 10-15 seconds | Random, triggers leader election |
 | Failure detection | ~15 seconds | Max time to detect dead server |
 
-## Coordination Backend Trait
-
-```rust
-pub trait CoordinationBackend: Send + Sync + 'static {
-    // === Server Membership ===
-    fn register_server<'a>(
-        &'a self,
-        registration: &'a ServerRegistration,
-    ) -> BoxFuture<'a, Result<(), CoordError>>;
-
-    fn leave_cluster(&self) -> BoxFuture<'_, Result<(), CoordError>>;
-
-    fn get_servers(&self) -> BoxFuture<'_, Result<Vec<ServerRegistration>, CoordError>>;
-
-    // === Cache Epoch ===
-    fn get_epoch(&self) -> BoxFuture<'_, Result<u64, CoordError>>;
-
-    fn subscribe_epoch_changes(&self) -> BoxFuture<'_, EpochStream>;
-
-    // === Lease Coordination ===
-    fn create_lease<'a>(
-        &'a self,
-        lease: &'a LeaseEntry,
-    ) -> BoxFuture<'a, Result<(), CoordError>>;
-
-    fn get_lease(
-        &self,
-        lease_key: &[u8; 16],
-    ) -> BoxFuture<'_, Result<Option<LeaseEntry>, CoordError>>;
-
-    fn break_lease<'a>(
-        &'a self,
-        lease_key: &[u8; 16],
-        new_state: u32,
-    ) -> BoxFuture<'a, Result<(), CoordError>>;
-
-    fn subscribe_lease_breaks(
-        &self,
-        server_id: &str,
-    ) -> BoxFuture<'_, LeaseBreakStream>;
-
-    // === Lock Coordination ===
-    fn acquire_lock<'a>(
-        &'a self,
-        lock: &'a DistributedLock,
-    ) -> BoxFuture<'a, Result<bool, CoordError>>;
-
-    fn release_lock(&self, lock_id: u64) -> BoxFuture<'_, Result<(), CoordError>>;
-
-    fn get_locks_for_file(
-        &self,
-        path: &str,
-    ) -> BoxFuture<'_, Result<Vec<DistributedLock>, CoordError>>;
-}
-```
-
 ## Lease Coordination
 
 ### Lease Entry
@@ -365,10 +429,10 @@ pub trait CoordinationBackend: Send + Sync + 'static {
 ```rust
 pub struct LeaseEntry {
     /// Unique lease key (usually derived from file path)
-    pub lease_key: [u8; 16],
+    pub lease_key: String,
 
     /// Client that owns this lease
-    pub client_id: String,
+    pub client_guid: String,
 
     /// Session owning the lease
     pub session_id: u64,
@@ -388,23 +452,23 @@ pub struct LeaseEntry {
 
 ```
 Client A          Server 1         Raft           Server 2    Client B
-   │                 │              │                 │           │
-   │  Has lease RWH  │              │                 │           │
-   │  on file.txt    │              │                 │           │
-   │                 │              │                 │◄──CREATE──┤
-   │                 │              │                 │  file.txt │
-   │                 │              │                 │  want W   │
-   │                 │              │◄──BreakLease────┤           │
-   │                 │              │  (file.txt,W)   │           │
-   │                 │◄─────────────│ Apply break     │           │
-   │◄──OPLOCK_BREAK──│              │                 │           │
-   │  (new_state=R)  │              │                 │           │
-   ├──flush writes──►│              │                 │           │
-   ├──OPLOCK_ACK────►│              │                 │           │
-   │                 │──AckBreak───►│                 │           │
-   │                 │              │──Lease granted─►│           │
-   │                 │              │                 ├──CREATE───►
-   │                 │              │                 │  response │
+   |                 |              |                 |           |
+   |  Has lease RWH  |              |                 |           |
+   |  on file.txt    |              |                 |           |
+   |                 |              |                 |<--CREATE--|
+   |                 |              |                 |  file.txt |
+   |                 |              |                 |  want W   |
+   |                 |              |<--BreakLease----|           |
+   |                 |              |  (file.txt,W)   |           |
+   |                 |<-------------|  Apply break    |           |
+   |<--OPLOCK_BREAK--|              |                 |           |
+   |  (new_state=R)  |              |                 |           |
+   |--flush writes-->|              |                 |           |
+   |--OPLOCK_ACK---->|              |                 |           |
+   |                 |--AckBreak--->|                 |           |
+   |                 |              |--Lease granted->|           |
+   |                 |              |                 |--CREATE-->|
+   |                 |              |                 |  response |
 ```
 
 ## Lock Conflict Detection
@@ -517,32 +581,6 @@ async fn cleanup_dead_server(server_id: &str, bulk_store: &dyn BulkStateStore) {
 }
 ```
 
-## Crate Structure
-
-```
-crates/
-├── rustsmb-state/                   # State trait definitions
-│   └── src/
-│       ├── traits.rs                # StateStore, CoordinationBackend
-│       ├── types.rs                 # SessionState, HandleState, etc.
-│       ├── coordination.rs          # Coordination types (LeaseEntry, etc.)
-│       └── lib.rs                   # Re-exports
-
-├── rustsmb-state-cached/            # Cached state store
-│   └── src/
-│       ├── lib.rs                   # CachedStateStore wrapper
-│       └── cache.rs                 # LocalCache (LRU + epoch)
-
-├── rustsmb-coord-raft/              # Embedded Raft coordination
-│   └── src/
-│       ├── lib.rs                   # InMemoryCoordinator (implements CoordinationBackend)
-│       └── state.rs                 # CoordinationState (application state)
-
-├── rustsmb-state-redis/             # Bulk data storage (existing)
-```
-
-**Key simplification:** The coordinator is the only public type from `rustsmb-coord-raft`. It implements `CoordinationBackend` and encapsulates all Raft internals.
-
 ## Dependencies
 
 ```toml
@@ -561,7 +599,7 @@ raft = "0.7"
 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
-| Cache hit | ~10μs | Local memory only |
+| Cache hit | ~10us | Local memory only |
 | Cache miss | ~1-5ms | Redis round-trip |
 | Lease grant (no conflict) | ~1-5ms | Raft consensus |
 | Lease break | ~5-20ms | Multi-server coordination |
