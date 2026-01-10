@@ -10,57 +10,80 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
+x-steps:
+  checkout: &checkout
+    uses: actions/checkout@v4
+  toolchain: &toolchain
+    uses: dtolnay/rust-toolchain@stable
+  toolchain-rustfmt: &toolchain-rustfmt
+    uses: dtolnay/rust-toolchain@stable
+    with:
+      components: rustfmt
+  toolchain-clippy: &toolchain-clippy
+    uses: dtolnay/rust-toolchain@stable
+    with:
+      components: clippy
+  rust-cache: &rust-cache
+    uses: Swatinem/rust-cache@v2
+  install-protoc: &install-protoc
+    name: Install protobuf compiler
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y protobuf-compiler
+  install-smbclient: &install-smbclient
+    name: Install smbclient
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y smbclient
+
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - *checkout
+      - *toolchain
+      - *install-protoc
+      - *rust-cache
       - run: cargo check --workspace --all-targets
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - *checkout
+      - *toolchain-rustfmt
       - run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - *checkout
+      - *toolchain-clippy
+      - *install-protoc
+      - *rust-cache
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - *checkout
+      - *toolchain
+      - *install-protoc
+      - *rust-cache
       - run: cargo test --workspace
 
   integration-test:
     name: Integration Tests (smbclient)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install smbclient
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y smbclient
+      - *checkout
+      - *toolchain
+      - *install-protoc
+      - *rust-cache
+      - *install-smbclient
       - name: Run smbclient integration tests
         run: cargo test --test integration_smbclient -- --ignored
 
@@ -78,13 +101,11 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install smbclient
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y smbclient
+      - *checkout
+      - *toolchain
+      - *install-protoc
+      - *rust-cache
+      - *install-smbclient
       - name: Run HA integration tests with Redis
         env:
           RUSTSMB_REDIS_URL: redis://127.0.0.1:6379
@@ -96,13 +117,10 @@ jobs:
     name: Build Linux Server
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - *checkout
+      - *toolchain
+      - *install-protoc
+      - *rust-cache
       - name: Build release binary
         run: cargo build --release --package rustsmb
       - name: Upload server binary
@@ -117,7 +135,7 @@ jobs:
     runs-on: windows-latest
     needs: build-linux-server
     steps:
-      - uses: actions/checkout@v4
+      - *checkout
 
       # Download pre-built Linux server binary
       - name: Download Linux server binary
@@ -166,8 +184,8 @@ jobs:
           Test-NetConnection -ComputerName 127.0.0.1 -Port 445
 
       # Setup Windows Rust for client tests
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - *toolchain
+      - *rust-cache
 
       - name: Run Windows client tests against WSL2 server
         env:
@@ -182,9 +200,10 @@ jobs:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - *checkout
+      - *toolchain
+      - *install-protoc
+      - *rust-cache
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -Dwarnings
@@ -193,9 +212,10 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - *checkout
+      - *toolchain
+      - *install-protoc
+      - *rust-cache
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v3
