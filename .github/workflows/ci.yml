@@ -187,6 +187,8 @@ jobs:
 
       # Setup Windows Rust for client tests
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler (Windows)
+        run: choco install protoc -y
       - uses: Swatinem/rust-cache@v2
 
       - name: Run Windows client tests against WSL2 server
