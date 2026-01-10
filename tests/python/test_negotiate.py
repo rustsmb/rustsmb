@@ -25,7 +25,7 @@ class TestNegotiate:
     def test_negotiate_smb311(self, server_addr, server_port):
         """Test SMB 3.1.1 dialect negotiation."""
         conn = Connection(uuid.uuid4(), server_addr, server_port)
-        conn.connect(preferred_dialect="3.1.1")
+        conn.connect(dialect="3.1.1")
 
         if conn.dialect == "3.1.1":
             # SMB 3.1.1 should have pre-auth integrity
@@ -36,7 +36,7 @@ class TestNegotiate:
         """Test SMB 3.0.2 dialect negotiation."""
         conn = Connection(uuid.uuid4(), server_addr, server_port)
         try:
-            conn.connect(preferred_dialect="3.0.2")
+            conn.connect(dialect="3.0.2")
             assert conn.dialect in ["3.0.2", "3.0", "2.1", "2.0.2"]
         finally:
             conn.disconnect()
@@ -45,7 +45,7 @@ class TestNegotiate:
         """Test SMB 3.0 dialect negotiation."""
         conn = Connection(uuid.uuid4(), server_addr, server_port)
         try:
-            conn.connect(preferred_dialect="3.0")
+            conn.connect(dialect="3.0")
             assert conn.dialect in ["3.0", "2.1", "2.0.2"]
         finally:
             conn.disconnect()
@@ -54,7 +54,7 @@ class TestNegotiate:
         """Test SMB 2.1 dialect negotiation."""
         conn = Connection(uuid.uuid4(), server_addr, server_port)
         try:
-            conn.connect(preferred_dialect="2.1")
+            conn.connect(dialect="2.1")
             assert conn.dialect in ["2.1", "2.0.2"]
         finally:
             conn.disconnect()

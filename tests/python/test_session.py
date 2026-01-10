@@ -16,12 +16,11 @@ class TestSessionSetup:
 
     def test_session_setup_valid_credentials(self, connection, credentials):
         """Test session setup with valid credentials."""
-        username, password, domain = credentials
+        username, password, _domain = credentials
         session = Session(
             connection,
             username=username,
             password=password,
-            domain=domain,
             require_encryption=False,
         )
         session.connect()
@@ -53,7 +52,7 @@ class TestSessionSetup:
 
     def test_session_multiple_sessions(self, connection, credentials):
         """Test multiple sessions on same connection."""
-        username, password, domain = credentials
+        username, password, _domain = credentials
 
         sessions = []
         try:
@@ -62,7 +61,6 @@ class TestSessionSetup:
                     connection,
                     username=username,
                     password=password,
-                    domain=domain,
                     require_encryption=False,
                 )
                 session.connect()
@@ -77,12 +75,11 @@ class TestSessionSetup:
 
     def test_session_logoff(self, connection, credentials):
         """Test session logoff."""
-        username, password, domain = credentials
+        username, password, _domain = credentials
         session = Session(
             connection,
             username=username,
             password=password,
-            domain=domain,
             require_encryption=False,
         )
         session.connect()
@@ -96,7 +93,6 @@ class TestSessionSetup:
             connection,
             username=username,
             password=password,
-            domain=domain,
             require_encryption=False,
         )
         session2.connect()
@@ -109,7 +105,7 @@ class TestAuthentication:
 
     def test_ntlm_authentication(self, server_addr, server_port, credentials):
         """Test NTLM authentication."""
-        username, password, domain = credentials
+        username, password, _domain = credentials
 
         conn = Connection(uuid.uuid4(), server_addr, server_port)
         conn.connect()
@@ -119,7 +115,6 @@ class TestAuthentication:
                 conn,
                 username=username,
                 password=password,
-                domain=domain,
                 require_encryption=False,
             )
             session.connect()

@@ -93,12 +93,11 @@ def session(connection: Connection, credentials: tuple):
     This fixture provides an authenticated session that is automatically
     logged off after the test completes.
     """
-    username, password, domain = credentials
+    username, password, _domain = credentials
     sess = Session(
         connection,
         username=username,
         password=password,
-        domain=domain,
         require_encryption=False,
     )
     sess.connect()
