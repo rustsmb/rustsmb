@@ -1,0 +1,392 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+	"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+
+<head>
+<title>oplock-lease-design.html</title>
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>
+
+</head>
+
+<body>
+
+<h1 id="smb-oplock-and-lease-design">SMB Oplock and Lease Design</h1>
+<h2 id="overview">Overview</h2>
+<p>Oplocks (Opportunistic Locks) and Leases are SMB mechanisms that
+allow clients to cache file data locally, improving performance by
+reducing network round-trips. This document describes the RustSMB
+implementation.</p>
+<h2 id="oplock-vs-lease">Oplock vs Lease</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Oplock (SMB 2.0)</th>
+<th>Lease (SMB 2.1+)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scope</td>
+<td>Per-handle</td>
+<td>Per-file (across handles)</td>
+</tr>
+<tr>
+<td>Identified by</td>
+<td>File handle</td>
+<td>16-byte lease key</td>
+</tr>
+<tr>
+<td>Survives reconnect</td>
+<td>No</td>
+<td>Yes (with same lease key)</td>
+</tr>
+<tr>
+<td>Recommended</td>
+<td>Legacy</td>
+<td>Modern clients</td>
+</tr>
+</tbody>
+</table>
+<p>RustSMB primarily uses <strong>leases</strong> as they provide better
+semantics for multi-server deployments.</p>
+<h2 id="lease-states">Lease States</h2>
+<pre><code>┌─────────────────────────────────────────────────────────────┐
+│                    Lease State Bits                          │
+├─────────────────────────────────────────────────────────────┤
+│  Bit 0 (0x01): READ_CACHING                                 │
+│    - Client can cache reads                                 │
+│    - Multiple clients can hold simultaneously               │
+│                                                             │
+│  Bit 1 (0x02): WRITE_CACHING                                │
+│    - Client can cache writes (exclusive)                    │
+│    - Only one client can hold WRITE at a time               │
+│                                                             │
+│  Bit 2 (0x04): HANDLE_CACHING                               │
+│    - Client can delay close operations                      │
+│    - Allows handle reuse without server round-trip          │
+└─────────────────────────────────────────────────────────────┘</code></pre>
+<h3 id="common-lease-combinations">Common Lease Combinations</h3>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Value</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>None</td>
+<td>0x00</td>
+<td>No caching allowed</td>
+</tr>
+<tr>
+<td>Read</td>
+<td>0x01</td>
+<td>Read caching only</td>
+</tr>
+<tr>
+<td>Read-Handle</td>
+<td>0x05</td>
+<td>Read + handle caching</td>
+</tr>
+<tr>
+<td>Read-Write</td>
+<td>0x03</td>
+<td>Read + write caching (exclusive)</td>
+</tr>
+<tr>
+<td>Read-Write-Handle</td>
+<td>0x07</td>
+<td>Full caching (exclusive)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="lease-compatibility-matrix">Lease Compatibility Matrix</h2>
+<p>When a new client requests a lease, the server checks compatibility
+with existing leases:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 29%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 6%" />
+<col style="width: 6%" />
+<col style="width: 6%" />
+<col style="width: 8%" />
+</colgroup>
+<thead>
+<tr>
+<th>Existing  Requested</th>
+<th>R (0x01)</th>
+<th>W (0x02)</th>
+<th>H (0x04)</th>
+<th>RW</th>
+<th>RH</th>
+<th>WH</th>
+<th>RWH</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R (Read)</td>
+<td>✓</td>
+<td>✗</td>
+<td>✓</td>
+<td>✗</td>
+<td>✓</td>
+<td>✗</td>
+<td>✗</td>
+</tr>
+<tr>
+<td>W (Write)</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+</tr>
+<tr>
+<td>H (Handle)</td>
+<td>✓</td>
+<td>✗</td>
+<td>✓</td>
+<td>✗</td>
+<td>✓</td>
+<td>✗</td>
+<td>✗</td>
+</tr>
+<tr>
+<td>RW</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+</tr>
+<tr>
+<td>RH</td>
+<td>✓</td>
+<td>✗</td>
+<td>✓</td>
+<td>✗</td>
+<td>✓</td>
+<td>✗</td>
+<td>✗</td>
+</tr>
+<tr>
+<td>WH</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+</tr>
+<tr>
+<td>RWH</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+<td>✗</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key rule:</strong> WRITE_CACHING is exclusive - only one
+client can have it.</p>
+<h2 id="architecture">Architecture</h2>
+<h3 id="single-server-lease-flow">Single-Server Lease Flow</h3>
+<pre><code>┌────────────┐         ┌────────────┐         ┌────────────┐
+│  Client A  │         │   Server   │         │  Client B  │
+└─────┬──────┘         └─────┬──────┘         └─────┬──────┘
+      │                      │                      │
+      │ CREATE file.txt      │                      │
+      │ lease=RWH            │                      │
+      │─────────────────────&gt;│                      │
+      │                      │                      │
+      │ SUCCESS              │                      │
+      │ lease_granted=RWH    │                      │
+      │&lt;─────────────────────│                      │
+      │                      │                      │
+      │ (caching locally)    │  CREATE file.txt    │
+      │                      │  lease=RWH          │
+      │                      │&lt;─────────────────────│
+      │                      │                      │
+      │ LEASE_BREAK          │  (conflict!)        │
+      │ new_state=RH         │                      │
+      │&lt;─────────────────────│                      │
+      │                      │                      │
+      │ flush writes         │                      │
+      │                      │                      │
+      │ LEASE_BREAK_ACK      │                      │
+      │ state=RH             │                      │
+      │─────────────────────&gt;│                      │
+      │                      │                      │
+      │                      │ SUCCESS             │
+      │                      │ lease_granted=R     │
+      │                      │─────────────────────&gt;│
+      │                      │                      │</code></pre>
+<h3 id="multi-server-lease-flow-reduce-grant">Multi-Server Lease Flow
+(Reduce Grant)</h3>
+<p>In a multi-server deployment, cross-server lease breaks are complex.
+RustSMB uses a <strong>reduce grant</strong> approach:</p>
+<pre><code>┌────────────┐    ┌────────────┐         ┌────────────┐    ┌────────────┐
+│  Client A  │    │  Server A  │         │  Server B  │    │  Client B  │
+└─────┬──────┘    └─────┬──────┘         └─────┬──────┘    └─────┬──────┘
+      │                 │                      │                 │
+      │ CREATE          │                      │                 │
+      │ lease=RW        │                      │                 │
+      │────────────────&gt;│                      │                 │
+      │                 │ store in Redis       │                 │
+      │                 │─────────────────────&gt;│                 │
+      │ SUCCESS         │                      │                 │
+      │ granted=RW      │                      │                 │
+      │&lt;────────────────│                      │                 │
+      │                 │                      │                 │
+      │                 │                      │ CREATE          │
+      │                 │                      │ lease=RW        │
+      │                 │                      │&lt;────────────────│
+      │                 │                      │                 │
+      │                 │    check Redis       │                 │
+      │                 │    conflict found!   │                 │
+      │                 │&lt;─────────────────────│                 │
+      │                 │                      │                 │
+      │ (no break sent) │                      │ SUCCESS         │
+      │                 │                      │ granted=NONE    │ (reduced!)
+      │                 │                      │────────────────&gt;│
+      │                 │                      │                 │</code></pre>
+<p><strong>Why no break?</strong> Server B cannot send a lease break to
+Client A because Client A is connected to Server A. Instead of
+implementing complex inter-server communication, we simply reduce Client
+B’s grant.</p>
+<h2 id="data-structures">Data Structures</h2>
+<h3 id="leaseentry-stored-in-redis">LeaseEntry (stored in Redis)</h3>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LeaseEntry <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Unique lease identifier (16-byte key as hex string)</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> lease_key<span class="op">:</span> <span class="dt">String</span><span class="op">,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Client GUID that owns this lease</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> client_guid<span class="op">:</span> <span class="dt">String</span><span class="op">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Session that owns this lease</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> session_id<span class="op">:</span> <span class="dt">u64</span><span class="op">,</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Server that created this lease</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> server_id<span class="op">:</span> <span class="dt">String</span><span class="op">,</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// File path this lease applies to</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> file_path<span class="op">:</span> <span class="dt">String</span><span class="op">,</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Current lease state (READ|WRITE|HANDLE flags)</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> lease_state<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// When the lease was created</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> created_at<span class="op">:</span> <span class="dt">u64</span><span class="op">,</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3
+id="leaseconflictresult-from-check_and_create_lease">LeaseConflictResult
+(from check_and_create_lease)</h3>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LeaseConflictResult <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Whether the lease can be granted as requested</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> can_grant<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Actual state that can be granted (may be reduced)</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> granted_state<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Conflicting leases that would need to be broken</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> conflicts<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span>LeaseEntry<span class="op">&gt;,</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h2 id="redis-storage">Redis Storage</h2>
+<h3 id="key-schema">Key Schema</h3>
+<pre><code>smb:lease:{lease_key}           → LeaseEntry JSON
+smb:lease:file:{file_path}      → Set of lease_keys for this file
+smb:lease:server:{server_id}    → Set of lease_keys for this server</code></pre>
+<h3 id="conflict-detection-watch-pattern">Conflict Detection (WATCH
+Pattern)</h3>
+<pre><code>WATCH smb:lease:file:{file_path}
+
+# Read existing leases
+existing = SMEMBERS smb:lease:file:{file_path}
+
+# Check compatibility
+granted_state = compute_compatible_state(existing, requested)
+
+# Atomic create
+MULTI
+  SET smb:lease:{lease_key} {json}
+  SADD smb:lease:file:{file_path} {lease_key}
+  SADD smb:lease:server:{server_id} {lease_key}
+EXEC
+
+# If EXEC returns nil, someone else modified - retry</code></pre>
+<h2 id="lease-lifecycle">Lease Lifecycle</h2>
+<h3 id="creation-create-handler">Creation (CREATE handler)</h3>
+<ol type="1">
+<li>Client sends CREATE with lease request context</li>
+<li>Server extracts lease_key and requested_state</li>
+<li>Server calls
+<code>check_and_create_lease(file_path, lease, requested_state)</code></li>
+<li>Redis checks for conflicts, returns granted_state</li>
+<li>Server responds with granted_state (may be reduced)</li>
+</ol>
+<h3 id="cleanup-close-handler">Cleanup (CLOSE handler)</h3>
+<ol type="1">
+<li>Client sends CLOSE</li>
+<li>Server gets handle to find lease_key</li>
+<li>Server calls <code>delete_lease(lease_key)</code></li>
+<li>Server deletes handle</li>
+</ol>
+<h3 id="session-end">Session End</h3>
+<ol type="1">
+<li>Session times out or client disconnects</li>
+<li>Server iterates all handles for session</li>
+<li>For each handle with lease_key, calls
+<code>delete_lease()</code></li>
+<li>Deletes all handles</li>
+</ol>
+<h3 id="server-failure">Server Failure</h3>
+<ol type="1">
+<li>Coordinator detects server heartbeat timeout</li>
+<li>Broadcasts server failure event</li>
+<li>Each server calls
+<code>delete_leases_for_server(failed_server_id)</code></li>
+<li>Stale leases removed from Redis</li>
+</ol>
+<h2 id="future-enhancements-phase-15">Future Enhancements (Phase
+15+)</h2>
+<h3 id="same-server-oplock-breaks">Same-Server Oplock Breaks</h3>
+<p>For clients on the same server, we can implement full oplock
+breaks:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LeaseBreakManager <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Map lease_key → connection channel</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    lease_connections<span class="op">:</span> DashMap<span class="op">&lt;</span><span class="dt">String</span><span class="op">,</span> <span class="pp">mpsc::</span>Sender<span class="op">&lt;</span>LeaseBreakNotification<span class="op">&gt;&gt;,</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Pending break acknowledgments</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    pending_breaks<span class="op">:</span> DashMap<span class="op">&lt;</span><span class="dt">String</span><span class="op">,</span> PendingBreak<span class="op">&gt;,</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Flow: 1. Detect conflict with lease on same server 2. Send
+<code>LeaseBreakNotification</code> via channel 3. Wait up to 35 seconds
+for <code>LeaseBreakAcknowledgment</code> 4. Client flushes cached
+writes, acknowledges 5. Grant conflicting lease</p>
+<h3 id="cross-server-oplock-breaks">Cross-Server Oplock Breaks</h3>
+<p>Options for future implementation: 1. <strong>Redis Pub/Sub</strong>:
+Publish break request, servers subscribe 2. <strong>Coordinator
+RPC</strong>: Route breaks through coordinator service 3. <strong>Direct
+gRPC</strong>: Server-to-server communication</p>
+<h2 id="references">References</h2>
+<ul>
+<li><a
+href="https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/">MS-SMB2:
+Server Message Block Protocol Version 2</a></li>
+<li>Section 3.3.1.4: Lease Management</li>
+<li>Section 2.2.13.2: SMB2 CREATE Request - Lease contexts</li>
+</ul>
+
+</body>
+</html>

@@ -132,6 +132,18 @@ impl Connection {
         self.dialect.is_some()
     }
 
+    /// Get client GUID as hex string (for lease tracking).
+    #[inline]
+    pub fn client_guid_string(&self) -> String {
+        use std::fmt::Write;
+        self.client_guid
+            .iter()
+            .fold(String::with_capacity(32), |mut s, b| {
+                let _ = write!(s, "{:02x}", b);
+                s
+            })
+    }
+
     /// Transition to negotiated state.
     pub fn negotiate(&mut self, dialect: SmbDialect) {
         self.dialect = Some(dialect);

@@ -1,0 +1,618 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+	"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+
+<head>
+<title>persistent-handles-leases.html</title>
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>
+
+</head>
+
+<body>
+
+<h1 id="smb-persistent-handles-and-leases">SMB Persistent Handles and
+Leases</h1>
+<h2 id="overview">Overview</h2>
+<p>This document explains two critical SMB2/SMB3 features for enterprise
+high availability:</p>
+<ul>
+<li><strong>Persistent Handles</strong> - File handles that survive
+server failures</li>
+<li><strong>Leases</strong> - Client-side caching with server-managed
+cache coherency</li>
+</ul>
+<p>Together, these features enable transparent failover where
+applications continue working after a server crash without losing data
+or reopening files.</p>
+<h2 id="why-are-they-needed">Why Are They Needed?</h2>
+<h3 id="the-problem-session-level-ha-is-not-enough">The Problem:
+Session-Level HA Is Not Enough</h3>
+<p>RustSMB’s Phase 10 implemented session binding, which allows clients
+to reconnect to a different server without re-authenticating. However,
+this only preserves the session - not the file handles.</p>
+<p><strong>Current behavior (without persistent handles):</strong></p>
+<pre><code>1. Client opens file.txt on Server A
+   → Gets handle_id = 0x1234
+   → File position at byte 1000
+
+2. Server A crashes
+
+3. Client connects to Server B
+   → Session binding succeeds (Phase 10) ✓
+
+4. Client tries to READ using handle_id = 0x1234
+   → Server B: &quot;Unknown handle!&quot;
+   → Returns STATUS_FILE_CLOSED
+
+5. Client must re-open file
+   → File position reset to 0
+   → Any unsaved data is lost
+   → Application may fail or corrupt data</code></pre>
+<p><strong>Desired behavior (with persistent handles):</strong></p>
+<pre><code>1. Client opens file.txt with DurableHandleRequest
+   → Server stores: {handle_id=0x1234, path=&quot;file.txt&quot;, position=1000}
+
+2. Server A crashes
+
+3. Client connects to Server B
+   → Session binding succeeds ✓
+
+4. Client sends CREATE with DurableHandleReconnect(handle_id=0x1234)
+   → Server B looks up handle state in Redis
+   → Reopens file at same path
+   → Returns same handle_id = 0x1234
+
+5. Client continues READ/WRITE
+   → No data loss
+   → Application unaware of failover</code></pre>
+<h3 id="who-needs-this">Who Needs This?</h3>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 48%" />
+<col style="width: 26%" />
+</colgroup>
+<thead>
+<tr>
+<th>Client Type</th>
+<th>Need Persistent Handles?</th>
+<th>Need Leases?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linux/Unix (smbclient, mount.cifs)</td>
+<td>No - apps expect handles to fail</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Windows desktop</td>
+<td>Yes - apps expect transparent recovery</td>
+<td>Yes - for performance</td>
+</tr>
+<tr>
+<td>SQL Server, Hyper-V</td>
+<td><strong>Required</strong> - continuous availability</td>
+<td><strong>Required</strong></td>
+</tr>
+<tr>
+<td>Office applications</td>
+<td>Yes - to prevent data loss</td>
+<td>Yes</td>
+</tr>
+</tbody>
+</table>
+<h2 id="persistent-handles">Persistent Handles</h2>
+<h3 id="what-is-a-persistent-handle">What Is a Persistent Handle?</h3>
+<p>A persistent handle is a file handle whose state is stored externally
+(in Redis) so it can be recovered after: - Network disconnection -
+Server crash - Failover to another server</p>
+<p>SMB defines two types:</p>
+<table>
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 29%" />
+<col style="width: 27%" />
+<col style="width: 27%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Introduced</th>
+<th>Survives</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Durable Handle</strong></td>
+<td>SMB 2.1</td>
+<td>Network glitch, server crash</td>
+<td>Desktop applications</td>
+</tr>
+<tr>
+<td><strong>Persistent Handle</strong></td>
+<td>SMB 3.0</td>
+<td>Everything + planned failover</td>
+<td>Hyper-V, SQL Server</td>
+</tr>
+</tbody>
+</table>
+<h3 id="how-durable-handles-work">How Durable Handles Work</h3>
+<p>Durable handles are negotiated during the CREATE (file open) request
+using CREATE contexts.</p>
+<p><strong>Protocol Flow:</strong></p>
+<pre><code>Client                          Server                      Redis
+   │                               │                          │
+   ├──CREATE file.txt─────────────&gt;│                          │
+   │  with DurableHandleRequest    │                          │
+   │                               ├──Store HandleState──────&gt;│
+   │                               │  {handle_id, path, ...}  │
+   │&lt;──────────────CREATE response─┤                          │
+   │  with DurableHandleResponse   │                          │
+   │  handle_id = 0x1234           │                          │
+   │                               │                          │
+   ├──WRITE data──────────────────&gt;│                          │
+   │  handle_id = 0x1234           ├──Update position────────&gt;│
+   │                               │                          │
+   │  [CONNECTION LOST]            │                          │
+   │                               │                          │
+   │  [RECONNECT TO NEW SERVER]    │                          │
+   │                               │                          │
+   ├──CREATE file.txt─────────────&gt;│                          │
+   │  with DurableHandleReconnect  │                          │
+   │  handle_id = 0x1234           ├──Lookup HandleState─────&gt;│
+   │                               │&lt;─────────────────────────┤
+   │                               │  Reopen file at path     │
+   │&lt;──────────────CREATE response─┤                          │
+   │  same handle_id = 0x1234      │                          │
+   │                               │                          │
+   ├──READ─────────────────────────&gt;│                          │
+   │  handle_id = 0x1234           │  (Works!)                │</code></pre>
+<h3 id="create-contexts">CREATE Contexts</h3>
+<p>Clients request durable handles using CREATE contexts (MS-SMB2
+Section 2.2.13.2):</p>
+<table>
+<colgroup>
+<col style="width: 48%" />
+<col style="width: 20%" />
+<col style="width: 31%" />
+</colgroup>
+<thead>
+<tr>
+<th>Context Name</th>
+<th>Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DHnQ</code></td>
+<td>DurableHandleRequest</td>
+<td>Request durable handle (SMB 2.1)</td>
+</tr>
+<tr>
+<td><code>DHnC</code></td>
+<td>DurableHandleReconnect</td>
+<td>Reconnect to existing handle</td>
+</tr>
+<tr>
+<td><code>DH2Q</code></td>
+<td>DurableHandleRequestV2</td>
+<td>Request durable/persistent (SMB 3.0+)</td>
+</tr>
+<tr>
+<td><code>DH2C</code></td>
+<td>DurableHandleReconnectV2</td>
+<td>Reconnect with GUID validation</td>
+</tr>
+</tbody>
+</table>
+<p><strong>DurableHandleRequestV2 flags:</strong></p>
+<pre><code>Flags:
+  0x01 - Reserved
+  0x02 - PERSISTENT - Request persistent handle (survives planned failover)</code></pre>
+<h3 id="handle-state-storage">Handle State Storage</h3>
+<p>For handles to survive failover, we store their state in Redis:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> HandleState <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Identity</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> persistent_id<span class="op">:</span> <span class="dt">u128</span><span class="op">,</span>        <span class="co">// Unique ID (returned to client)</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> volatile_id<span class="op">:</span> <span class="dt">u128</span><span class="op">,</span>          <span class="co">// Per-connection ID</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> create_guid<span class="op">:</span> [<span class="dt">u8</span><span class="op">;</span> <span class="dv">16</span>]<span class="op">,</span>      <span class="co">// For reconnection validation</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Session association</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> session_id<span class="op">:</span> <span class="dt">u64</span><span class="op">,</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> tree_id<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> share_name<span class="op">:</span> <span class="dt">String</span><span class="op">,</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// File state</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> path<span class="op">:</span> <span class="dt">String</span><span class="op">,</span>               <span class="co">// File path for reopening</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> access_mask<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span>           <span class="co">// How file was opened</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> share_access<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span>          <span class="co">// Sharing flags</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> create_options<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span>        <span class="co">// Creation options</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> file_offset<span class="op">:</span> <span class="dt">u64</span><span class="op">,</span>           <span class="co">// Current file position</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Durability</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> is_durable<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span>           <span class="co">// Can survive disconnect</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> is_persistent<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span>        <span class="co">// Can survive planned failover</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> durable_timeout<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span>       <span class="co">// How long to keep after disconnect</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> reconnect_deadline<span class="op">:</span> <span class="dt">u64</span><span class="op">,</span>    <span class="co">// When handle expires</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="persistent-vs-durable-handles">Persistent vs Durable
+Handles</h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Durable (SMB 2.1)</th>
+<th>Persistent (SMB 3.0)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Survives network glitch</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Survives server crash</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Survives planned failover</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Requires encryption</td>
+<td>No</td>
+<td>Yes (SMB 3.0+)</td>
+</tr>
+<tr>
+<td>Timeout</td>
+<td>Client-specified</td>
+<td>Indefinite</td>
+</tr>
+<tr>
+<td>Use case</td>
+<td>Desktop apps</td>
+<td>Hyper-V, SQL Server</td>
+</tr>
+</tbody>
+</table>
+<h2 id="leases">Leases</h2>
+<h3 id="what-is-a-lease">What Is a Lease?</h3>
+<p>A <strong>lease</strong> is SMB’s mechanism for client-side caching
+with server-managed coherency. It allows clients to: - Cache file data
+locally (avoid network round-trips) - Cache metadata (reduce latency) -
+Buffer writes locally (batch I/O)</p>
+<p>The server tracks who has leases and sends <strong>lease
+break</strong> notifications when another client needs incompatible
+access.</p>
+<h3 id="why-leases-matter-for-performance">Why Leases Matter for
+Performance</h3>
+<p>Without leases:</p>
+<pre><code>Every READ → Network round-trip to server → Response
+Every WRITE → Network round-trip to server → Acknowledgment</code></pre>
+<p>With leases:</p>
+<pre><code>First READ → Get data + READ lease
+Subsequent READs → Local cache (no network!)
+WRITEs → Local buffer with WRITE lease
+Sync → Single batch write to server</code></pre>
+<p><strong>Performance impact:</strong> 10-100x improvement for random
+I/O workloads.</p>
+<h3 id="lease-states">Lease States</h3>
+<p>Leases have three independent states that can be combined:</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Flag</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Read Caching</strong> (R)</td>
+<td>0x01</td>
+<td>Client may cache read data</td>
+</tr>
+<tr>
+<td><strong>Handle Caching</strong> (H)</td>
+<td>0x02</td>
+<td>Client may keep handle open locally</td>
+</tr>
+<tr>
+<td><strong>Write Caching</strong> (W)</td>
+<td>0x04</td>
+<td>Client may buffer writes locally</td>
+</tr>
+</tbody>
+</table>
+<p>Common combinations:</p>
+<table>
+<thead>
+<tr>
+<th>Lease</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R</td>
+<td>Read-only caching</td>
+</tr>
+<tr>
+<td>RH</td>
+<td>Read + handle caching</td>
+</tr>
+<tr>
+<td>RWH</td>
+<td>Full caching (exclusive access)</td>
+</tr>
+<tr>
+<td>None</td>
+<td>No caching allowed</td>
+</tr>
+</tbody>
+</table>
+<h3 id="lease-protocol-flow">Lease Protocol Flow</h3>
+<pre><code>Client A                    Server                    Client B
+    │                          │                          │
+    ├──CREATE file.txt────────&gt;│                          │
+    │  LeaseRequest(R-W-H)     │                          │
+    │&lt;──────────CREATE─────────┤                          │
+    │  LeaseResponse(R-W-H)    │                          │
+    │                          │                          │
+    │  [Client A caches file]  │                          │
+    │                          │                          │
+    │                          │&lt;──CREATE file.txt────────┤
+    │                          │  (wants write access)    │
+    │                          │                          │
+    │&lt;──OPLOCK_BREAK──────────┤                          │
+    │  &quot;Give up W lease&quot;       │                          │
+    │                          │                          │
+    │  [Client A flushes]      │                          │
+    │                          │                          │
+    ├──OPLOCK_BREAK_ACK───────&gt;│                          │
+    │  &quot;OK, W released&quot;        │                          │
+    │                          │                          │
+    │                          ├──CREATE response────────&gt;│
+    │                          │  (Client B can write)    │</code></pre>
+<h3 id="lease-break-notifications">Lease Break Notifications</h3>
+<p>When a lease must be broken, the server sends an unsolicited
+OPLOCK_BREAK (lease break) notification:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LeaseBreakNotification <span class="op">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> structure_size<span class="op">:</span> <span class="dt">u16</span><span class="op">,</span>      <span class="co">// Always 44</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> new_epoch<span class="op">:</span> <span class="dt">u16</span><span class="op">,</span>           <span class="co">// Incremented on each state change</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> flags<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span>               <span class="co">// Break flags</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> lease_key<span class="op">:</span> [<span class="dt">u8</span><span class="op">;</span> <span class="dv">16</span>]<span class="op">,</span>      <span class="co">// Which lease is breaking</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> current_lease_state<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span> <span class="co">// Current state</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> new_lease_state<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span>     <span class="co">// State to transition to</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> break_reason<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span>        <span class="co">// Why breaking</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> access_mask_hint<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span>    <span class="co">// Hint about conflicting access</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> share_mask_hint<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span>     <span class="co">// Hint about conflicting share</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>The client must acknowledge the break within a timeout (default 35
+seconds) or the server forcibly breaks the lease.</p>
+<h3 id="client-crash-lease-break-timeout">Client Crash: Lease Break
+Timeout</h3>
+<p>What happens when a client holding a lease crashes and cannot
+acknowledge the break?</p>
+<p><strong>Timeout and Forced Break:</strong></p>
+<pre><code>Client A (crashed)          Server                    Client B
+      ✗                        │                          │
+                               │&lt;──CREATE file.txt────────┤
+                               │  (wants write access)    │
+                               │                          │
+      ✗←──LEASE_BREAK─────────┤                          │
+         (no response)         │                          │
+                               │                          │
+                               │  [TIMEOUT: 35 seconds]   │
+                               │                          │
+                               │  Server forcibly breaks  │
+                               │  Client A&#39;s lease        │
+                               │                          │
+                               ├──CREATE response────────&gt;│
+                               │  (Client B can proceed)  │</code></pre>
+<p><strong>What happens to cached data when Client A
+resumes?</strong></p>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 51%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Cached Write Data</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Client truly crashed</td>
+<td><strong>Lost forever</strong></td>
+<td>Data was only in client RAM</td>
+</tr>
+<tr>
+<td>Network glitch, client still alive</td>
+<td><strong>Must discard</strong></td>
+<td>Lease broken, epoch changed</td>
+</tr>
+<tr>
+<td>Client reconnects before timeout</td>
+<td><strong>Can flush</strong></td>
+<td>Lease still valid</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The Lease Epoch Mechanism:</strong></p>
+<pre><code>Before break:  lease_epoch = 5,  lease_state = RWH
+After break:   lease_epoch = 6,  lease_state = None</code></pre>
+<p>When client A reconnects and sees the epoch changed: - Its cached
+data is <strong>stale</strong> - another client may have written -
+Protocol requires discarding cache and re-syncing with server -
+Attempting to write stale data would corrupt the file</p>
+<p><strong>Key insight:</strong> The server never had the cached write
+data - it only existed in client A’s memory. Once the lease is broken,
+that data is gone.</p>
+<p><strong>Implications for Applications:</strong></p>
+<ol type="1">
+<li><strong>Flush frequently</strong> - Don’t hold large amounts of
+unflushed data</li>
+<li><strong>Expect data loss on crash</strong> - Same as local
+filesystem crash behavior</li>
+<li><strong>The 35-second timeout is the recovery window</strong> -
+Client must reconnect and flush within this window to preserve cached
+writes</li>
+</ol>
+<h3 id="lease-vs-oplock">Lease vs Oplock</h3>
+<p>Leases (SMB 2.1+) supersede the older oplock mechanism:</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Oplock (SMB 1.0)</th>
+<th>Lease (SMB 2.1+)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Per-handle</td>
+<td>Yes</td>
+<td>No - per lease key</td>
+</tr>
+<tr>
+<td>Multiple handles</td>
+<td>No</td>
+<td>Yes - share lease</td>
+</tr>
+<tr>
+<td>Directory caching</td>
+<td>No</td>
+<td>Yes (SMB 3.0+)</td>
+</tr>
+<tr>
+<td>Epoch tracking</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Preferred</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+</tbody>
+</table>
+<h2 id="effects-and-trade-offs">Effects and Trade-offs</h2>
+<h3 id="benefits">Benefits</h3>
+<ol type="1">
+<li><strong>Transparent failover</strong> - Applications continue
+working after server failure</li>
+<li><strong>No data loss</strong> - Unsaved writes are not lost during
+failover</li>
+<li><strong>Performance</strong> - Client-side caching reduces network
+I/O dramatically</li>
+<li><strong>Enterprise compatibility</strong> - Required for Hyper-V,
+SQL Server over SMB</li>
+</ol>
+<h3 id="complexity-cost">Complexity Cost</h3>
+<ol type="1">
+<li><strong>Protocol complexity</strong> - CREATE context parsing, lease
+state machine</li>
+<li><strong>State management</strong> - Handle state must be stored in
+Redis</li>
+<li><strong>Testing burden</strong> - Need to test all failover
+scenarios</li>
+<li><strong>Debugging difficulty</strong> - Distributed state makes
+issues harder to diagnose</li>
+</ol>
+<h3 id="when-to-skip-this">When to Skip This</h3>
+<p>Consider not implementing if: - Only Linux/Unix clients (they handle
+reconnection at mount level) - Simple file sharing (users can retry
+operations) - No enterprise requirements (no Hyper-V/SQL Server)</p>
+<h2 id="implementation-status">Implementation Status</h2>
+<table>
+<colgroup>
+<col style="width: 42%" />
+<col style="width: 30%" />
+<col style="width: 26%" />
+</colgroup>
+<thead>
+<tr>
+<th>Component</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HandleState in Redis</td>
+<td>Complete</td>
+<td>Phase 10 - stores persistent_id</td>
+</tr>
+<tr>
+<td>CREATE context parsing</td>
+<td>Not implemented</td>
+<td>Need to parse DHnQ, DHnC, etc.</td>
+</tr>
+<tr>
+<td>Durable handle request</td>
+<td>Not implemented</td>
+<td>Need to set is_durable flag</td>
+</tr>
+<tr>
+<td>Durable handle reconnect</td>
+<td>Not implemented</td>
+<td>Need reopen logic</td>
+</tr>
+<tr>
+<td>Persistent handles</td>
+<td>Not implemented</td>
+<td>Need SMB 3.0 validation</td>
+</tr>
+<tr>
+<td>Lease request parsing</td>
+<td>Not implemented</td>
+<td>Need to parse RqLs context</td>
+</tr>
+<tr>
+<td>Lease state machine</td>
+<td>Not implemented</td>
+<td>Need LeaseManager</td>
+</tr>
+<tr>
+<td>Oplock break handler</td>
+<td>Not implemented</td>
+<td>Need unsolicited notifications</td>
+</tr>
+</tbody>
+</table>
+<h2 id="references">References</h2>
+<ul>
+<li><a
+href="https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997">MS-SMB2
+Section 2.2.13.2</a> - CREATE Request Extensions (CREATE Contexts)</li>
+<li><a
+href="https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/5f60bf26-ec0e-4e17-b9bb-0e0f71a66f94">MS-SMB2
+Section 2.2.13.2.3</a> - Durable Handle Request</li>
+<li><a
+href="https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/ee3faa51-53e0-4158-9b16-3a69c4c91a5b">MS-SMB2
+Section 2.2.13.2.8</a> - Lease Context</li>
+<li><a
+href="https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/1c04f926-0a7a-453f-8bba-79bf91c90a62">MS-SMB2
+Section 2.2.23</a> - Lease Break Notification</li>
+<li><a
+href="https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-direct">Hyper-V
+over SMB Requirements</a> - Continuous Availability requirements</li>
+</ul>
+
+</body>
+</html>

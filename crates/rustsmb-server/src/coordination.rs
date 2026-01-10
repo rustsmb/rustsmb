@@ -22,7 +22,9 @@
 use crate::config::CoordinationConfig;
 use rustsmb_coord_raft::{CoordinatorConfig, RaftCoordinator};
 use rustsmb_coordinator_client::CoordinatorClient;
-use rustsmb_state::{coordination::CoordinationBackend, DynStateStore, ServerRegistration};
+use rustsmb_state::{
+    coordination::CoordinationBackend, DynStateStore, ServerRegistration, StateStore,
+};
 use rustsmb_state_cached::{CacheConfig, CachedStateStore};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -391,8 +393,32 @@ impl ServerCoordination {
 
                 warn!(
                     failed_server = %failed_server_id,
-                    "Server failure detected - invalidating all caches"
+                    "Server failure detected - cleaning up resources"
                 );
+
+                // Clean up leases owned by the failed server
+                if let Err(e) = cached_store
+                    .delete_leases_for_server(&failed_server_id)
+                    .await
+                {
+                    warn!(
+                        failed_server = %failed_server_id,
+                        error = %e,
+                        "Failed to delete leases for failed server"
+                    );
+                }
+
+                // Clean up file locks owned by the failed server
+                if let Err(e) = cached_store
+                    .release_file_locks_for_server(&failed_server_id)
+                    .await
+                {
+                    warn!(
+                        failed_server = %failed_server_id,
+                        error = %e,
+                        "Failed to release file locks for failed server"
+                    );
+                }
 
                 // Invalidate all caches on any server failure
                 // This ensures strong consistency (CP)

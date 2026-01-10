@@ -121,6 +121,10 @@ impl SessionManager {
         // Delete all handles for this session
         let handles = self.state_store.get_handles_by_session(session_id).await?;
         for handle in handles {
+            // Delete lease if present (before deleting handle)
+            if let Some(lease_key) = &handle.lease_key {
+                let _ = self.state_store.delete_lease(lease_key).await;
+            }
             self.state_store.delete_handle(handle.persistent_id).await?;
         }
 

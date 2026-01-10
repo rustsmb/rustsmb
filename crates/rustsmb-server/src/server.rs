@@ -231,6 +231,13 @@ impl SmbServer {
 
                             self.active_connections.fetch_add(1, Ordering::Relaxed);
 
+                            // Get server_id from coordination or generate default
+                            let server_id = self
+                                .coordination
+                                .as_ref()
+                                .map(|c| c.server_id().to_string())
+                                .unwrap_or_else(|| format!("standalone-{}", std::process::id()));
+
                             // Spawn connection handler
                             let handler_context = HandlerContext {
                                 config: self.config.clone(),
@@ -239,6 +246,7 @@ impl SmbServer {
                                 shares: self.shares.clone(),
                                 active_connections: self.active_connections.clone(),
                                 _permit: permit,
+                                server_id,
                             };
 
                             if let Some(ref acceptor) = tls_acceptor {
@@ -299,6 +307,7 @@ impl SmbServer {
             ctx.session_manager,
             ctx.auth_provider,
             ctx.shares,
+            ctx.server_id,
         );
 
         if let Err(e) = handler.run().await {
@@ -372,6 +381,7 @@ struct HandlerContext {
     shares: Arc<ShareManager>,
     active_connections: Arc<AtomicUsize>,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    server_id: String,
 }
 
 /// Server error types.

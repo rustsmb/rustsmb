@@ -16,6 +16,7 @@ All project documentation is maintained in the `docs/` directory:
 | [docs/ha-design.md](./docs/ha-design.md) | High availability design, session binding, Redis state store |
 | [docs/persistent-handles-leases.md](./docs/persistent-handles-leases.md) | Persistent handles and leases for enterprise HA |
 | [docs/state-store-design.md](./docs/state-store-design.md) | State store design with separate coordinator service and Redis leases/locks |
+| [docs/oplock-lease-design.md](./docs/oplock-lease-design.md) | SMB oplock and lease design, conflict detection, multi-server handling |
 
 ### Documentation Update Policy
 
@@ -458,8 +459,8 @@ Do not commit code that fails any of these checks.
 - [x] Phase 11B: Lease request/response contexts (LeaseV1, LeaseV2) parsing
 - [x] Phase 11B: Basic lease handling in CREATE flow (grant requested lease state)
 - [x] Phase 11C: Persistent handles validation (SMB 3.0+ requirement)
-- [ ] Phase 11B (Advanced): Full LeaseManager state machine with conflict detection
-- [ ] Phase 11B (Advanced): Oplock break notifications to clients
+- [x] Phase 11B (Advanced): Lease conflict detection with reduced grant (Phase 14)
+- [ ] Phase 11B (Advanced): Same-server oplock break notifications to clients
 
 ### Phase 12: Hyperscale State Store - COMPLETED
 - [x] docs/state-store-design.md: Design document for hyperscale state store
@@ -484,3 +485,18 @@ Do not commit code that fails any of these checks.
 - [x] Phase 13E: Implement Raft transport between coordinator nodes (gRPC)
 - [x] Phase 13F: Update CachedStateStore (caching conditional on coordinator)
 - [x] Phase 13G: Update server integration (use CoordinatorClient or embedded Raft)
+
+### Phase 14: Lease Lifecycle & Conflict Detection - COMPLETED
+- [x] docs/oplock-lease-design.md: Oplock/lease design document with multi-server handling
+- [x] Phase 14A: Fix lease lifecycle cleanup
+  - CLOSE handler deletes lease before handle
+  - Session cleanup deletes leases for all handles
+  - Server failure cleanup deletes leases and locks for failed server
+- [x] Phase 14B: Add lease conflict detection
+  - Add server_id to ConnectionHandler for lease tracking
+  - Add client_guid_string() helper to Connection
+  - Use check_and_create_lease() in CREATE handler with conflict detection
+- [x] Phase 14C: Implement reduced grant for cross-server conflicts
+  - WRITE_CACHING is exclusive (conflicts with any other lease)
+  - Conflicting lease requests get reduced grant instead of oplock break
+  - File open still succeeds with reduced/no lease (affects caching only)

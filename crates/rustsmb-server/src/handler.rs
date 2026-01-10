@@ -10,7 +10,7 @@ use rustsmb_auth::{AuthContext, AuthResult, DynAuthProvider};
 use rustsmb_core::{NtStatus, SmbDialect};
 use rustsmb_protocol::{Smb2Command, Smb2Flags, Smb2Header, SMB2_HEADER_SIZE, SMB2_MAGIC};
 use rustsmb_session::{Connection, SessionManager};
-use rustsmb_state::{HandleState, SessionState, TreeState};
+use rustsmb_state::{HandleState, LeaseEntry, SessionState, TreeState};
 use rustsmb_vfs::FileType;
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -40,6 +40,8 @@ pub struct ConnectionHandler<S> {
     shares: Arc<ShareManager>,
     /// Authentication context (for multi-round auth).
     auth_context: AuthContext,
+    /// Server ID for lease tracking.
+    server_id: String,
 }
 
 impl<S> ConnectionHandler<S>
@@ -54,6 +56,7 @@ where
         session_manager: Arc<SessionManager>,
         auth_provider: DynAuthProvider,
         shares: Arc<ShareManager>,
+        server_id: String,
     ) -> Self {
         let conn_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let connection = Connection::new(conn_id, peer_addr);
@@ -67,6 +70,7 @@ where
             auth_provider,
             shares,
             auth_context: AuthContext::default(),
+            server_id,
         }
     }
 
@@ -970,9 +974,55 @@ where
             handle.set_durable_timeout(timeout_ms);
         }
 
-        // Set lease key if requested
+        // Handle lease request with conflict detection
+        let mut granted_lease_state = 0u32;
         if let Some(key) = lease_key {
-            handle.set_lease_key(&key);
+            // Build file path for lease tracking
+            let file_path = format!("{}/{}", tree.share_name, filename);
+
+            // Create lease entry
+            let lease = LeaseEntry::new(
+                key,
+                self.connection.client_guid_string(),
+                header.session_id,
+                self.server_id.clone(),
+                file_path.clone(),
+                lease_state,
+            );
+
+            // Check for conflicts and create lease atomically
+            match self
+                .session_manager
+                .state_store()
+                .check_and_create_lease(&file_path, &lease, lease_state)
+                .await
+            {
+                Ok(result) => {
+                    // Use the granted state (may be reduced due to conflicts)
+                    granted_lease_state = result.granted_state;
+
+                    if !result.conflicts.is_empty() {
+                        debug!(
+                            conn_id = self.connection.id,
+                            conflicts = result.conflicts.len(),
+                            requested = lease_state,
+                            granted = granted_lease_state,
+                            "Lease reduced due to conflicts"
+                        );
+                    }
+
+                    // Set lease key on handle only if lease was created
+                    handle.set_lease_key(&key);
+                }
+                Err(e) => {
+                    warn!(
+                        conn_id = self.connection.id,
+                        error = %e,
+                        "Lease creation failed, proceeding without lease"
+                    );
+                    // Continue without lease - file open still succeeds
+                }
+            }
         }
 
         self.session_manager
@@ -1013,12 +1063,10 @@ where
             }
         }
 
-        // Add lease response if requested
+        // Add lease response if requested (with conflict-detected grant)
         if let Some(key) = lease_key {
-            // Grant reduced lease state (simplified - just grant what was requested)
-            // In a full implementation, we'd check for conflicts and potentially break existing leases
-            let granted_state = lease_state & 0x07; // Mask to valid lease bits
-            ctx_builder = ctx_builder.add_lease_response(key, granted_state, 0);
+            // Use the granted_lease_state from check_and_create_lease (may be reduced)
+            ctx_builder = ctx_builder.add_lease_response(key, granted_lease_state, 0);
         }
 
         let ctx_data = ctx_builder.build();
@@ -1272,6 +1320,21 @@ where
         // Reconstruct handle ID from file_id
         let handle_id =
             (request.file_id_volatile as u128) << 64 | request.file_id_persistent as u128;
+
+        // Get handle first to check for lease
+        if let Ok(Some(handle)) = self.session_manager.get_handle(handle_id).await {
+            // Delete lease if present
+            if let Some(lease_key) = &handle.lease_key {
+                if let Err(e) = self
+                    .session_manager
+                    .state_store()
+                    .delete_lease(lease_key)
+                    .await
+                {
+                    debug!(error = %e, lease_key = %lease_key, "Failed to delete lease on close");
+                }
+            }
+        }
 
         // Delete handle
         let _ = self.session_manager.delete_handle(handle_id).await;
