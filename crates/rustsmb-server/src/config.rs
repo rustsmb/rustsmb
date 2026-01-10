@@ -69,7 +69,11 @@ pub struct CoordinationConfig {
     pub enabled: bool,
     /// This server's unique ID (auto-generated if empty).
     pub server_id: String,
-    /// Address for Raft peer communication.
+    /// External coordinator endpoint (e.g., "http://coordinator:9000").
+    /// If set, uses gRPC client to connect to external coordinator service.
+    /// If empty, uses embedded Raft coordinator (raft_addr must be set).
+    pub coordinator_endpoint: String,
+    /// Address for Raft peer communication (only used if coordinator_endpoint is empty).
     pub raft_addr: String,
     /// Heartbeat interval in seconds.
     pub heartbeat_interval_secs: u64,
@@ -84,11 +88,19 @@ impl Default for CoordinationConfig {
         Self {
             enabled: false,
             server_id: String::new(),
+            coordinator_endpoint: String::new(),
             raft_addr: "127.0.0.1:8080".to_string(),
             heartbeat_interval_secs: 5,
             heartbeat_timeout_secs: 15,
             cache: CacheLayerConfig::default(),
         }
+    }
+}
+
+impl CoordinationConfig {
+    /// Check if using external coordinator (gRPC client) vs embedded Raft.
+    pub fn use_external_coordinator(&self) -> bool {
+        !self.coordinator_endpoint.is_empty()
     }
 }
 

@@ -15,7 +15,7 @@ All project documentation is maintained in the `docs/` directory:
 | [docs/ksmbd-research.md](./docs/ksmbd-research.md) | Linux kernel ksmbd research notes and lessons learned |
 | [docs/ha-design.md](./docs/ha-design.md) | High availability design, session binding, Redis state store |
 | [docs/persistent-handles-leases.md](./docs/persistent-handles-leases.md) | Persistent handles and leases for enterprise HA |
-| [docs/state-store-design.md](./docs/state-store-design.md) | Hyperscale state store with embedded Raft and local caching |
+| [docs/state-store-design.md](./docs/state-store-design.md) | State store design with separate coordinator service and Redis leases/locks |
 
 ### Documentation Update Policy
 
@@ -53,11 +53,14 @@ All project documentation is maintained in the `docs/` directory:
 | `rustsmb-protocol` | SMB2/3 protocol parsing and commands |
 | `rustsmb-auth` | Authentication (NTLM, Simple) |
 | `rustsmb-vfs` | StorageBackend trait definition |
-| `rustsmb-state` | StateStore trait for HA support |
+| `rustsmb-state` | StateStore trait for HA support (includes leases/locks in Phase 13) |
 | `rustsmb-state-memory` | In-memory state store (dev/testing) |
-| `rustsmb-state-redis` | Redis state store (production) |
-| `rustsmb-state-cached` | Cached state store with LRU + epoch invalidation (Phase 12) |
-| `rustsmb-coord-raft` | CoordinationBackend impl using tikv/raft-rs library (Phase 12) |
+| `rustsmb-state-redis` | Redis state store (production, with WATCH-based lease/lock conflict detection) |
+| `rustsmb-state-cached` | Cached state store with LRU + epoch invalidation (caching requires coordinator) |
+| `rustsmb-coordinator` | Standalone coordinator service binary (Phase 13) |
+| `rustsmb-coordinator-client` | gRPC client for connecting to coordinator service (Phase 13) |
+| `rustsmb-coordinator-proto` | Protobuf/gRPC definitions for coordinator (Phase 13) |
+| `rustsmb-coord-raft` | **DEPRECATED** - replaced by rustsmb-coordinator |
 | `rustsmb-backend-local` | Local filesystem backend |
 | `rustsmb-backend-memory` | In-memory filesystem (testing) |
 | `rustsmb-session` | Session/connection management |
@@ -467,3 +470,17 @@ Do not commit code that fails any of these checks.
 - [x] Phase 12D: Server failure detection and cache invalidation (15s heartbeat timeout)
 - [x] Phase 12E: Lease/lock coordination (SMB lease conflict detection)
 - [x] Phase 12F: Server integration (ServerCoordination layer, with_coordination())
+
+### Phase 13: Coordinator Service Refactoring - COMPLETED
+- [x] Phase 13A: Update documentation (CLAUDE.md, docs/state-store-design.md)
+- [x] Phase 13B: Create rustsmb-coordinator-proto crate (gRPC definitions)
+- [x] Phase 13B: Create rustsmb-coordinator-client crate (gRPC client)
+- [x] Phase 13C: Move lease methods to StateStore trait
+- [x] Phase 13C: Move lock methods to StateStore trait
+- [x] Phase 13C: Implement lease/lock in RedisStateStore with WATCH
+- [x] Phase 13D: Simplify CoordinationBackend trait (remove lease/lock, keep membership + epoch)
+- [x] Phase 13E: Create rustsmb-coordinator binary (standalone service with Raft)
+- [x] Phase 13E: Implement gRPC service handlers
+- [x] Phase 13E: Implement Raft transport between coordinator nodes (gRPC)
+- [x] Phase 13F: Update CachedStateStore (caching conditional on coordinator)
+- [x] Phase 13G: Update server integration (use CoordinatorClient or embedded Raft)

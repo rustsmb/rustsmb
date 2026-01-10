@@ -6,10 +6,23 @@
 //! - Server registration and heartbeats
 //! - Cache invalidation on server failure or epoch changes
 //! - Graceful shutdown with cluster leave
+//!
+//! # Coordination Modes
+//!
+//! Two coordination modes are supported:
+//!
+//! 1. **External Coordinator** (recommended for production):
+//!    Connect to a separate coordinator service via gRPC.
+//!    Set `coordinator_endpoint` in config.
+//!
+//! 2. **Embedded Raft** (for development/testing):
+//!    Each server runs its own Raft node.
+//!    Leave `coordinator_endpoint` empty and set `raft_addr`.
 
 use crate::config::CoordinationConfig;
 use rustsmb_coord_raft::{CoordinatorConfig, RaftCoordinator};
-use rustsmb_state::{CoordinationBackend, DynStateStore, ServerRegistration};
+use rustsmb_coordinator_client::CoordinatorClient;
+use rustsmb_state::{coordination::CoordinationBackend, DynStateStore, ServerRegistration};
 use rustsmb_state_cached::{CacheConfig, CachedStateStore};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -19,12 +32,30 @@ use std::time::Duration;
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
+/// Coordinator backend - either external gRPC client or embedded Raft.
+enum CoordinatorBackendImpl {
+    /// External coordinator service via gRPC.
+    External(Arc<CoordinatorClient>),
+    /// Embedded Raft coordinator (for dev/testing).
+    Embedded(Arc<RaftCoordinator>),
+}
+
+impl CoordinatorBackendImpl {
+    /// Get the coordination backend trait object.
+    fn as_backend(&self) -> Arc<dyn CoordinationBackend> {
+        match self {
+            Self::External(client) => client.clone(),
+            Self::Embedded(raft) => raft.clone(),
+        }
+    }
+}
+
 /// Server coordination layer.
 ///
 /// Manages the connection to the coordinator and handles cache invalidation.
 pub struct ServerCoordination {
-    /// The coordinator backend.
-    coordinator: Arc<RaftCoordinator>,
+    /// The coordinator backend (external or embedded).
+    coordinator: CoordinatorBackendImpl,
     /// The cached state store.
     cached_store: Arc<CachedStateStore>,
     /// Server registration info.
@@ -33,6 +64,8 @@ pub struct ServerCoordination {
     shutdown: Arc<AtomicBool>,
     /// Heartbeat interval.
     heartbeat_interval: Duration,
+    /// Whether using external coordinator.
+    using_external: bool,
 }
 
 /// Convert a string server ID to a u64 node ID for Raft.
@@ -63,24 +96,104 @@ impl ServerCoordination {
             config.server_id.clone()
         };
 
-        // Convert string server_id to u64 node_id for Raft
-        let node_id = string_to_node_id(&server_id);
-
-        // Create coordinator config
-        let coord_config = CoordinatorConfig {
-            node_id,
-            node_addr: config.raft_addr.clone(),
-            heartbeat_timeout_secs: config.heartbeat_timeout_secs,
-            heartbeat_check_interval_secs: config.heartbeat_interval_secs,
-            raft_tick_interval_ms: 100,
-            election_tick: 10,
-            heartbeat_tick: 3,
+        // Create cache config
+        let cache_config = CacheConfig {
+            max_sessions: config.cache.max_sessions,
+            max_handles: config.cache.max_handles,
+            max_trees: config.cache.max_trees,
+            default_ttl: Duration::from_secs(config.cache.default_ttl_secs),
         };
 
-        // Create the coordinator
-        let coordinator = Arc::new(
-            RaftCoordinator::new(coord_config).expect("Failed to create Raft coordinator"),
+        // Create the appropriate coordinator backend
+        let (coordinator, using_external) = if config.use_external_coordinator() {
+            // External coordinator via gRPC - will be connected in start()
+            // For now, create a placeholder that will be replaced
+            // This is a sync function, so we can't connect here
+            let coord_config = CoordinatorConfig {
+                node_id: string_to_node_id(&server_id),
+                node_addr: config.raft_addr.clone(),
+                heartbeat_timeout_secs: config.heartbeat_timeout_secs,
+                heartbeat_check_interval_secs: config.heartbeat_interval_secs,
+                raft_tick_interval_ms: 100,
+                election_tick: 10,
+                heartbeat_tick: 3,
+            };
+            let raft = Arc::new(
+                RaftCoordinator::new(coord_config).expect("Failed to create Raft coordinator"),
+            );
+            // We'll replace this with the gRPC client in start()
+            (CoordinatorBackendImpl::Embedded(raft), true)
+        } else {
+            // Embedded Raft coordinator
+            let node_id = string_to_node_id(&server_id);
+            let coord_config = CoordinatorConfig {
+                node_id,
+                node_addr: config.raft_addr.clone(),
+                heartbeat_timeout_secs: config.heartbeat_timeout_secs,
+                heartbeat_check_interval_secs: config.heartbeat_interval_secs,
+                raft_tick_interval_ms: 100,
+                election_tick: 10,
+                heartbeat_tick: 3,
+            };
+            let raft = Arc::new(
+                RaftCoordinator::new(coord_config).expect("Failed to create Raft coordinator"),
+            );
+            (CoordinatorBackendImpl::Embedded(raft), false)
+        };
+
+        // Create cached state store with coordinator for epoch-based invalidation
+        let cached_store = Arc::new(CachedStateStore::new(
+            bulk_store,
+            cache_config,
+            Some(coordinator.as_backend()),
+        ));
+
+        // Create server registration
+        let registration =
+            ServerRegistration::new(&server_id, server_name, listen_port, &config.raft_addr);
+
+        Self {
+            coordinator,
+            cached_store,
+            registration,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs),
+            using_external,
+        }
+    }
+
+    /// Create with external coordinator (async version for gRPC connection).
+    pub async fn new_with_external_coordinator(
+        config: &CoordinationConfig,
+        server_name: &str,
+        listen_port: u16,
+        bulk_store: DynStateStore,
+    ) -> Result<Self, CoordinationError> {
+        if !config.use_external_coordinator() {
+            return Err(CoordinationError::Backend(
+                "coordinator_endpoint not set".to_string(),
+            ));
+        }
+
+        // Generate server ID if not provided
+        let server_id = if config.server_id.is_empty() {
+            format!("{}-{}", server_name, uuid::Uuid::new_v4())
+        } else {
+            config.server_id.clone()
+        };
+
+        // Connect to external coordinator
+        info!(
+            endpoint = %config.coordinator_endpoint,
+            "Connecting to external coordinator"
         );
+
+        let client = CoordinatorClient::connect(&config.coordinator_endpoint)
+            .await
+            .map_err(|e| CoordinationError::Backend(e.to_string()))?;
+
+        let client = Arc::new(client);
+        let coordinator = CoordinatorBackendImpl::External(client);
 
         // Create cache config
         let cache_config = CacheConfig {
@@ -90,24 +203,25 @@ impl ServerCoordination {
             default_ttl: Duration::from_secs(config.cache.default_ttl_secs),
         };
 
-        // Create cached state store
-        let cached_store = Arc::new(CachedStateStore::new(bulk_store, cache_config));
+        // Create cached state store with coordinator for epoch-based invalidation
+        let cached_store = Arc::new(CachedStateStore::new(
+            bulk_store,
+            cache_config,
+            Some(coordinator.as_backend()),
+        ));
 
         // Create server registration
-        let registration = ServerRegistration::new(
-            server_id,
-            server_name.to_string(),
-            listen_port,
-            config.raft_addr.clone(),
-        );
+        let registration =
+            ServerRegistration::new(&server_id, server_name, listen_port, &config.raft_addr);
 
-        Self {
+        Ok(Self {
             coordinator,
             cached_store,
             registration,
             shutdown: Arc::new(AtomicBool::new(false)),
             heartbeat_interval: Duration::from_secs(config.heartbeat_interval_secs),
-        }
+            using_external: true,
+        })
     }
 
     /// Get the cached state store for use by the server.
@@ -115,14 +229,19 @@ impl ServerCoordination {
         self.cached_store.clone()
     }
 
-    /// Get the coordinator.
-    pub fn coordinator(&self) -> &Arc<RaftCoordinator> {
-        &self.coordinator
+    /// Get the coordinator backend.
+    pub fn coordinator(&self) -> Arc<dyn CoordinationBackend> {
+        self.coordinator.as_backend()
     }
 
     /// Get the server ID.
     pub fn server_id(&self) -> &str {
         &self.registration.server_id
+    }
+
+    /// Check if using external coordinator.
+    pub fn is_external(&self) -> bool {
+        self.using_external
     }
 
     /// Start the coordination tasks.
@@ -132,17 +251,29 @@ impl ServerCoordination {
     pub async fn start(&self) -> Result<(), CoordinationError> {
         // Register with the cluster
         self.coordinator
+            .as_backend()
             .register_server(&self.registration)
             .await
             .map_err(|e| CoordinationError::Registration(e.to_string()))?;
 
         info!(
             server_id = %self.registration.server_id,
+            external = self.using_external,
             "Registered with coordination cluster"
         );
 
-        // Start the heartbeat monitor on the coordinator
-        self.coordinator.start_heartbeat_monitor();
+        // Start background tasks based on coordinator type
+        match &self.coordinator {
+            CoordinatorBackendImpl::External(client) => {
+                // Start subscription handler for external coordinator
+                let client = Arc::clone(client);
+                client.start_subscriptions();
+            }
+            CoordinatorBackendImpl::Embedded(raft) => {
+                // Start the heartbeat monitor on the embedded coordinator
+                raft.start_heartbeat_monitor();
+            }
+        }
 
         // Spawn heartbeat task
         self.spawn_heartbeat_task();
@@ -166,11 +297,19 @@ impl ServerCoordination {
         // Signal shutdown
         self.shutdown.store(true, Ordering::Release);
 
-        // Stop the coordinator (stops heartbeat monitor and other background tasks)
-        self.coordinator.stop();
+        // Stop coordinator-specific tasks
+        match &self.coordinator {
+            CoordinatorBackendImpl::External(_) => {
+                // External coordinator cleanup handled by leave_cluster
+            }
+            CoordinatorBackendImpl::Embedded(raft) => {
+                // Stop the embedded coordinator
+                raft.stop();
+            }
+        }
 
         // Leave the cluster gracefully
-        if let Err(e) = self.coordinator.leave_cluster().await {
+        if let Err(e) = self.coordinator.as_backend().leave_cluster().await {
             warn!(error = %e, "Error leaving cluster");
         }
 
@@ -179,7 +318,7 @@ impl ServerCoordination {
 
     /// Spawn the heartbeat task.
     fn spawn_heartbeat_task(&self) {
-        let coordinator = self.coordinator.clone();
+        let coordinator = self.coordinator.as_backend();
         let server_id = self.registration.server_id.clone();
         let interval = self.heartbeat_interval;
         let shutdown = self.shutdown.clone();
@@ -194,7 +333,7 @@ impl ServerCoordination {
                     break;
                 }
 
-                if let Err(e) = coordinator.update_heartbeat(&server_id).await {
+                if let Err(e) = coordinator.heartbeat(&server_id).await {
                     warn!(
                         server_id = %server_id,
                         error = %e,
@@ -211,7 +350,7 @@ impl ServerCoordination {
 
     /// Spawn the epoch change listener.
     fn spawn_epoch_listener(&self) {
-        let coordinator = self.coordinator.clone();
+        let coordinator = self.coordinator.as_backend();
         let cached_store = self.cached_store.clone();
         let shutdown = self.shutdown.clone();
 
@@ -236,7 +375,7 @@ impl ServerCoordination {
 
     /// Spawn the server failure listener.
     fn spawn_failure_listener(&self) {
-        let coordinator = self.coordinator.clone();
+        let coordinator = self.coordinator.as_backend();
         let cached_store = self.cached_store.clone();
         let shutdown = self.shutdown.clone();
 
@@ -328,6 +467,7 @@ mod tests {
 
         // Server ID should be auto-generated
         assert!(coord.server_id().starts_with("TEST-"));
+        assert!(!coord.is_external());
     }
 
     #[tokio::test]
@@ -360,5 +500,14 @@ mod tests {
         // Should be able to generate IDs
         let session_id = store.next_session_id().await.unwrap();
         assert!(session_id > 0);
+    }
+
+    #[test]
+    fn test_external_coordinator_config() {
+        let mut config = CoordinationConfig::default();
+        assert!(!config.use_external_coordinator());
+
+        config.coordinator_endpoint = "http://coordinator:9000".to_string();
+        assert!(config.use_external_coordinator());
     }
 }

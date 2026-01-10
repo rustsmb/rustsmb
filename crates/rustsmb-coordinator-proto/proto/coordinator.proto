@@ -1,0 +1,178 @@
+syntax = "proto3";
+
+package rustsmb.coordinator.v1;
+
+// CoordinatorService manages SMB server cluster membership and cache coordination.
+// It does NOT handle file leases or locks - those are managed by the StateStore (Redis).
+service CoordinatorService {
+    // ========== Server Membership ==========
+
+    // Register a new SMB server with the cluster.
+    // Returns the current cache epoch.
+    rpc RegisterServer(RegisterServerRequest) returns (RegisterServerResponse);
+
+    // Send a heartbeat to indicate the server is alive.
+    // Must be called periodically (default: every 5 seconds).
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+    // Gracefully leave the cluster.
+    rpc LeaveCluster(LeaveClusterRequest) returns (LeaveClusterResponse);
+
+    // Get all registered servers in the cluster.
+    rpc GetServers(GetServersRequest) returns (GetServersResponse);
+
+    // ========== Cache Epoch ==========
+
+    // Get the current cache epoch.
+    rpc GetEpoch(GetEpochRequest) returns (GetEpochResponse);
+
+    // Subscribe to epoch changes (server streaming).
+    // Clients use this to invalidate their local caches when the epoch changes.
+    rpc SubscribeEpochChanges(SubscribeEpochChangesRequest) returns (stream EpochChangeEvent);
+
+    // Subscribe to server failure events (server streaming).
+    // Useful for monitoring and debugging.
+    rpc SubscribeServerFailures(SubscribeServerFailuresRequest) returns (stream ServerFailureEvent);
+
+    // ========== Admin ==========
+
+    // Force an epoch increment (for testing/admin purposes).
+    rpc IncrementEpoch(IncrementEpochRequest) returns (IncrementEpochResponse);
+
+    // Get cluster health status.
+    rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+}
+
+// ========== Server Registration ==========
+
+message ServerRegistration {
+    // Unique server identifier (e.g., UUID or hostname:port).
+    string server_id = 1;
+    // Server hostname or IP address.
+    string hostname = 2;
+    // SMB server port (usually 445).
+    uint32 port = 3;
+    // Unix timestamp when server was registered.
+    uint64 registered_at = 4;
+    // Unix timestamp of last heartbeat.
+    uint64 last_heartbeat = 5;
+    // Number of active sessions on this server.
+    uint64 active_sessions = 6;
+    // Number of active file handles on this server.
+    uint64 active_handles = 7;
+}
+
+message RegisterServerRequest {
+    ServerRegistration registration = 1;
+}
+
+message RegisterServerResponse {
+    // Current cache epoch at time of registration.
+    uint64 current_epoch = 1;
+    // Number of servers currently in the cluster.
+    uint32 cluster_size = 2;
+}
+
+// ========== Heartbeat ==========
+
+message HeartbeatRequest {
+    // Server identifier.
+    string server_id = 1;
+    // Optional: updated session/handle counts.
+    uint64 active_sessions = 2;
+    uint64 active_handles = 3;
+}
+
+message HeartbeatResponse {
+    // Current cache epoch (client can compare to detect if they missed an increment).
+    uint64 current_epoch = 1;
+}
+
+// ========== Leave Cluster ==========
+
+message LeaveClusterRequest {
+    string server_id = 1;
+}
+
+message LeaveClusterResponse {
+    // Empty on success.
+}
+
+// ========== Get Servers ==========
+
+message GetServersRequest {
+    // Empty.
+}
+
+message GetServersResponse {
+    repeated ServerRegistration servers = 1;
+}
+
+// ========== Epoch ==========
+
+message GetEpochRequest {
+    // Empty.
+}
+
+message GetEpochResponse {
+    uint64 epoch = 1;
+}
+
+message SubscribeEpochChangesRequest {
+    // Optional: client server_id for logging purposes.
+    string client_id = 1;
+}
+
+message EpochChangeEvent {
+    // New epoch value.
+    uint64 new_epoch = 1;
+    // Reason for the epoch change.
+    string reason = 2;
+    // Unix timestamp when the change occurred.
+    uint64 timestamp = 3;
+}
+
+message SubscribeServerFailuresRequest {
+    // Optional: client server_id for logging purposes.
+    string client_id = 1;
+}
+
+message ServerFailureEvent {
+    // ID of the server that failed.
+    string failed_server_id = 1;
+    // New epoch after the failure.
+    uint64 new_epoch = 2;
+    // Unix timestamp when failure was detected.
+    uint64 timestamp = 3;
+}
+
+// ========== Admin ==========
+
+message IncrementEpochRequest {
+    // Optional reason for the increment.
+    string reason = 1;
+}
+
+message IncrementEpochResponse {
+    // New epoch value after increment.
+    uint64 new_epoch = 1;
+}
+
+message GetClusterStatusRequest {
+    // Empty.
+}
+
+message GetClusterStatusResponse {
+    // Current cache epoch.
+    uint64 epoch = 1;
+    // Number of registered servers.
+    uint32 server_count = 2;
+    // List of registered servers.
+    repeated ServerRegistration servers = 3;
+    // Raft leader ID (if applicable).
+    string leader_id = 4;
+    // Whether this node is the leader.
+    bool is_leader = 5;
+    // Raft term (if applicable).
+    uint64 raft_term = 6;
+}

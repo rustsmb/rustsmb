@@ -11,6 +11,9 @@ members = [
     "crates/rustsmb-state-redis",
     "crates/rustsmb-state-cached",
     "crates/rustsmb-coord-raft",
+    "crates/rustsmb-coordinator-proto",
+    "crates/rustsmb-coordinator-client",
+    "crates/rustsmb-coordinator",
     "crates/rustsmb-backend-local",
     "crates/rustsmb-backend-memory",
     "crates/rustsmb-session",
@@ -36,6 +39,9 @@ rustsmb-state-memory = { path = "crates/rustsmb-state-memory" }
 rustsmb-state-redis = { path = "crates/rustsmb-state-redis" }
 rustsmb-state-cached = { path = "crates/rustsmb-state-cached" }
 rustsmb-coord-raft = { path = "crates/rustsmb-coord-raft" }
+rustsmb-coordinator-proto = { path = "crates/rustsmb-coordinator-proto" }
+rustsmb-coordinator-client = { path = "crates/rustsmb-coordinator-client" }
+rustsmb-coordinator = { path = "crates/rustsmb-coordinator" }
 rustsmb-backend-local = { path = "crates/rustsmb-backend-local" }
 rustsmb-backend-memory = { path = "crates/rustsmb-backend-memory" }
 rustsmb-session = { path = "crates/rustsmb-session" }

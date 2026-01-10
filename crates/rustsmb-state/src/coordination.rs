@@ -1,8 +1,16 @@
 //! Coordination layer traits and types for distributed SMB servers.
 //!
 //! This module defines the `CoordinationBackend` trait for distributed
-//! coordination operations like server membership, cache invalidation,
-//! lease management, and distributed locking.
+//! coordination operations: server membership and cache epoch management.
+//!
+//! # Architecture (Phase 13)
+//!
+//! The coordinator is a **separate service** (not embedded in SMB servers).
+//! It handles ONLY:
+//! - Server membership (registration, heartbeats, failure detection)
+//! - Cache epoch (incremented on server failure for cache invalidation)
+//!
+//! Leases and locks are stored in the StateStore (Redis), NOT in the coordinator.
 
 use crate::BoxFuture;
 use rustsmb_core::CoordError;
@@ -14,9 +22,6 @@ pub type EpochStream = Pin<Box<dyn futures::Stream<Item = u64> + Send>>;
 
 /// Stream of server failure events.
 pub type ServerFailureStream = Pin<Box<dyn futures::Stream<Item = String> + Send>>;
-
-/// Stream of lease break requests.
-pub type LeaseBreakStream = Pin<Box<dyn futures::Stream<Item = LeaseBreakRequest> + Send>>;
 
 /// Server registration information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,16 +46,16 @@ pub struct ServerRegistration {
 
 impl ServerRegistration {
     /// Create a new server registration.
-    pub fn new(server_id: String, hostname: String, port: u16, raft_addr: String) -> Self {
+    pub fn new(server_id: &str, hostname: &str, port: u16, raft_addr: &str) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         Self {
-            server_id,
-            hostname,
+            server_id: server_id.to_string(),
+            hostname: hostname.to_string(),
             port,
-            raft_addr,
+            raft_addr: raft_addr.to_string(),
             registered_at: now,
             last_heartbeat: now,
             active_sessions: 0,
@@ -271,12 +276,17 @@ impl DistributedLock {
 /// Coordination backend trait for distributed SMB server coordination.
 ///
 /// This trait abstracts the coordination layer, allowing different
-/// implementations (e.g., embedded Raft, etcd).
+/// implementations (e.g., gRPC client to coordinator service).
 ///
-/// All operations that modify shared state go through consensus
-/// to ensure strong consistency.
+/// # Responsibilities (Simplified in Phase 13)
+///
+/// The coordinator handles ONLY:
+/// - Server membership (registration, heartbeats, failure detection)
+/// - Cache epoch (incremented on server failure for cache invalidation)
+///
+/// Leases and locks are stored in the StateStore (Redis), NOT in the coordinator.
 pub trait CoordinationBackend: Send + Sync + 'static {
-    // ========== Server Membership ==========
+    // ========== Server Membership (5 methods) ==========
 
     /// Register this server with the cluster.
     ///
@@ -285,6 +295,13 @@ pub trait CoordinationBackend: Send + Sync + 'static {
         &'a self,
         registration: &'a ServerRegistration,
     ) -> BoxFuture<'a, Result<(), CoordError>>;
+
+    /// Send a heartbeat to the coordinator.
+    ///
+    /// Servers must send heartbeats periodically (typically every 5s).
+    /// If a server misses heartbeats for the timeout period (typically 15s),
+    /// it is marked as failed and the epoch is incremented.
+    fn heartbeat(&self, server_id: &str) -> BoxFuture<'_, Result<(), CoordError>>;
 
     /// Leave the cluster gracefully.
     fn leave_cluster(&self) -> BoxFuture<'_, Result<(), CoordError>>;
@@ -297,7 +314,7 @@ pub trait CoordinationBackend: Send + Sync + 'static {
     /// Returns a stream that yields server IDs when they are detected as failed.
     fn subscribe_server_failures(&self) -> BoxFuture<'_, ServerFailureStream>;
 
-    // ========== Cache Epoch ==========
+    // ========== Cache Epoch (3 methods) ==========
 
     /// Get the current cache epoch.
     ///
@@ -309,80 +326,11 @@ pub trait CoordinationBackend: Send + Sync + 'static {
     /// When a server fails, the epoch is incremented to invalidate all caches.
     fn subscribe_epoch_changes(&self) -> BoxFuture<'_, EpochStream>;
 
-    // ========== Lease Coordination ==========
-
-    /// Create a new lease.
+    /// Increment the cache epoch (manual invalidation).
     ///
-    /// Fails with `Conflict` if a conflicting lease exists.
-    fn create_lease<'a>(&'a self, lease: &'a LeaseEntry) -> BoxFuture<'a, Result<(), CoordError>>;
-
-    /// Get a lease by key.
-    fn get_lease(&self, lease_key: &str) -> BoxFuture<'_, Result<Option<LeaseEntry>, CoordError>>;
-
-    /// Update a lease (e.g., after lease break acknowledgment).
-    fn update_lease<'a>(&'a self, lease: &'a LeaseEntry) -> BoxFuture<'a, Result<(), CoordError>>;
-
-    /// Delete a lease.
-    fn delete_lease(&self, lease_key: &str) -> BoxFuture<'_, Result<(), CoordError>>;
-
-    /// Request a lease break.
-    ///
-    /// This notifies the server owning the lease to break it.
-    fn request_lease_break<'a>(
-        &'a self,
-        lease_key: &'a str,
-        new_state: u32,
-    ) -> BoxFuture<'a, Result<(), CoordError>>;
-
-    /// Subscribe to lease break requests for this server.
-    fn subscribe_lease_breaks(&self, server_id: &str) -> BoxFuture<'_, LeaseBreakStream>;
-
-    /// Get all leases for a specific file path.
-    fn get_leases_for_file(
-        &self,
-        file_path: &str,
-    ) -> BoxFuture<'_, Result<Vec<LeaseEntry>, CoordError>>;
-
-    /// Check if a requested lease conflicts with existing leases.
-    ///
-    /// Returns a LeaseConflictResult indicating whether the lease can be granted
-    /// and any conflicting leases that need to be broken first.
-    ///
-    /// # Arguments
-    /// * `file_path` - The file path to check
-    /// * `requestor_lease_key` - The lease key of the requestor (excluded from conflict check)
-    /// * `requested_state` - The lease state being requested
-    fn check_lease_conflict<'a>(
-        &'a self,
-        file_path: &'a str,
-        requestor_lease_key: Option<&'a str>,
-        requested_state: u32,
-    ) -> BoxFuture<'a, Result<LeaseConflictResult, CoordError>>;
-
-    // ========== Lock Coordination ==========
-
-    /// Acquire a distributed lock.
-    ///
-    /// Returns `true` if the lock was granted, `false` if there's a conflict.
-    fn acquire_lock<'a>(
-        &'a self,
-        lock: &'a DistributedLock,
-    ) -> BoxFuture<'a, Result<bool, CoordError>>;
-
-    /// Release a distributed lock.
-    fn release_lock(&self, lock_id: u64) -> BoxFuture<'_, Result<(), CoordError>>;
-
-    /// Get all locks for a file path.
-    fn get_locks_for_file(
-        &self,
-        file_path: &str,
-    ) -> BoxFuture<'_, Result<Vec<DistributedLock>, CoordError>>;
-
-    /// Release all locks held by a session.
-    fn release_locks_for_session(&self, session_id: u64) -> BoxFuture<'_, Result<(), CoordError>>;
-
-    /// Release all locks held by a handle.
-    fn release_locks_for_handle(&self, handle_id: u128) -> BoxFuture<'_, Result<(), CoordError>>;
+    /// This is typically called automatically when a server fails, but can
+    /// also be called manually to force cache invalidation across all servers.
+    fn increment_epoch(&self) -> BoxFuture<'_, Result<u64, CoordError>>;
 }
 
 /// Dynamic dispatch wrapper for coordination backends.
@@ -394,12 +342,7 @@ mod tests {
 
     #[test]
     fn test_server_registration_new() {
-        let reg = ServerRegistration::new(
-            "srv1".to_string(),
-            "localhost".to_string(),
-            445,
-            "127.0.0.1:8080".to_string(),
-        );
+        let reg = ServerRegistration::new("srv1", "localhost", 445, "127.0.0.1:8080");
         assert_eq!(reg.server_id, "srv1");
         assert!(reg.registered_at > 0);
     }

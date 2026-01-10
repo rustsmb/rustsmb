@@ -1,0 +1,22 @@
+[package]
+name = "rustsmb-coordinator-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "gRPC client for RustSMB coordinator service"
+
+[dependencies]
+rustsmb-core = { workspace = true }
+rustsmb-state = { workspace = true }
+rustsmb-coordinator-proto = { workspace = true }
+
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

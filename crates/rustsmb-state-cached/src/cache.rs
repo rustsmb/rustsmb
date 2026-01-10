@@ -244,7 +244,7 @@ impl LocalCache {
 }
 
 /// Cache statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CacheStats {
     /// Current cache epoch.
     pub epoch: u64,

@@ -413,12 +413,7 @@ mod tests {
     fn test_server_registration() {
         let mut state = CoordinationState::new();
 
-        let server = ServerRegistration::new(
-            "srv1".to_string(),
-            "localhost".to_string(),
-            445,
-            "127.0.0.1:8080".to_string(),
-        );
+        let server = ServerRegistration::new("srv1", "localhost", 445, "127.0.0.1:8080");
 
         state.apply(CoordRequest::RegisterServer(server.clone()));
         assert!(state.get_server("srv1").is_some());
@@ -556,12 +551,7 @@ mod tests {
     async fn test_state_machine_async() {
         let sm = CoordStateMachine::new();
 
-        let server = ServerRegistration::new(
-            "srv1".to_string(),
-            "localhost".to_string(),
-            445,
-            "127.0.0.1:8080".to_string(),
-        );
+        let server = ServerRegistration::new("srv1", "localhost", 445, "127.0.0.1:8080");
 
         sm.apply(CoordRequest::RegisterServer(server)).await;
 

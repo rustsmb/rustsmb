@@ -15,6 +15,7 @@ rustsmb-auth = { workspace = true }
 rustsmb-session = { workspace = true }
 rustsmb-state-cached = { workspace = true }
 rustsmb-coord-raft = { workspace = true }
+rustsmb-coordinator-client = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "signal"] }
 tokio-rustls = "0.26"
 rustls = "0.23"

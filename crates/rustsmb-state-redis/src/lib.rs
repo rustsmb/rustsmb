@@ -11,7 +11,10 @@
 use deadpool_redis::{Config, Connection, Pool, Runtime};
 use redis::AsyncCommands;
 use rustsmb_core::StateError;
-use rustsmb_state::{BoxFuture, HandleState, LockState, SessionState, StateStore, TreeState};
+use rustsmb_state::{
+    coordination::{DistributedLock, LeaseConflictResult, LeaseEntry},
+    BoxFuture, HandleState, LockState, SessionState, StateStore, TreeState,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +32,19 @@ mod keys {
     pub const COUNTER_SESSION: &str = "smb:counter:session";
     pub const COUNTER_TREE: &str = "smb:counter:tree:";
     pub const COUNTER_HANDLE: &str = "smb:counter:handle";
+
+    // SMB Lease keys
+    pub const LEASE: &str = "smb:lease:";
+    pub const LEASE_FILE_INDEX: &str = "smb:lease:file:";
+    pub const LEASE_SERVER_INDEX: &str = "smb:lease:server:";
+
+    // Cluster-wide file locks
+    pub const FILE_LOCK: &str = "smb:filelock:";
+    pub const FILE_LOCK_FILE_INDEX: &str = "smb:filelock:file:";
+    pub const FILE_LOCK_SESSION_INDEX: &str = "smb:filelock:session:";
+    pub const FILE_LOCK_HANDLE_INDEX: &str = "smb:filelock:handle:";
+    pub const FILE_LOCK_SERVER_INDEX: &str = "smb:filelock:server:";
+    pub const COUNTER_FILE_LOCK: &str = "smb:counter:filelock";
 }
 
 /// Redis state store for production HA deployments.
@@ -102,6 +118,66 @@ impl RedisStateStore {
         // Add some randomness by including thread ID
         let tid = std::thread::current().id();
         format!("{:032x}-{:?}", now, tid)
+    }
+
+    /// Check for lease conflicts and compute granted state.
+    ///
+    /// Returns (conflicting_leases, granted_state).
+    fn check_lease_conflicts(
+        existing_leases: &[LeaseEntry],
+        requested_state: u32,
+    ) -> (Vec<LeaseEntry>, u32) {
+        let mut conflicts = Vec::new();
+        let mut granted_state = requested_state;
+
+        for existing in existing_leases {
+            // Write caching is exclusive - conflicts with any other lease
+            let existing_has_write = (existing.lease_state & LeaseEntry::WRITE_CACHING) != 0;
+            let requested_has_write = (requested_state & LeaseEntry::WRITE_CACHING) != 0;
+
+            if existing_has_write && requested_state != 0 {
+                // Existing lease has write caching - we conflict
+                conflicts.push(existing.clone());
+                granted_state = 0;
+            } else if requested_has_write && existing.lease_state != 0 {
+                // We want write caching but there's an existing lease - conflict
+                conflicts.push(existing.clone());
+                // Can't grant write caching, try to reduce
+                granted_state &= !LeaseEntry::WRITE_CACHING;
+            }
+        }
+
+        // If any existing lease has write caching, we get nothing
+        let any_write = existing_leases
+            .iter()
+            .any(|l| (l.lease_state & LeaseEntry::WRITE_CACHING) != 0);
+        if any_write {
+            granted_state = 0;
+        }
+
+        (conflicts, granted_state)
+    }
+
+    /// Check if two byte-range locks conflict.
+    fn locks_conflict(existing: &DistributedLock, new: &DistributedLock) -> bool {
+        // Same file?
+        if existing.file_path != new.file_path {
+            return false;
+        }
+
+        // Check for range overlap
+        let existing_end = existing.offset + existing.length;
+        let new_end = new.offset + new.length;
+
+        if new.offset >= existing_end || existing.offset >= new_end {
+            // No overlap
+            return false;
+        }
+
+        // Ranges overlap - check exclusivity
+        // Exclusive locks conflict with everything
+        // Shared locks only conflict with exclusive locks
+        existing.exclusive || new.exclusive
     }
 }
 
@@ -733,6 +809,646 @@ impl StateStore for RedisStateStore {
                 .map_err(|e| StateError::Internal(e.to_string()))?;
 
             Ok(id as u128)
+        })
+    }
+
+    // ========== SMB Lease Management ==========
+
+    fn create_lease<'a>(&'a self, lease: &'a LeaseEntry) -> BoxFuture<'a, Result<(), StateError>> {
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            let key = format!("{}{}", keys::LEASE, lease.lease_key);
+
+            // Check if lease already exists
+            let existing: Option<String> = conn
+                .get(&key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            if existing.is_some() {
+                return Err(StateError::AlreadyExists(lease.lease_key.clone()));
+            }
+
+            let json = serde_json::to_string(lease)
+                .map_err(|e| StateError::Serialization(e.to_string()))?;
+
+            conn.set::<_, _, ()>(&key, &json)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            // Add to file index
+            let file_index_key = format!("{}{}", keys::LEASE_FILE_INDEX, lease.file_path);
+            conn.sadd::<_, _, ()>(&file_index_key, &lease.lease_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            // Add to server index
+            let server_index_key = format!("{}{}", keys::LEASE_SERVER_INDEX, lease.server_id);
+            conn.sadd::<_, _, ()>(&server_index_key, &lease.lease_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    fn get_lease(&self, lease_key: &str) -> BoxFuture<'_, Result<Option<LeaseEntry>, StateError>> {
+        let lease_key = lease_key.to_string();
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            let key = format!("{}{}", keys::LEASE, lease_key);
+            let json: Option<String> = conn
+                .get(&key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            match json {
+                Some(j) => {
+                    let lease: LeaseEntry = serde_json::from_str(&j)
+                        .map_err(|e| StateError::Serialization(e.to_string()))?;
+                    Ok(Some(lease))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn update_lease<'a>(&'a self, lease: &'a LeaseEntry) -> BoxFuture<'a, Result<(), StateError>> {
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            let key = format!("{}{}", keys::LEASE, lease.lease_key);
+            let json = serde_json::to_string(lease)
+                .map_err(|e| StateError::Serialization(e.to_string()))?;
+
+            conn.set::<_, _, ()>(&key, &json)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    fn delete_lease(&self, lease_key: &str) -> BoxFuture<'_, Result<(), StateError>> {
+        let lease_key = lease_key.to_string();
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            // Get lease first to find file_path and server_id for index cleanup
+            let key = format!("{}{}", keys::LEASE, lease_key);
+            let json: Option<String> = conn
+                .get(&key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            if let Some(j) = json {
+                if let Ok(lease) = serde_json::from_str::<LeaseEntry>(&j) {
+                    // Remove from file index
+                    let file_index_key = format!("{}{}", keys::LEASE_FILE_INDEX, lease.file_path);
+                    let _: () = conn
+                        .srem(&file_index_key, &lease_key)
+                        .await
+                        .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                    // Remove from server index
+                    let server_index_key =
+                        format!("{}{}", keys::LEASE_SERVER_INDEX, lease.server_id);
+                    let _: () = conn
+                        .srem(&server_index_key, &lease_key)
+                        .await
+                        .map_err(|e| StateError::Internal(e.to_string()))?;
+                }
+            }
+
+            // Delete lease key
+            conn.del::<_, ()>(&key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    fn get_leases_for_file(
+        &self,
+        file_path: &str,
+    ) -> BoxFuture<'_, Result<Vec<LeaseEntry>, StateError>> {
+        let file_path = file_path.to_string();
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            // Get lease keys from file index
+            let file_index_key = format!("{}{}", keys::LEASE_FILE_INDEX, file_path);
+            let lease_keys: Vec<String> = conn
+                .smembers(&file_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            // Fetch all leases
+            let mut leases = Vec::new();
+            for lease_key in lease_keys {
+                let key = format!("{}{}", keys::LEASE, lease_key);
+                let json: Option<String> = conn
+                    .get(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                if let Some(j) = json {
+                    if let Ok(lease) = serde_json::from_str::<LeaseEntry>(&j) {
+                        leases.push(lease);
+                    }
+                }
+            }
+
+            Ok(leases)
+        })
+    }
+
+    fn check_and_create_lease<'a>(
+        &'a self,
+        file_path: &'a str,
+        lease: &'a LeaseEntry,
+        requested_state: u32,
+    ) -> BoxFuture<'a, Result<LeaseConflictResult, StateError>> {
+        Box::pin(async move {
+            // Use WATCH-based optimistic locking with retries
+            for _attempt in 0..3 {
+                let mut conn = self.get_conn().await?;
+
+                let file_index_key = format!("{}{}", keys::LEASE_FILE_INDEX, file_path);
+
+                // WATCH the file's lease set
+                let _: () = redis::cmd("WATCH")
+                    .arg(&file_index_key)
+                    .query_async(&mut *conn)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                // Get existing leases for conflict detection
+                let lease_keys: Vec<String> = conn
+                    .smembers(&file_index_key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                let mut existing_leases = Vec::new();
+                for lk in &lease_keys {
+                    let key = format!("{}{}", keys::LEASE, lk);
+                    let json: Option<String> = conn
+                        .get(&key)
+                        .await
+                        .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                    if let Some(j) = json {
+                        if let Ok(l) = serde_json::from_str::<LeaseEntry>(&j) {
+                            existing_leases.push(l);
+                        }
+                    }
+                }
+
+                // Check for conflicts and reduce state if needed
+                let (conflicts, granted_state) =
+                    Self::check_lease_conflicts(&existing_leases, requested_state);
+
+                if !conflicts.is_empty() && granted_state == 0 {
+                    // Full conflict - cannot grant any lease state
+                    // UNWATCH before returning
+                    let _: Result<(), _> = redis::cmd("UNWATCH").query_async(&mut *conn).await;
+
+                    return Ok(LeaseConflictResult {
+                        can_grant: false,
+                        granted_state: 0,
+                        conflicts,
+                    });
+                }
+
+                // Create the lease with potentially reduced state
+                let mut new_lease = lease.clone();
+                new_lease.lease_state = granted_state;
+
+                let lease_json = serde_json::to_string(&new_lease)
+                    .map_err(|e| StateError::Serialization(e.to_string()))?;
+
+                let lease_key = format!("{}{}", keys::LEASE, new_lease.lease_key);
+                let server_index_key =
+                    format!("{}{}", keys::LEASE_SERVER_INDEX, new_lease.server_id);
+
+                // MULTI/EXEC transaction
+                let result: Option<()> = redis::pipe()
+                    .atomic()
+                    .set(&lease_key, &lease_json)
+                    .sadd(&file_index_key, &new_lease.lease_key)
+                    .sadd(&server_index_key, &new_lease.lease_key)
+                    .query_async(&mut *conn)
+                    .await
+                    .ok();
+
+                if result.is_some() {
+                    // Transaction succeeded
+                    return Ok(LeaseConflictResult {
+                        can_grant: true,
+                        granted_state,
+                        conflicts,
+                    });
+                }
+
+                // EXEC returned None - WATCH detected a change, retry
+            }
+
+            // Failed after retries
+            Err(StateError::Conflict(
+                "Failed to create lease after retries".to_string(),
+            ))
+        })
+    }
+
+    fn delete_leases_for_server(&self, server_id: &str) -> BoxFuture<'_, Result<(), StateError>> {
+        let server_id = server_id.to_string();
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            // Get all lease keys for this server
+            let server_index_key = format!("{}{}", keys::LEASE_SERVER_INDEX, server_id);
+            let lease_keys: Vec<String> = conn
+                .smembers(&server_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            // Delete each lease
+            for lease_key in lease_keys {
+                // Get lease to find file_path for index cleanup
+                let key = format!("{}{}", keys::LEASE, lease_key);
+                let json: Option<String> = conn
+                    .get(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                if let Some(j) = json {
+                    if let Ok(lease) = serde_json::from_str::<LeaseEntry>(&j) {
+                        // Remove from file index
+                        let file_index_key =
+                            format!("{}{}", keys::LEASE_FILE_INDEX, lease.file_path);
+                        let _: () = conn
+                            .srem(&file_index_key, &lease_key)
+                            .await
+                            .map_err(|e| StateError::Internal(e.to_string()))?;
+                    }
+                }
+
+                // Delete lease key
+                conn.del::<_, ()>(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+            }
+
+            // Delete server index
+            conn.del::<_, ()>(&server_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    // ========== File Lock Management (Cluster-wide) ==========
+
+    fn acquire_file_lock<'a>(
+        &'a self,
+        lock: &'a DistributedLock,
+    ) -> BoxFuture<'a, Result<bool, StateError>> {
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            // Get existing locks for the file
+            let file_index_key = format!("{}{}", keys::FILE_LOCK_FILE_INDEX, lock.file_path);
+            let lock_ids: Vec<u64> = conn
+                .smembers(&file_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            // Check for conflicts
+            for lock_id in lock_ids {
+                let key = format!("{}{}", keys::FILE_LOCK, lock_id);
+                let json: Option<String> = conn
+                    .get(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                if let Some(j) = json {
+                    if let Ok(existing) = serde_json::from_str::<DistributedLock>(&j) {
+                        if Self::locks_conflict(&existing, lock) {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+
+            // No conflict, create the lock
+            let key = format!("{}{}", keys::FILE_LOCK, lock.lock_id);
+            let json = serde_json::to_string(lock)
+                .map_err(|e| StateError::Serialization(e.to_string()))?;
+
+            conn.set::<_, _, ()>(&key, &json)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            // Add to indices
+            conn.sadd::<_, _, ()>(&file_index_key, lock.lock_id)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            let session_index_key = format!("{}{}", keys::FILE_LOCK_SESSION_INDEX, lock.session_id);
+            conn.sadd::<_, _, ()>(&session_index_key, lock.lock_id)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            let handle_index_key = format!("{}{}", keys::FILE_LOCK_HANDLE_INDEX, lock.handle_id);
+            conn.sadd::<_, _, ()>(&handle_index_key, lock.lock_id)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            let server_index_key = format!("{}{}", keys::FILE_LOCK_SERVER_INDEX, lock.server_id);
+            conn.sadd::<_, _, ()>(&server_index_key, lock.lock_id)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(true)
+        })
+    }
+
+    fn release_file_lock(&self, lock_id: u64) -> BoxFuture<'_, Result<(), StateError>> {
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            // Get lock to find indices
+            let key = format!("{}{}", keys::FILE_LOCK, lock_id);
+            let json: Option<String> = conn
+                .get(&key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            if let Some(j) = json {
+                if let Ok(lock) = serde_json::from_str::<DistributedLock>(&j) {
+                    // Remove from all indices
+                    let file_index_key =
+                        format!("{}{}", keys::FILE_LOCK_FILE_INDEX, lock.file_path);
+                    let _: () = conn
+                        .srem(&file_index_key, lock_id)
+                        .await
+                        .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                    let session_index_key =
+                        format!("{}{}", keys::FILE_LOCK_SESSION_INDEX, lock.session_id);
+                    let _: () = conn
+                        .srem(&session_index_key, lock_id)
+                        .await
+                        .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                    let handle_index_key =
+                        format!("{}{}", keys::FILE_LOCK_HANDLE_INDEX, lock.handle_id);
+                    let _: () = conn
+                        .srem(&handle_index_key, lock_id)
+                        .await
+                        .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                    let server_index_key =
+                        format!("{}{}", keys::FILE_LOCK_SERVER_INDEX, lock.server_id);
+                    let _: () = conn
+                        .srem(&server_index_key, lock_id)
+                        .await
+                        .map_err(|e| StateError::Internal(e.to_string()))?;
+                }
+            }
+
+            // Delete lock key
+            conn.del::<_, ()>(&key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    fn get_file_locks(
+        &self,
+        file_path: &str,
+    ) -> BoxFuture<'_, Result<Vec<DistributedLock>, StateError>> {
+        let file_path = file_path.to_string();
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            let file_index_key = format!("{}{}", keys::FILE_LOCK_FILE_INDEX, file_path);
+            let lock_ids: Vec<u64> = conn
+                .smembers(&file_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            let mut locks = Vec::new();
+            for lock_id in lock_ids {
+                let key = format!("{}{}", keys::FILE_LOCK, lock_id);
+                let json: Option<String> = conn
+                    .get(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                if let Some(j) = json {
+                    if let Ok(lock) = serde_json::from_str::<DistributedLock>(&j) {
+                        locks.push(lock);
+                    }
+                }
+            }
+
+            Ok(locks)
+        })
+    }
+
+    fn release_file_locks_for_session(
+        &self,
+        session_id: u64,
+    ) -> BoxFuture<'_, Result<(), StateError>> {
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            let session_index_key = format!("{}{}", keys::FILE_LOCK_SESSION_INDEX, session_id);
+            let lock_ids: Vec<u64> = conn
+                .smembers(&session_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            // Release each lock (this also removes from indices)
+            for lock_id in lock_ids {
+                // Get lock to find other indices
+                let key = format!("{}{}", keys::FILE_LOCK, lock_id);
+                let json: Option<String> = conn
+                    .get(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                if let Some(j) = json {
+                    if let Ok(lock) = serde_json::from_str::<DistributedLock>(&j) {
+                        let file_index_key =
+                            format!("{}{}", keys::FILE_LOCK_FILE_INDEX, lock.file_path);
+                        let _: () = conn.srem(&file_index_key, lock_id).await.ok().unwrap_or(());
+
+                        let handle_index_key =
+                            format!("{}{}", keys::FILE_LOCK_HANDLE_INDEX, lock.handle_id);
+                        let _: () = conn
+                            .srem(&handle_index_key, lock_id)
+                            .await
+                            .ok()
+                            .unwrap_or(());
+
+                        let server_index_key =
+                            format!("{}{}", keys::FILE_LOCK_SERVER_INDEX, lock.server_id);
+                        let _: () = conn
+                            .srem(&server_index_key, lock_id)
+                            .await
+                            .ok()
+                            .unwrap_or(());
+                    }
+                }
+
+                // Delete lock key
+                conn.del::<_, ()>(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+            }
+
+            // Delete session index
+            conn.del::<_, ()>(&session_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    fn release_file_locks_for_handle(
+        &self,
+        handle_id: u128,
+    ) -> BoxFuture<'_, Result<(), StateError>> {
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            let handle_index_key = format!("{}{}", keys::FILE_LOCK_HANDLE_INDEX, handle_id);
+            let lock_ids: Vec<u64> = conn
+                .smembers(&handle_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            for lock_id in lock_ids {
+                let key = format!("{}{}", keys::FILE_LOCK, lock_id);
+                let json: Option<String> = conn
+                    .get(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                if let Some(j) = json {
+                    if let Ok(lock) = serde_json::from_str::<DistributedLock>(&j) {
+                        let file_index_key =
+                            format!("{}{}", keys::FILE_LOCK_FILE_INDEX, lock.file_path);
+                        let _: () = conn.srem(&file_index_key, lock_id).await.ok().unwrap_or(());
+
+                        let session_index_key =
+                            format!("{}{}", keys::FILE_LOCK_SESSION_INDEX, lock.session_id);
+                        let _: () = conn
+                            .srem(&session_index_key, lock_id)
+                            .await
+                            .ok()
+                            .unwrap_or(());
+
+                        let server_index_key =
+                            format!("{}{}", keys::FILE_LOCK_SERVER_INDEX, lock.server_id);
+                        let _: () = conn
+                            .srem(&server_index_key, lock_id)
+                            .await
+                            .ok()
+                            .unwrap_or(());
+                    }
+                }
+
+                conn.del::<_, ()>(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+            }
+
+            conn.del::<_, ()>(&handle_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    fn release_file_locks_for_server(
+        &self,
+        server_id: &str,
+    ) -> BoxFuture<'_, Result<(), StateError>> {
+        let server_id = server_id.to_string();
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            let server_index_key = format!("{}{}", keys::FILE_LOCK_SERVER_INDEX, server_id);
+            let lock_ids: Vec<u64> = conn
+                .smembers(&server_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            for lock_id in lock_ids {
+                let key = format!("{}{}", keys::FILE_LOCK, lock_id);
+                let json: Option<String> = conn
+                    .get(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                if let Some(j) = json {
+                    if let Ok(lock) = serde_json::from_str::<DistributedLock>(&j) {
+                        let file_index_key =
+                            format!("{}{}", keys::FILE_LOCK_FILE_INDEX, lock.file_path);
+                        let _: () = conn.srem(&file_index_key, lock_id).await.ok().unwrap_or(());
+
+                        let session_index_key =
+                            format!("{}{}", keys::FILE_LOCK_SESSION_INDEX, lock.session_id);
+                        let _: () = conn
+                            .srem(&session_index_key, lock_id)
+                            .await
+                            .ok()
+                            .unwrap_or(());
+
+                        let handle_index_key =
+                            format!("{}{}", keys::FILE_LOCK_HANDLE_INDEX, lock.handle_id);
+                        let _: () = conn
+                            .srem(&handle_index_key, lock_id)
+                            .await
+                            .ok()
+                            .unwrap_or(());
+                    }
+                }
+
+                conn.del::<_, ()>(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+            }
+
+            conn.del::<_, ()>(&server_index_key)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(())
+        })
+    }
+
+    fn next_file_lock_id(&self) -> BoxFuture<'_, Result<u64, StateError>> {
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            let id: u64 = conn
+                .incr(keys::COUNTER_FILE_LOCK, 1u64)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            Ok(id)
         })
     }
 }

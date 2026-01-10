@@ -1,0 +1,49 @@
+[package]
+name = "rustsmb-coordinator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Standalone coordinator service for RustSMB cluster"
+
+[[bin]]
+name = "rustsmb-coordinator"
+path = "src/main.rs"
+
+[dependencies]
+rustsmb-state = { workspace = true }
+rustsmb-coordinator-proto = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+
+# Raft consensus
+raft = { workspace = true }
+protobuf = { workspace = true }
+slog = { workspace = true }
+slog-stdlog = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# CLI and config
+clap = { version = "4.4", features = ["derive"] }
+toml = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-test = { workspace = true }

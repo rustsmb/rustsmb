@@ -1,0 +1,793 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+	"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+
+<head>
+<title>CLAUDE.html</title>
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>
+
+</head>
+
+<body>
+
+<h1 id="rustsmb---project-guidelines">RustSMB - Project Guidelines</h1>
+<h2 id="project-overview">Project Overview</h2>
+<p>RustSMB is a Rust-based SMB2/SMB3 server with pluggable storage
+backends, designed as a stateless gateway for high availability
+deployments.</p>
+<h2 id="documentation">Documentation</h2>
+<p>All project documentation is maintained in the <code>docs/</code>
+directory:</p>
+<table>
+<colgroup>
+<col style="width: 43%" />
+<col style="width: 56%" />
+</colgroup>
+<thead>
+<tr>
+<th>Document</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="./CLAUDE.md">CLAUDE.md</a></td>
+<td>Project guidelines, coding conventions, and quick reference (this
+file)</td>
+</tr>
+<tr>
+<td><a href="./docs/architecture.md">docs/architecture.md</a></td>
+<td>Detailed system architecture, core traits, data flow, and design
+decisions</td>
+</tr>
+<tr>
+<td><a href="./docs/ksmbd-research.md">docs/ksmbd-research.md</a></td>
+<td>Linux kernel ksmbd research notes and lessons learned</td>
+</tr>
+<tr>
+<td><a href="./docs/ha-design.md">docs/ha-design.md</a></td>
+<td>High availability design, session binding, Redis state store</td>
+</tr>
+<tr>
+<td><a
+href="./docs/persistent-handles-leases.md">docs/persistent-handles-leases.md</a></td>
+<td>Persistent handles and leases for enterprise HA</td>
+</tr>
+<tr>
+<td><a
+href="./docs/state-store-design.md">docs/state-store-design.md</a></td>
+<td>State store design with separate coordinator service and Redis
+leases/locks</td>
+</tr>
+</tbody>
+</table>
+<h3 id="documentation-update-policy">Documentation Update Policy</h3>
+<ul>
+<li>Update relevant docs after completing each task</li>
+<li>Run <code>make ci doc</code> and commit changes after completing
+each phase</li>
+<li>Keep CLAUDE.md as the entry point referencing all other docs</li>
+</ul>
+<h2 id="architecture">Architecture</h2>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                    Configuration Layer                          │
+├─────────────────────────────────────────────────────────────────┤
+│                    Transport Layer (TCP/TLS)                    │
+├─────────────────────────────────────────────────────────────────┤
+│                    Protocol Layer (rustsmb-protocol)            │
+│  (SMB2/3 message parsing, command dispatch, signing/encryption)│
+├─────────────────────────────────────────────────────────────────┤
+│                    Session Layer (rustsmb-session)              │
+│  (Stateless - via StateStore trait)                            │
+├─────────────────────────────────────────────────────────────────┤
+│                    VFS Layer (rustsmb-vfs)                      │
+│  (StorageBackend trait - POSIX-like interface)                 │
+├─────────────────────────────────────────────────────────────────┤
+│                    Storage Backend Layer                        │
+│  (rustsmb-backend-local, rustsmb-backend-memory)               │
+└─────────────────────────────────────────────────────────────────┘</code></pre>
+<h2 id="crate-structure">Crate Structure</h2>
+<table>
+<colgroup>
+<col style="width: 35%" />
+<col style="width: 65%" />
+</colgroup>
+<thead>
+<tr>
+<th>Crate</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rustsmb-core</code></td>
+<td>Core types, errors, NT_STATUS codes</td>
+</tr>
+<tr>
+<td><code>rustsmb-protocol</code></td>
+<td>SMB2/3 protocol parsing and commands</td>
+</tr>
+<tr>
+<td><code>rustsmb-auth</code></td>
+<td>Authentication (NTLM, Simple)</td>
+</tr>
+<tr>
+<td><code>rustsmb-vfs</code></td>
+<td>StorageBackend trait definition</td>
+</tr>
+<tr>
+<td><code>rustsmb-state</code></td>
+<td>StateStore trait for HA support (includes leases/locks in Phase
+13)</td>
+</tr>
+<tr>
+<td><code>rustsmb-state-memory</code></td>
+<td>In-memory state store (dev/testing)</td>
+</tr>
+<tr>
+<td><code>rustsmb-state-redis</code></td>
+<td>Redis state store (production, with WATCH-based lease/lock conflict
+detection)</td>
+</tr>
+<tr>
+<td><code>rustsmb-state-cached</code></td>
+<td>Cached state store with LRU + epoch invalidation (caching requires
+coordinator)</td>
+</tr>
+<tr>
+<td><code>rustsmb-coordinator</code></td>
+<td>Standalone coordinator service binary (Phase 13)</td>
+</tr>
+<tr>
+<td><code>rustsmb-coordinator-client</code></td>
+<td>gRPC client for connecting to coordinator service (Phase 13)</td>
+</tr>
+<tr>
+<td><code>rustsmb-coordinator-proto</code></td>
+<td>Protobuf/gRPC definitions for coordinator (Phase 13)</td>
+</tr>
+<tr>
+<td><code>rustsmb-coord-raft</code></td>
+<td><strong>DEPRECATED</strong> - replaced by rustsmb-coordinator</td>
+</tr>
+<tr>
+<td><code>rustsmb-backend-local</code></td>
+<td>Local filesystem backend</td>
+</tr>
+<tr>
+<td><code>rustsmb-backend-memory</code></td>
+<td>In-memory filesystem (testing)</td>
+</tr>
+<tr>
+<td><code>rustsmb-session</code></td>
+<td>Session/connection management</td>
+</tr>
+<tr>
+<td><code>rustsmb-server</code></td>
+<td>Main server implementation</td>
+</tr>
+</tbody>
+</table>
+<h2 id="coding-conventions">Coding Conventions</h2>
+<h3 id="rust-style">Rust Style</h3>
+<ul>
+<li>Follow standard Rust formatting (<code>cargo fmt</code>)</li>
+<li>Use <code>clippy</code> with default lints
+(<code>cargo clippy</code>)</li>
+<li>Prefer <code>&amp;str</code> over <code>String</code> for function
+parameters when ownership isn’t needed</li>
+<li>Use <code>thiserror</code> for error types in library crates</li>
+<li>Use <code>anyhow</code> only in the binary crate</li>
+</ul>
+<h3 id="naming-conventions">Naming Conventions</h3>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Types: PascalCase</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> SessionState <span class="op">{</span> <span class="op">...</span> <span class="op">}</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">enum</span> NtStatus <span class="op">{</span> <span class="op">...</span> <span class="op">}</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> StorageBackend <span class="op">{</span> <span class="op">...</span> <span class="op">}</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co">// Functions/methods: snake_case</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> create_session() <span class="op">{</span> <span class="op">...</span> <span class="op">}</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">async</span> <span class="kw">fn</span> read_file() <span class="op">{</span> <span class="op">...</span> <span class="op">}</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co">// Constants: SCREAMING_SNAKE_CASE</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> SMB2_MAGIC<span class="op">:</span> [<span class="dt">u8</span><span class="op">;</span> <span class="dv">4</span>] <span class="op">=</span> [<span class="dv">0xFE</span><span class="op">,</span> <span class="ch">b&#39;S&#39;</span><span class="op">,</span> <span class="ch">b&#39;M&#39;</span><span class="op">,</span> <span class="ch">b&#39;B&#39;</span>]<span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> MAX_READ_SIZE<span class="op">:</span> <span class="dt">u32</span> <span class="op">=</span> <span class="dv">8</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co">// Modules: snake_case</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="kw">mod</span> session_manager<span class="op">;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="kw">mod</span> protocol_handler<span class="op">;</span></span></code></pre></div>
+<h3 id="async-patterns">Async Patterns</h3>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Use BoxFuture for object-safe async traits</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::future::</span><span class="bu">Future</span><span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::pin::</span>Pin<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">type</span> BoxFuture<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">,</span> T<span class="op">&gt;</span> <span class="op">=</span> Pin<span class="op">&lt;</span><span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> <span class="bu">Future</span><span class="op">&lt;</span>Output <span class="op">=</span> T<span class="op">&gt;</span> <span class="op">+</span> <span class="bu">Send</span> <span class="op">+</span> <span class="ot">&#39;a</span><span class="op">&gt;&gt;;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co">// Trait methods return BoxFuture</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> StorageBackend<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">+</span> <span class="ot">&#39;static</span> <span class="op">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> read<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">&gt;</span>(</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="ot">&#39;a</span> <span class="kw">self</span><span class="op">,</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>        handle<span class="op">:</span> <span class="op">&amp;</span><span class="ot">&#39;a</span> FileHandle<span class="op">,</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>        offset<span class="op">:</span> <span class="dt">u64</span><span class="op">,</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>        length<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    ) <span class="op">-&gt;</span> BoxFuture<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">,</span> <span class="dt">Result</span><span class="op">&lt;</span>ReadResult<span class="op">,</span> VfsError<span class="op">&gt;&gt;;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="co">// Implementation wraps async block in Box::pin</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> StorageBackend <span class="cf">for</span> LocalBackend <span class="op">{</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> read<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">&gt;</span>(</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="ot">&#39;a</span> <span class="kw">self</span><span class="op">,</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        handle<span class="op">:</span> <span class="op">&amp;</span><span class="ot">&#39;a</span> FileHandle<span class="op">,</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>        offset<span class="op">:</span> <span class="dt">u64</span><span class="op">,</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        length<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    ) <span class="op">-&gt;</span> BoxFuture<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">,</span> <span class="dt">Result</span><span class="op">&lt;</span>ReadResult<span class="op">,</span> VfsError<span class="op">&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>        <span class="dt">Box</span><span class="pp">::</span>pin(<span class="kw">async</span> <span class="kw">move</span> <span class="op">{</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>            <span class="co">// async implementation</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span>)</span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="error-handling">Error Handling</h3>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Define errors with thiserror</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">thiserror::</span><span class="bu">Error</span><span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>derive<span class="at">(</span><span class="bu">Debug</span><span class="op">,</span> <span class="bu">Error</span><span class="at">)]</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">enum</span> VfsError <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>error<span class="at">(</span><span class="st">&quot;File not found: {0}&quot;</span><span class="at">)]</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    NotFound(<span class="dt">String</span>)<span class="op">,</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>error<span class="at">(</span><span class="st">&quot;Access denied: {0}&quot;</span><span class="at">)]</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    AccessDenied(<span class="dt">String</span>)<span class="op">,</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>error<span class="at">(</span><span class="st">&quot;I/O error: {0}&quot;</span><span class="at">)]</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    Io(<span class="at">#[</span>from<span class="at">]</span> <span class="pp">std::io::</span><span class="bu">Error</span>)<span class="op">,</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="co">// Map to NT_STATUS for protocol responses</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> <span class="bu">From</span><span class="op">&lt;&amp;</span>VfsError<span class="op">&gt;</span> <span class="cf">for</span> NtStatus <span class="op">{</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> from(err<span class="op">:</span> <span class="op">&amp;</span>VfsError) <span class="op">-&gt;</span> <span class="dt">Self</span> <span class="op">{</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">match</span> err <span class="op">{</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>            <span class="pp">VfsError::</span>NotFound(_) <span class="op">=&gt;</span> <span class="pp">NtStatus::</span>ObjectNameNotFound<span class="op">,</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>            <span class="pp">VfsError::</span>AccessDenied(_) <span class="op">=&gt;</span> <span class="pp">NtStatus::</span>AccessDenied<span class="op">,</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>            _ <span class="op">=&gt;</span> <span class="pp">NtStatus::</span>InternalError<span class="op">,</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="documentation-1">Documentation</h3>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">/// Brief description of the item.</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co">/// More detailed explanation if needed.</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Arguments</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co">/// * `param` - Description of the parameter</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Returns</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="co">/// Description of what is returned.</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Errors</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="co">/// Describes when this function returns an error.</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Examples</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="co">/// ```rust</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="co">/// let result = function(arg);</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="co">/// assert!(result.is_ok());</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="co">/// ```</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> function(param<span class="op">:</span> Type) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>Output<span class="op">,</span> <span class="bu">Error</span><span class="op">&gt;</span> <span class="op">{</span> <span class="op">...</span> <span class="op">}</span></span></code></pre></div>
+<h3 id="testing">Testing</h3>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Unit tests in the same file</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>cfg<span class="at">(</span>test<span class="at">)]</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">mod</span> tests <span class="op">{</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">use</span> <span class="kw">super</span><span class="pp">::</span><span class="op">*;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> test_basic_functionality() <span class="op">{</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Arrange</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> input <span class="op">=</span> create_test_input()<span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Act</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> result <span class="op">=</span> function_under_test(input)<span class="op">;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Assert</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>        <span class="pp">assert_eq!</span>(result<span class="op">,</span> expected)<span class="op">;</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span><span class="pp">tokio::</span>test<span class="at">]</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">async</span> <span class="kw">fn</span> test_async_functionality() <span class="op">{</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> result <span class="op">=</span> async_function()<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>        <span class="pp">assert!</span>(result<span class="op">.</span>is_ok())<span class="op">;</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="co">// Integration tests in tests/ directory</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a><span class="co">// Property-based tests with proptest</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>cfg<span class="at">(</span>test<span class="at">)]</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a><span class="kw">mod</span> proptests <span class="op">{</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>    <span class="kw">use</span> <span class="pp">proptest::prelude::</span><span class="op">*;</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    <span class="pp">proptest!</span> <span class="op">{</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>        <span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>        <span class="kw">fn</span> test_roundtrip(input <span class="kw">in</span> <span class="pp">any::</span><span class="op">&lt;</span><span class="dt">u64</span><span class="op">&gt;</span>()) <span class="op">{</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>            <span class="kw">let</span> encoded <span class="op">=</span> encode(input)<span class="op">;</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>            <span class="kw">let</span> decoded <span class="op">=</span> decode(<span class="op">&amp;</span>encoded)<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>            <span class="pp">prop_assert_eq!</span>(input<span class="op">,</span> decoded)<span class="op">;</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="binary-protocol-parsing">Binary Protocol Parsing</h3>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">binrw::</span><span class="op">{</span>BinRead<span class="op">,</span> BinWrite<span class="op">};</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="co">/// SMB2 Header (64 bytes)</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>derive<span class="at">(</span><span class="bu">Debug</span><span class="op">,</span> <span class="bu">Clone</span><span class="op">,</span> BinRead<span class="op">,</span> BinWrite<span class="at">)]</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>brw<span class="at">(</span>little<span class="at">)]</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Smb2Header <span class="op">{</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>brw<span class="at">(</span>magic <span class="op">=</span> <span class="st">b&quot;</span><span class="sc">\xFE</span><span class="st">SMB&quot;</span><span class="at">)]</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> protocol_id<span class="op">:</span> ()<span class="op">,</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>brw<span class="at">(</span>assert<span class="at">(</span>structure_size <span class="op">==</span> <span class="dv">64</span><span class="at">))]</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> structure_size<span class="op">:</span> <span class="dt">u16</span><span class="op">,</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> credit_charge<span class="op">:</span> <span class="dt">u16</span><span class="op">,</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> status<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> command<span class="op">:</span> <span class="dt">u16</span><span class="op">,</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... rest of header</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h2 id="key-commands">Key Commands</h2>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build all crates</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> build <span class="at">--workspace</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Run tests</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">--workspace</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Run clippy</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> clippy <span class="at">--workspace</span> <span class="at">--</span> <span class="at">-D</span> warnings</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Format code</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> fmt <span class="at">--all</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Run the server</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--</span> <span class="at">--config</span> config.toml</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Run benchmarks</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> bench</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="co"># Or use Makefile shortcuts</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> test      <span class="co"># Run all tests</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> clippy    <span class="co"># Run clippy</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> fmt       <span class="co"># Format code</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> ci        <span class="co"># Run fmt-check + clippy + test (full CI)</span></span></code></pre></div>
+<h2 id="development-workflow">Development Workflow</h2>
+<p><strong>IMPORTANT: After completing each task, always
+run:</strong></p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> ci</span></code></pre></div>
+<p>Or manually:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> fmt <span class="at">--all</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> clippy <span class="at">--workspace</span> <span class="at">--</span> <span class="at">-D</span> warnings</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">--workspace</span></span></code></pre></div>
+<p>This ensures: 1. Code is properly formatted 2. No clippy warnings 3.
+All tests pass</p>
+<p>Do not commit code that fails any of these checks.</p>
+<h2 id="protocol-references">Protocol References</h2>
+<ul>
+<li><a
+href="https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/">MS-SMB2
+Specification</a></li>
+<li><a href="https://docs.kernel.org/filesystems/smb/ksmbd.html">Linux
+ksmbd Documentation</a></li>
+</ul>
+<h2 id="smb2-commands-19-total">SMB2 Commands (19 total)</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Code</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NEGOTIATE</td>
+<td>0x00</td>
+<td>Protocol negotiation</td>
+</tr>
+<tr>
+<td>SESSION_SETUP</td>
+<td>0x01</td>
+<td>Authentication</td>
+</tr>
+<tr>
+<td>LOGOFF</td>
+<td>0x02</td>
+<td>Session termination</td>
+</tr>
+<tr>
+<td>TREE_CONNECT</td>
+<td>0x03</td>
+<td>Connect to share</td>
+</tr>
+<tr>
+<td>TREE_DISCONNECT</td>
+<td>0x04</td>
+<td>Disconnect from share</td>
+</tr>
+<tr>
+<td>CREATE</td>
+<td>0x05</td>
+<td>Open/create file</td>
+</tr>
+<tr>
+<td>CLOSE</td>
+<td>0x06</td>
+<td>Close file handle</td>
+</tr>
+<tr>
+<td>FLUSH</td>
+<td>0x07</td>
+<td>Flush pending writes</td>
+</tr>
+<tr>
+<td>READ</td>
+<td>0x08</td>
+<td>Read file data</td>
+</tr>
+<tr>
+<td>WRITE</td>
+<td>0x09</td>
+<td>Write file data</td>
+</tr>
+<tr>
+<td>LOCK</td>
+<td>0x0A</td>
+<td>File locking</td>
+</tr>
+<tr>
+<td>IOCTL</td>
+<td>0x0B</td>
+<td>IO control</td>
+</tr>
+<tr>
+<td>CANCEL</td>
+<td>0x0C</td>
+<td>Cancel pending request</td>
+</tr>
+<tr>
+<td>ECHO</td>
+<td>0x0D</td>
+<td>Keep-alive</td>
+</tr>
+<tr>
+<td>QUERY_DIRECTORY</td>
+<td>0x0E</td>
+<td>List directory</td>
+</tr>
+<tr>
+<td>CHANGE_NOTIFY</td>
+<td>0x0F</td>
+<td>Directory watch</td>
+</tr>
+<tr>
+<td>QUERY_INFO</td>
+<td>0x10</td>
+<td>Get file info</td>
+</tr>
+<tr>
+<td>SET_INFO</td>
+<td>0x11</td>
+<td>Set file info</td>
+</tr>
+<tr>
+<td>OPLOCK_BREAK</td>
+<td>0x12</td>
+<td>Oplock notification</td>
+</tr>
+</tbody>
+</table>
+<h2 id="git-workflow">Git Workflow</h2>
+<ul>
+<li>Use conventional commits: <code>feat:</code>, <code>fix:</code>,
+<code>docs:</code>, <code>refactor:</code>, <code>test:</code>,
+<code>chore:</code></li>
+<li>Keep commits atomic and focused</li>
+<li>Write descriptive commit messages</li>
+</ul>
+<h2 id="security-considerations">Security Considerations</h2>
+<ul>
+<li>Never log sensitive data (passwords, session keys)</li>
+<li>Validate all paths to prevent directory traversal</li>
+<li>Use constant-time comparison for signatures</li>
+<li>Encrypt session keys in state store</li>
+</ul>
+<h2 id="implementation-status">Implementation Status</h2>
+<h3 id="phase-1-project-setup-documentation---completed">Phase 1:
+Project Setup &amp; Documentation - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />Workspace Cargo.toml with
+all crate definitions</label></li>
+<li><label><input type="checkbox" checked="" />CLAUDE.md with coding
+conventions</label></li>
+<li><label><input type="checkbox" checked="" />docs/ksmbd-research.md
+with kernel research</label></li>
+<li><label><input type="checkbox" checked="" />docs/architecture.md with
+detailed design</label></li>
+<li><label><input type="checkbox" checked="" />CI configuration
+(.github/workflows/ci.yml)</label></li>
+<li><label><input type="checkbox" checked="" />All crate structures
+created</label></li>
+</ul>
+<h3 id="phase-2-core-infrastructure---completed">Phase 2: Core
+Infrastructure - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />rustsmb-core: Complete
+error types and NT_STATUS (40+ status codes, 6 error types)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-vfs:
+StorageBackend trait with 27 POSIX-like methods</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-state: StateStore
+trait with 24 methods for HA support</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-state-memory:
+In-memory state store (full implementation)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-backend-memory:
+In-memory filesystem (full StorageBackend implementation with 9
+tests)</label></li>
+</ul>
+<h3 id="phase-3-protocol-layer---completed">Phase 3: Protocol Layer -
+COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />SMB2 header parsing with
+binrw (64-byte header)</label></li>
+<li><label><input type="checkbox" checked="" />SMB2 transform header for
+encryption (52-byte header)</label></li>
+<li><label><input type="checkbox" checked="" />All 19 SMB2 commands with
+request/response structures:</label>
+<ul>
+<li>NEGOTIATE, SESSION_SETUP, LOGOFF</li>
+<li>TREE_CONNECT, TREE_DISCONNECT</li>
+<li>CREATE, CLOSE, FLUSH, READ, WRITE</li>
+<li>LOCK, IOCTL, CANCEL, ECHO</li>
+<li>QUERY_DIRECTORY, CHANGE_NOTIFY, QUERY_INFO, SET_INFO</li>
+<li>OPLOCK_BREAK (with lease support)</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Dialect negotiation
+helpers (DialectNegotiator, context parsing)</label></li>
+<li><label><input type="checkbox" checked="" />Message signing (AES-CMAC
+for SMB 3.0, AES-GMAC for SMB 3.1.1)</label></li>
+<li><label><input type="checkbox" checked="" />Message encryption
+(AES-128-CCM, AES-128-GCM, AES-256-GCM)</label></li>
+<li><label><input type="checkbox" checked="" />100 unit tests
+passing</label></li>
+</ul>
+<h3 id="phase-4-session-management---completed">Phase 4: Session
+Management - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />rustsmb-session:
+Connection state machine (multi-session support, idle
+tracking)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-session: Session
+manager with StateStore integration</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-session: Tree
+connection manager</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-session: File
+handle manager (volatile + persistent IDs)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-session: Credit
+management for multi-credit operations</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-session: Compound
+request handling (related/unrelated)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-session: Async
+request tracking (for CHANGE_NOTIFY, LOCK, etc.)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-session: Request
+context validation (session/tree/handle)</label></li>
+<li><label><input type="checkbox" checked="" />39 unit tests
+passing</label></li>
+</ul>
+<h3 id="phase-5-authentication---completed">Phase 5: Authentication -
+COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />rustsmb-auth:
+AuthProvider trait with guest/anonymous support</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-auth: Simple auth
+provider (username/password)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-auth: NTLM
+authentication (NTLMv2 with full crypto)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-auth:
+SPNEGO/GSS-API wrapper (ASN.1/DER parsing)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-auth: Session key
+derivation (SP800-108 KDF for SMB 3.0/3.1.1)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-auth: Pre-auth
+integrity hash (SHA-512 for SMB 3.1.1)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-auth: Guest and
+anonymous session support</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-auth:
+CompositeAuthProvider for chaining providers</label></li>
+<li><label><input type="checkbox" checked="" />48 unit tests
+passing</label></li>
+</ul>
+<h3 id="phase-6-server-implementation---completed">Phase 6: Server
+Implementation - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />rustsmb-server: TCP
+listener with connection handling</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-server: TLS
+support (optional)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-server:
+Configuration loading (TOML)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-server: Share
+manager (share definitions, access control)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-server: Command
+dispatcher (route to handlers)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-server: All 19
+command handlers implementation</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-server: Graceful
+shutdown and connection draining</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-server: Metrics
+and logging (via tracing)</label></li>
+</ul>
+<h3 id="phase-7-local-filesystem-backend---completed">Phase 7: Local
+Filesystem Backend - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />rustsmb-backend-local:
+Full StorageBackend implementation (27 methods)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-backend-local:
+Path validation (prevent traversal attacks via
+canonicalization)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-backend-local:
+File locking (advisory locks via libc flock)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-backend-local:
+Extended attributes support (xattr on macOS/Linux)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-backend-local:
+Proper permission mapping (Unix to SMB via MetadataExt)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-backend-local:
+Symlink handling (create, read, follow option)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-backend-local:
+Large file support (&gt;4GB via sparse file writes)</label></li>
+<li><label><input type="checkbox" checked="" />13 unit tests for local
+backend</label></li>
+</ul>
+<h3 id="phase-8-redis-state-store---completed">Phase 8: Redis State
+Store - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />rustsmb-state-redis: Full
+StateStore implementation (24 methods)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-state-redis:
+Connection pooling (deadpool-redis)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-state-redis:
+Session state serialization (serde_json)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-state-redis:
+TTL-based session expiration</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-state-redis:
+Distributed locking (SET NX EX with Lua scripts)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-state-redis:
+Atomic ID generation (INCR)</label></li>
+<li><label><input type="checkbox" checked="" />rustsmb-state-redis: 6
+integration tests (require Redis)</label></li>
+</ul>
+<h3 id="phase-9-testing-hardening---completed">Phase 9: Testing &amp;
+Hardening - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />Integration tests with
+smbclient (16 tests - requires smbclient installed)</label></li>
+<li><label><input type="checkbox" checked="" />Integration tests with
+Windows client (10 tests - requires Windows with admin
+privileges)</label></li>
+<li><label><input type="checkbox" checked="" />Fuzz testing
+infrastructure (cargo-fuzz targets for headers and
+commands)</label></li>
+<li><label><input type="checkbox" checked="" />Property-based tests for
+all command roundtrips (36 proptest tests)</label></li>
+<li><label><input type="checkbox" checked="" />Stress testing
+(concurrent connections, large files - 13 tests)</label></li>
+<li><label><input type="checkbox" checked="" />Security tests (path
+traversal prevention, input validation - 25 tests)</label></li>
+<li><label><input type="checkbox" checked="" />Performance benchmarks
+(protocol parsing, throughput)</label></li>
+<li><label><input type="checkbox" />Documentation (rustdoc, examples,
+deployment guide)</label></li>
+</ul>
+<h3 id="phase-10-high-availability---completed">Phase 10: High
+Availability - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />docs/ha-design.md: HA
+design document (architecture, session binding, Redis)</label></li>
+<li><label><input type="checkbox" checked="" />Session binding support
+in server (SESSION_SETUP with SESSION_BINDING flag)</label></li>
+<li><label><input type="checkbox" checked="" />NT_STATUS
+UserSessionDeleted code for binding failures</label></li>
+<li><label><input type="checkbox" checked="" />Custom SMB2 test client
+(tests/ha_client.rs) for session binding tests</label></li>
+<li><label><input type="checkbox" checked="" />HA integration tests
+(tests/integration_ha.rs) with Redis state store</label></li>
+<li><label><input type="checkbox" checked="" />CI workflow for HA tests
+with Redis service container</label></li>
+</ul>
+<h3 id="phase-11-persistent-handles-leases---completed">Phase 11:
+Persistent Handles &amp; Leases - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox"
+checked="" />docs/persistent-handles-leases.md: Design document for
+persistent handles and leases</label></li>
+<li><label><input type="checkbox" checked="" />Phase 11A: CREATE context
+parsing (DHnQ, DHnC, DH2Q, DH2C, RqLs, RqLsV2)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 11A: Durable handle
+request/reconnect support in CREATE handler</label></li>
+<li><label><input type="checkbox" checked="" />Phase 11A: Extend
+HandleState with reconnection fields (create_guid, file_offset,
+durable_timeout, etc.)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 11A:
+update_handle() added to StateStore trait and
+implementations</label></li>
+<li><label><input type="checkbox" checked="" />Phase 11B: Lease
+request/response contexts (LeaseV1, LeaseV2) parsing</label></li>
+<li><label><input type="checkbox" checked="" />Phase 11B: Basic lease
+handling in CREATE flow (grant requested lease state)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 11C: Persistent
+handles validation (SMB 3.0+ requirement)</label></li>
+<li><label><input type="checkbox" />Phase 11B (Advanced): Full
+LeaseManager state machine with conflict detection</label></li>
+<li><label><input type="checkbox" />Phase 11B (Advanced): Oplock break
+notifications to clients</label></li>
+</ul>
+<h3 id="phase-12-hyperscale-state-store---completed">Phase 12:
+Hyperscale State Store - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox"
+checked="" />docs/state-store-design.md: Design document for hyperscale
+state store</label></li>
+<li><label><input type="checkbox" checked="" />Phase 12A: Extend
+rustsmb-state with CoordinationBackend trait</label></li>
+<li><label><input type="checkbox" checked="" />Phase 12A: Add
+bound_server_id to SessionState and HandleState</label></li>
+<li><label><input type="checkbox" checked="" />Phase 12B: Create
+rustsmb-state-cached crate (LocalCache with LRU + epoch)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 12C: Create
+rustsmb-coord-raft crate (InMemoryCoordinator using Tokio
+broadcast)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 12D: Server failure
+detection and cache invalidation (15s heartbeat timeout)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 12E: Lease/lock
+coordination (SMB lease conflict detection)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 12F: Server
+integration (ServerCoordination layer, with_coordination())</label></li>
+</ul>
+<h3 id="phase-13-coordinator-service-refactoring---in-progress">Phase
+13: Coordinator Service Refactoring - IN PROGRESS</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />Phase 13A: Update
+documentation (CLAUDE.md, docs/state-store-design.md)</label></li>
+<li><label><input type="checkbox" />Phase 13B: Create
+rustsmb-coordinator-proto crate (gRPC definitions)</label></li>
+<li><label><input type="checkbox" />Phase 13B: Create
+rustsmb-coordinator-client crate (gRPC client)</label></li>
+<li><label><input type="checkbox" />Phase 13C: Move lease methods to
+StateStore trait</label></li>
+<li><label><input type="checkbox" />Phase 13C: Move lock methods to
+StateStore trait</label></li>
+<li><label><input type="checkbox" />Phase 13C: Implement lease/lock in
+RedisStateStore with WATCH</label></li>
+<li><label><input type="checkbox" />Phase 13D: Simplify
+CoordinationBackend trait (remove lease/lock, keep membership +
+epoch)</label></li>
+<li><label><input type="checkbox" />Phase 13E: Create
+rustsmb-coordinator binary (standalone service with Raft)</label></li>
+<li><label><input type="checkbox" />Phase 13E: Implement gRPC service
+handlers</label></li>
+<li><label><input type="checkbox" />Phase 13E: Implement Raft transport
+between coordinator nodes</label></li>
+<li><label><input type="checkbox" />Phase 13F: Update CachedStateStore
+(caching conditional on coordinator)</label></li>
+<li><label><input type="checkbox" />Phase 13G: Update server integration
+(use CoordinatorClient instead of embedded Raft)</label></li>
+</ul>
+
+</body>
+</html>

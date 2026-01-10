@@ -213,6 +213,10 @@ pub enum StateError {
     #[error("Key not found: {0}")]
     NotFound(String),
 
+    /// Resource already exists.
+    #[error("Already exists: {0}")]
+    AlreadyExists(String),
+
     /// Conflict during update.
     #[error("Conflict: {0}")]
     Conflict(String),
