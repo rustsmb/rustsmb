@@ -17,6 +17,7 @@ All project documentation is maintained in the `docs/` directory:
 | [docs/persistent-handles-leases.md](./docs/persistent-handles-leases.md) | Persistent handles and leases for enterprise HA |
 | [docs/state-store-design.md](./docs/state-store-design.md) | State store design with separate coordinator service and Redis leases/locks |
 | [docs/oplock-lease-design.md](./docs/oplock-lease-design.md) | SMB oplock and lease design, conflict detection, multi-server handling |
+| [docs/smb-protocol-testing.md](./docs/smb-protocol-testing.md) | SMB protocol testing with smbtorture, MS Protocol Test Suites, and smbprotocol |
 
 ### Documentation Update Policy
 
@@ -500,3 +501,19 @@ Do not commit code that fails any of these checks.
   - WRITE_CACHING is exclusive (conflicts with any other lease)
   - Conflicting lease requests get reduced grant instead of oplock break
   - File open still succeeds with reduced/no lease (affects caching only)
+
+### Phase 15: SMB Specification Testing - COMPLETED
+- [x] docs/smb-protocol-testing.md: Comprehensive testing documentation
+- [x] Phase 15A: smbtorture integration
+  - tests/smbtorture_runner.rs: Rust-based test runner
+  - tests/scripts/run_smbtorture.sh: Bash script for all SMB2 test suites
+  - CI job for smbtorture tests
+- [x] Phase 15B: Python smbprotocol tests
+  - tests/python/: Python test environment
+  - Tests for NEGOTIATE, SESSION, CREATE, READ/WRITE, leases
+  - CI job for Python tests
+- [x] Phase 15C: Microsoft Protocol Test Suites setup
+  - tests/ms-protocol/setup.sh: Setup script for MS test suites
+  - tests/ms-protocol/run_tests.sh: Test runner
+  - tests/ms-protocol/FileServer.ptfconfig: Configuration file
+- [x] CI workflow updated with spec test jobs

@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Microsoft Protocol Test Suites Configuration for RustSMB
+
+  This configuration is used to run the FileServer protocol test suite
+  against the RustSMB server.
+
+  Customize the values below to match your test environment:
+  - SUT: System Under Test (the RustSMB server)
+  - Credentials: Test user credentials
+  - Network settings: IP addresses and share names
+-->
+<TestSite xmlns="http://schemas.microsoft.com/windows/ProtocolTestFramework/2007/07/TestConfig"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+  <Properties>
+    <!-- Server Under Test (SUT) Configuration -->
+    <Property name="SutComputerName" value="localhost"/>
+    <Property name="SutIpAddress" value="127.0.0.1"/>
+    <Property name="SutPort" value="445"/>
+
+    <!-- Share Configuration -->
+    <Property name="BasicShareName" value="test"/>
+    <Property name="SharePath" value="/tmp/rustsmb/test"/>
+
+    <!-- Authentication -->
+    <Property name="AdminUserName" value="testuser"/>
+    <Property name="AdminPassword" value="testpass"/>
+    <Property name="NonAdminUserName" value="guest"/>
+    <Property name="NonAdminPassword" value=""/>
+    <Property name="DomainName" value="WORKGROUP"/>
+
+    <!-- Protocol Configuration -->
+    <Property name="SupportedDialects" value="Smb2002,Smb21,Smb30,Smb302,Smb311"/>
+    <Property name="MaxSmbVersionSupported" value="Smb311"/>
+
+    <!-- Feature Flags -->
+    <Property name="IsRequireMessageSigning" value="false"/>
+    <Property name="IsMultiCreditSupported" value="true"/>
+    <Property name="IsLeasingSupported" value="true"/>
+    <Property name="IsDirectoryLeasingSupported" value="false"/>
+    <Property name="IsDurableHandleV1Supported" value="true"/>
+    <Property name="IsDurableHandleV2Supported" value="true"/>
+    <Property name="IsPersistentHandleSupported" value="true"/>
+    <Property name="IsEncryptionSupported" value="true"/>
+    <Property name="IsMultiChannelSupported" value="false"/>
+    <Property name="IsReplaySupported" value="true"/>
+    <Property name="IsCompressedReadWriteSupported" value="false"/>
+
+    <!-- Timeouts (in seconds) -->
+    <Property name="DefaultTimeout" value="60"/>
+    <Property name="WaitTimeout" value="120"/>
+
+    <!-- Test Settings -->
+    <Property name="Platform" value="NonWindows"/>
+    <Property name="TestCategory" value="BVT"/>
+  </Properties>
+
+  <!-- Adapter Configuration -->
+  <Adapters>
+    <!-- Protocol adapter bindings -->
+    <Adapter xsi:type="managed" name="ISutProtocolControlAdapter"
+             adaptertype="Microsoft.Protocols.TestSuites.FileSharing.Common.Adapter.SutProtocolControlAdapter"/>
+  </Adapters>
+
+  <!-- Test Execution Settings -->
+  <TestLog defaultSink="Console">
+    <Sinks>
+      <Sink id="Console" type="ConsoleTestSink"/>
+      <Sink id="File" type="FileTestSink" fileName="TestLog.xml"/>
+    </Sinks>
+    <LogLevel value="Info"/>
+  </TestLog>
+</TestSite>

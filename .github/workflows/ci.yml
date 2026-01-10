@@ -80,6 +80,57 @@ jobs:
       - name: Run smbclient integration tests
         run: cargo test --test integration_smbclient -- --ignored
 
+  smbtorture-test:
+    name: SMB Spec Tests (smbtorture)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Install samba-testsuite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y samba-testsuite
+      - name: Run smbtorture tests
+        run: cargo test --test smbtorture_runner -- --ignored --nocapture
+        continue-on-error: true
+
+  python-smb-test:
+    name: Python SMB Tests (smbprotocol)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Python dependencies
+        run: pip install -r tests/python/requirements.txt
+      - name: Build and start server
+        run: |
+          cargo build --release
+          ./target/release/rustsmb --listen 127.0.0.1:4450 &
+          sleep 3
+      - name: Run Python tests
+        env:
+          RUSTSMB_SERVER: 127.0.0.1
+          RUSTSMB_PORT: 4450
+          RUSTSMB_SHARE: test
+          RUSTSMB_USER: testuser
+          RUSTSMB_PASSWORD: testpass
+        run: cd tests/python && pytest -v --tb=short
+        continue-on-error: true
+
   ha-test:
     name: HA Integration Tests (Redis)
     runs-on: ubuntu-latest

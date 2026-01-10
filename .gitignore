@@ -20,3 +20,8 @@ Thumbs.db
 # Environment files
 .env
 .env.local
+
+# Test artifacts
+tests/samba/
+tests/smbtorture-bin/
+test-results/
