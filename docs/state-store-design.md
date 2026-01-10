@@ -471,6 +471,146 @@ Client A          Server 1         Raft           Server 2    Client B
    |                 |              |                 |  response |
 ```
 
+### Lease State Flags
+
+SMB leases use three caching flags that can be combined:
+
+| Flag | Value | Name | Description |
+|------|-------|------|-------------|
+| **R** | `0x01` | Read Caching | Client can cache read data locally |
+| **H** | `0x02` | Handle Caching | Client can delay close operations |
+| **W** | `0x04` | Write Caching | Client can buffer writes locally |
+
+#### Flag Combinations
+
+| State | Flags | Use Case |
+|-------|-------|----------|
+| `0x00` | None | No caching (concurrent access) |
+| `0x01` | R | Read-only, shared access |
+| `0x03` | R+H | Read with handle caching |
+| `0x05` | R+W | Read/write exclusive |
+| `0x07` | R+W+H | Full exclusive access |
+
+**Key rule**: Write caching (W) is **exclusive** - only ONE client can hold W at a time.
+
+### Lease State Transitions
+
+#### Initial Grant (CREATE request)
+
+When client opens a file:
+1. Client requests desired state (typically RWH = 0x07)
+2. Server calls `check_lease_conflict(file_path, requested_state)`
+3. If no conflict → grant requested state
+4. If conflict → grant reduced state (see conflict rules)
+
+#### Lease Break (conflict detected)
+
+When another client needs incompatible access:
+1. New client requests lease that conflicts with existing
+2. Server sends OPLOCK_BREAK to existing client
+3. Existing client flushes cached data and acknowledges
+4. Existing client's lease downgraded
+5. New client's request proceeds
+
+#### State Reduction Flow
+
+```
+┌─────────┐    conflict    ┌─────────┐    conflict    ┌─────────┐
+│   RWH   │ ────────────> │    R    │ ────────────> │  None   │
+│  (0x07) │               │  (0x01) │               │  (0x00) │
+└─────────┘               └─────────┘               └─────────┘
+  exclusive                 shared                   no cache
+```
+
+### Conflict Detection Rules
+
+Implemented in `CoordinationState::leases_conflict()`:
+
+| Existing | Requested | Conflict? | Result |
+|----------|-----------|-----------|--------|
+| R | R | No | Both keep R |
+| R | W | **Yes** | Existing keeps R, new gets R (W stripped) |
+| R | RWH | **Yes** | Existing keeps R, new gets R |
+| W | R | **Yes** | Existing must break W first |
+| W | W | **Yes** | Existing must break W first |
+| W | RWH | **Yes** | Existing must break W first |
+| RWH | R | **Yes** | Existing must break to R |
+| RWH | RWH | **Yes** | One must downgrade |
+
+**Rule summary**:
+- R+R = OK (read caching can be shared)
+- W + anything = CONFLICT (write caching is exclusive)
+
+### Concurrent Write Scenario
+
+When two clients on different servers write the same file:
+
+#### Timeline
+
+```
+Client 1 (Server 1)         Raft Coordinator         Client 2 (Server 2)
+       │                          │                          │
+       │── CREATE file.txt ──────>│                          │
+       │   want RWH (0x07)        │                          │
+       │                          │ no conflicts             │
+       │<── granted RWH ──────────│                          │
+       │                          │                          │
+       │   (writes cached         │                          │
+       │    locally)              │                          │
+       │                          │                          │
+       │                          │<── CREATE file.txt ──────│
+       │                          │    want RWH (0x07)       │
+       │                          │                          │
+       │                          │ CONFLICT: Client 1 has W │
+       │                          │                          │
+       │<── OPLOCK_BREAK ─────────│                          │
+       │    new_state = R (0x01)  │                          │
+       │                          │                          │
+       │── flush writes ─────────>│                          │
+       │── acknowledge break ────>│                          │
+       │                          │                          │
+       │   lease = R (0x01)       │   granted_state = R      │
+       │                          │──────────────────────────>│
+       │                          │   (W stripped because    │
+       │                          │    Client 1 still has R) │
+       │                          │                          │
+       ▼                          ▼                          ▼
+   RESULT: Both clients have R only, no write caching
+```
+
+#### Why Both Lose Write Caching
+
+Write caching means buffering writes in client memory. If two clients both had W:
+
+```
+Client 1 buffers: write(0-100)     Client 2 buffers: write(50-150)
+       │                                   │
+       │ (neither knows about the other)   │
+       │                                   │
+       └──────────> flush ────────> SERVER <──────── flush <───────────┘
+                                      │
+                              DATA CORRUPTION!
+                    Conflicting writes at bytes 50-100
+```
+
+**Correct behavior**: Neither client caches writes. Every write goes directly to server:
+
+```
+Client 1: WRITE(0-100) ──────> SERVER <────── WRITE(50-150) :Client 2
+                                 │
+                     Server handles ordering
+                   (last-writer-wins or locking)
+```
+
+#### Performance Impact
+
+| Scenario | Write Latency | Data Safety |
+|----------|---------------|-------------|
+| Single writer (has W) | ~0 (cached) | Safe |
+| Concurrent writers (no W) | ~1-5ms per write | Safe |
+
+This is the designed trade-off: **correctness over performance** for concurrent access.
+
 ## Lock Conflict Detection
 
 ### Distributed Lock
