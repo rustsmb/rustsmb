@@ -371,10 +371,12 @@ mod tests {
 
     #[test]
     fn test_credits() {
+        use crate::credits::DEFAULT_INITIAL_CREDITS;
+
         let conn = Connection::new(1, test_addr());
 
-        // Initial credit
-        assert_eq!(conn.credits.available(), 1);
+        // Initial credits (256 by default for SMB compatibility)
+        assert_eq!(conn.credits.available(), DEFAULT_INITIAL_CREDITS);
 
         // Grant more credits
         let granted = conn.grant_credits(10, false);
@@ -413,5 +415,139 @@ mod tests {
         assert!(ConnectionState::SessionActive.is_post_negotiate());
         assert!(!ConnectionState::AwaitingNegotiate.is_post_negotiate());
         assert!(!ConnectionState::Disconnecting.is_post_negotiate());
+    }
+
+    #[test]
+    fn test_session_iteration() {
+        let mut conn = Connection::new(1, test_addr());
+        conn.negotiate(SmbDialect::Smb311);
+
+        // Add sessions
+        conn.add_session(100);
+        conn.add_session(200);
+        conn.add_session(300);
+
+        // Collect session IDs
+        let sessions: Vec<u64> = conn.session_ids().copied().collect();
+        assert_eq!(sessions.len(), 3);
+        assert!(sessions.contains(&100));
+        assert!(sessions.contains(&200));
+        assert!(sessions.contains(&300));
+    }
+
+    #[test]
+    fn test_duplicate_session() {
+        let mut conn = Connection::new(1, test_addr());
+        conn.negotiate(SmbDialect::Smb311);
+
+        // Add session
+        assert!(conn.add_session(100));
+        assert_eq!(conn.session_count(), 1);
+
+        // Adding same session ID should fail (returns false) or be idempotent
+        // depending on implementation - HashSet silently ignores duplicates
+        let result = conn.add_session(100);
+        // HashSet returns false for insert when already exists
+        assert!(!result || conn.session_count() == 1);
+    }
+
+    #[test]
+    fn test_session_cleanup_on_disconnect() {
+        let mut conn = Connection::new(1, test_addr());
+        conn.negotiate(SmbDialect::Smb311);
+
+        // Add multiple sessions
+        conn.add_session(100);
+        conn.add_session(200);
+        conn.add_session(300);
+        assert_eq!(conn.session_count(), 3);
+
+        // Disconnect
+        conn.disconnect();
+        assert!(conn.is_disconnecting());
+
+        // Sessions should still be tracked (for cleanup by handler)
+        // The connection tracks them until handler cleans up
+        assert_eq!(conn.session_count(), 3);
+    }
+
+    #[test]
+    fn test_session_state_transitions() {
+        let mut conn = Connection::new(1, test_addr());
+
+        // Initial state
+        assert_eq!(conn.state, ConnectionState::AwaitingNegotiate);
+
+        // After negotiate
+        conn.negotiate(SmbDialect::Smb311);
+        assert_eq!(conn.state, ConnectionState::Negotiated);
+
+        // After first session
+        conn.add_session(1);
+        assert_eq!(conn.state, ConnectionState::SessionActive);
+
+        // More sessions don't change state
+        conn.add_session(2);
+        assert_eq!(conn.state, ConnectionState::SessionActive);
+
+        // Remove one session, still have others
+        conn.remove_session(1);
+        assert_eq!(conn.state, ConnectionState::SessionActive);
+
+        // Remove last session
+        conn.remove_session(2);
+        assert_eq!(conn.state, ConnectionState::Negotiated);
+    }
+
+    #[test]
+    fn test_many_sessions() {
+        let config = ConnectionConfig {
+            max_sessions: 1000,
+            ..Default::default()
+        };
+        let mut conn = Connection::with_config(1, test_addr(), config);
+        conn.negotiate(SmbDialect::Smb311);
+
+        // Add many sessions
+        for i in 1..=100 {
+            assert!(
+                conn.add_session(i),
+                "Should be able to add session {}",
+                i
+            );
+        }
+        assert_eq!(conn.session_count(), 100);
+
+        // Remove half of them
+        for i in 1..=50 {
+            conn.remove_session(i);
+        }
+        assert_eq!(conn.session_count(), 50);
+
+        // Verify remaining sessions
+        for i in 51..=100 {
+            assert!(conn.has_session(i), "Should still have session {}", i);
+        }
+    }
+
+    #[test]
+    fn test_session_ids_after_removal() {
+        let mut conn = Connection::new(1, test_addr());
+        conn.negotiate(SmbDialect::Smb311);
+
+        // Add sessions
+        conn.add_session(100);
+        conn.add_session(200);
+        conn.add_session(300);
+
+        // Remove middle session
+        conn.remove_session(200);
+
+        // Check iteration
+        let sessions: Vec<u64> = conn.session_ids().copied().collect();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.contains(&100));
+        assert!(!sessions.contains(&200));
+        assert!(sessions.contains(&300));
     }
 }

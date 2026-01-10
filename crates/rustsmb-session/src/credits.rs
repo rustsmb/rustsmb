@@ -8,10 +8,14 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use tracing::{debug, trace};
 
 /// Default initial credits granted to a new connection.
-pub const DEFAULT_INITIAL_CREDITS: u16 = 1;
+/// Windows servers typically grant 256+ credits after NEGOTIATE.
+pub const DEFAULT_INITIAL_CREDITS: u16 = 256;
 
 /// Default maximum credits a connection can accumulate.
 pub const DEFAULT_MAX_CREDITS: u16 = 8192;
+
+/// Minimum credits to grant in any response to prevent client starvation.
+pub const MIN_CREDITS_PER_RESPONSE: u16 = 1;
 
 /// Credit manager configuration.
 #[derive(Debug, Clone)]
@@ -158,20 +162,30 @@ impl CreditManager {
     /// Calculate credits to grant in a response.
     ///
     /// Uses adaptive grant logic based on current balance and request type.
+    /// Always grants at least MIN_CREDITS_PER_RESPONSE to prevent client starvation.
     pub fn calculate_grant(&self, requested_credits: u16, is_async: bool) -> u16 {
-        if !self.config.adaptive_grants {
-            return self.config.grant_per_response;
+        let current = self.available();
+        let headroom = self.config.max_credits.saturating_sub(current);
+
+        // If at max, can't grant more
+        if headroom == 0 {
+            return 0;
         }
 
-        let current = self.available();
+        if !self.config.adaptive_grants {
+            return self.config.grant_per_response.min(headroom);
+        }
+
         let target = self.config.max_credits / 2; // Target 50% of max
 
-        // Base grant
-        let mut grant = self.config.grant_per_response;
+        // Base grant - always at least 1
+        let mut grant = self.config.grant_per_response.max(MIN_CREDITS_PER_RESPONSE);
 
-        // If below target, grant more
+        // If below target, grant more aggressively
         if current < target {
-            grant = grant.saturating_add((target - current) / 4);
+            // Grant enough to help client reach a comfortable level
+            let deficit = target - current;
+            grant = grant.saturating_add(deficit / 4);
         }
 
         // Honor client request within limits
@@ -184,9 +198,8 @@ impl CreditManager {
             grant = grant.saturating_mul(2);
         }
 
-        // Cap at remaining headroom
-        let headroom = self.config.max_credits.saturating_sub(current);
-        grant.min(headroom)
+        // Cap at remaining headroom, but ensure at least 1 if possible
+        grant.min(headroom).max(MIN_CREDITS_PER_RESPONSE.min(headroom))
     }
 
     /// Calculate the credit charge for a multi-credit operation.
@@ -425,5 +438,241 @@ mod tests {
         // Async operations get more
         let async_grant = manager.calculate_grant(0, true);
         assert!(async_grant > grant);
+    }
+
+    #[test]
+    fn test_default_initial_credits_sufficient() {
+        // Verify default initial credits are sufficient for typical SMB operations
+        let manager = CreditManager::new();
+
+        // Should have at least 256 credits initially (per Windows server behavior)
+        assert!(
+            manager.available() >= 256,
+            "Initial credits should be at least 256, got {}",
+            manager.available()
+        );
+
+        // Should be able to handle multiple operations without starvation
+        for _ in 0..10 {
+            assert!(
+                manager.can_satisfy(1),
+                "Should have credits for basic operations"
+            );
+            manager.consume(1);
+        }
+
+        // Still should have credits remaining
+        assert!(
+            manager.available() > 0,
+            "Should have credits remaining after 10 operations"
+        );
+    }
+
+    #[test]
+    fn test_credits_after_negotiate_response() {
+        // Simulate a fresh connection with credits granted by NEGOTIATE response
+        let config = CreditConfig {
+            initial_credits: DEFAULT_INITIAL_CREDITS,
+            max_credits: DEFAULT_MAX_CREDITS,
+            grant_per_response: 1,
+            adaptive_grants: true,
+        };
+        let manager = CreditManager::with_config(config);
+
+        // Client sends NEGOTIATE, server responds granting credits
+        // The calculate_grant should return a reasonable amount
+        let credits_to_grant = manager.calculate_grant(64, false); // Client requests 64
+
+        // Should grant enough for follow-up operations
+        assert!(
+            credits_to_grant >= 64,
+            "Should grant at least what client requested, got {}",
+            credits_to_grant
+        );
+
+        // Grant the credits
+        manager.grant(credits_to_grant);
+
+        // Now client should be able to send SESSION_SETUP (uses 1 credit)
+        assert!(
+            manager.can_satisfy(1),
+            "Should have credits for SESSION_SETUP"
+        );
+    }
+
+    #[test]
+    fn test_prevent_credit_starvation() {
+        // Verify that even with 0 requested credits, we grant something
+        let config = CreditConfig {
+            initial_credits: 10,
+            max_credits: 100,
+            grant_per_response: 1,
+            adaptive_grants: true,
+        };
+        let manager = CreditManager::with_config(config);
+
+        // Even with 0 requested, should grant at least 1
+        let grant = manager.calculate_grant(0, false);
+        assert!(
+            grant >= MIN_CREDITS_PER_RESPONSE,
+            "Should grant at least MIN_CREDITS_PER_RESPONSE, got {}",
+            grant
+        );
+    }
+
+    #[test]
+    fn test_consume_grant_cycle() {
+        // Simulate a realistic request/response cycle
+        let config = CreditConfig {
+            initial_credits: 256,
+            max_credits: 1000,
+            grant_per_response: 1,
+            adaptive_grants: true,
+        };
+        let manager = CreditManager::with_config(config);
+
+        // After NEGOTIATE, grant credits (simulating first response)
+        let first_grant = manager.calculate_grant(64, false);
+        manager.grant(first_grant);
+        let after_first_grant = manager.available();
+        assert!(
+            after_first_grant > 256,
+            "Should have more credits after first grant: {}",
+            after_first_grant
+        );
+
+        // Simulate 10 request/response cycles
+        for i in 0..10 {
+            // Client sends request, consuming 1 credit
+            let consumed = manager.consume(1);
+            assert!(
+                consumed.is_some(),
+                "Should be able to consume credit on iteration {}",
+                i
+            );
+
+            // Server responds, granting credits
+            let to_grant = manager.calculate_grant(1, false);
+            manager.grant(to_grant);
+        }
+
+        // Should still have plenty of credits
+        assert!(
+            manager.available() > 100,
+            "Should still have credits after 10 cycles: {}",
+            manager.available()
+        );
+    }
+
+    #[test]
+    fn test_headroom_replenishes_after_consume() {
+        // This tests the bug where credits couldn't be granted after hitting max
+        let config = CreditConfig {
+            initial_credits: 100,
+            max_credits: 100, // Start at max
+            grant_per_response: 10,
+            adaptive_grants: false,
+        };
+        let manager = CreditManager::with_config(config);
+
+        // At max, grant should return 0
+        assert_eq!(manager.grant(10), 0, "No headroom when at max");
+
+        // Consume some credits
+        manager.consume(50);
+        assert_eq!(manager.available(), 50);
+
+        // Now should be able to grant again
+        let granted = manager.grant(10);
+        assert_eq!(granted, 10, "Should grant after consuming");
+        assert_eq!(manager.available(), 60);
+    }
+
+    #[test]
+    fn test_sustained_traffic_pattern() {
+        // Simulate sustained client traffic where requests arrive continuously
+        let config = CreditConfig {
+            initial_credits: DEFAULT_INITIAL_CREDITS,
+            max_credits: DEFAULT_MAX_CREDITS,
+            grant_per_response: 1,
+            adaptive_grants: true,
+        };
+        let manager = CreditManager::with_config(config);
+
+        // Simulate 100 sequential requests (like listing a large directory)
+        for i in 0..100 {
+            // Each request consumes credits
+            assert!(
+                manager.consume(1).is_some(),
+                "Failed to consume on iteration {}, available: {}",
+                i,
+                manager.available()
+            );
+
+            // Each response grants credits
+            let to_grant = manager.calculate_grant(1, false);
+            manager.grant(to_grant);
+        }
+
+        // Credits should remain healthy
+        assert!(
+            manager.available() >= 200,
+            "Should maintain healthy credits: {}",
+            manager.available()
+        );
+    }
+
+    #[test]
+    fn test_multi_credit_operations() {
+        // Test operations that consume multiple credits (large reads/writes)
+        let config = CreditConfig {
+            initial_credits: 256,
+            max_credits: 1000,
+            grant_per_response: 1,
+            adaptive_grants: true,
+        };
+        let manager = CreditManager::with_config(config);
+
+        // Grant initial credits like after NEGOTIATE
+        let first_grant = manager.calculate_grant(64, false);
+        manager.grant(first_grant);
+
+        // Large read consuming 8 credits (512KB / 64KB per credit)
+        assert!(manager.consume(8).is_some(), "Should consume 8 credits");
+
+        // Response grants credits back
+        let granted = manager.calculate_grant(8, false);
+        manager.grant(granted);
+
+        // Should still have healthy balance
+        assert!(
+            manager.available() > 200,
+            "Should have credits after multi-credit op: {}",
+            manager.available()
+        );
+    }
+
+    #[test]
+    fn test_credit_tracking_statistics() {
+        let manager = CreditManager::new();
+
+        // Track initial stats
+        let initial_granted = manager.total_granted();
+        let initial_consumed = manager.total_consumed();
+
+        // Initial credits count as granted
+        assert_eq!(initial_granted, DEFAULT_INITIAL_CREDITS as u64);
+        assert_eq!(initial_consumed, 0);
+
+        // Consume and grant
+        manager.consume(10);
+        manager.grant(50);
+
+        // Check stats updated
+        assert_eq!(manager.total_consumed(), 10);
+        assert_eq!(
+            manager.total_granted(),
+            DEFAULT_INITIAL_CREDITS as u64 + 50
+        );
     }
 }

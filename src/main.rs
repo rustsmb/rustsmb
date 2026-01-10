@@ -9,7 +9,7 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use rustsmb_auth::AnonymousAuthProvider;
+use rustsmb_auth::{NtlmAuthProvider, SpnegoProvider};
 use rustsmb_backend_memory::MemoryBackend;
 use rustsmb_server::{ServerConfig, ShareConfig, SmbServer};
 use rustsmb_state_memory::MemoryStateStore;
@@ -62,9 +62,12 @@ async fn main() -> Result<()> {
     // Initialize state store (in-memory for now)
     let state: Arc<dyn rustsmb_state::StateStore + Send + Sync> = Arc::new(MemoryStateStore::new());
 
-    // Initialize auth provider (anonymous/guest for simplicity)
+    // Initialize auth provider (SPNEGO wrapping NTLM)
+    let ntlm_provider = NtlmAuthProvider::new("RUSTSMB", "WORKGROUP").with_anonymous();
+    ntlm_provider.add_user("testuser", "testpass", false);
+    ntlm_provider.add_user("admin", "admin", true);
     let auth: Arc<dyn rustsmb_auth::AuthProvider> =
-        Arc::new(AnonymousAuthProvider::allow_both().with_guest_fallback());
+        Arc::new(SpnegoProvider::ntlm(Arc::new(ntlm_provider)));
 
     // Create server config
     let config = ServerConfig {

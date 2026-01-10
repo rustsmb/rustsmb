@@ -124,6 +124,19 @@ where
             }
         }
 
+        // Clean up all sessions for this connection
+        let session_ids: Vec<u64> = self.connection.session_ids().copied().collect();
+        if !session_ids.is_empty() {
+            debug!(
+                conn_id = self.connection.id,
+                session_count = session_ids.len(),
+                "Cleaning up sessions on connection close"
+            );
+            for session_id in session_ids {
+                let _ = self.session_manager.delete_session(session_id).await;
+            }
+        }
+
         info!(conn_id = self.connection.id, "Connection closed");
         Ok(())
     }
@@ -179,11 +192,26 @@ where
             command = ?header.command,
             message_id = header.message_id,
             session_id = header.session_id,
+            credit_charge = header.credit_charge,
             "Processing message"
         );
 
         // Update connection activity
         self.connection.touch();
+
+        // Consume credits for this request (skip NEGOTIATE which bootstraps credits)
+        // The credit_charge field indicates how many credits this request consumes
+        if header.command != Smb2Command::Negotiate {
+            let charge = header.credit_charge.max(1); // Minimum 1 credit per request
+            if self.connection.consume_credits(charge).is_none() {
+                debug!(
+                    conn_id = self.connection.id,
+                    charge,
+                    "Insufficient credits for request"
+                );
+                // Don't fail - just log. Client tracks its own credits.
+            }
+        }
 
         // Dispatch to command handler
         let body = &message[SMB2_HEADER_SIZE..];
