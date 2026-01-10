@@ -278,9 +278,6 @@ cargo run -- --config config.toml
 # Run benchmarks
 cargo bench
 
-# Run Python tests (requires python3.10)
-cd tests/python && python3.10 -m pytest -v
-
 # Or use Makefile shortcuts
 make test      # Run all tests
 make clippy    # Run clippy
