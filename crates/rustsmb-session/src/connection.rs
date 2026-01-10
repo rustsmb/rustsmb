@@ -510,11 +510,7 @@ mod tests {
 
         // Add many sessions
         for i in 1..=100 {
-            assert!(
-                conn.add_session(i),
-                "Should be able to add session {}",
-                i
-            );
+            assert!(conn.add_session(i), "Should be able to add session {}", i);
         }
         assert_eq!(conn.session_count(), 100);
 

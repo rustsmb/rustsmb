@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -97,7 +101,6 @@ jobs:
           sudo apt-get install -y samba-testsuite
       - name: Run smbtorture tests
         run: cargo test --test smbtorture_runner -- --ignored --nocapture
-        continue-on-error: true
 
   python-smb-test:
     name: Python SMB Tests (smbprotocol)
@@ -129,7 +132,6 @@ jobs:
           RUSTSMB_USER: testuser
           RUSTSMB_PASSWORD: testpass
         run: cd tests/python && pytest -v --tb=short
-        continue-on-error: true
 
   ha-test:
     name: HA Integration Tests (Redis)

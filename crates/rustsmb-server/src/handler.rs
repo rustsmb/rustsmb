@@ -206,8 +206,7 @@ where
             if self.connection.consume_credits(charge).is_none() {
                 debug!(
                     conn_id = self.connection.id,
-                    charge,
-                    "Insufficient credits for request"
+                    charge, "Insufficient credits for request"
                 );
                 // Don't fail - just log. Client tracks its own credits.
             }

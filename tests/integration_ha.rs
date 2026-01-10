@@ -17,7 +17,7 @@
 mod ha_client;
 
 use ha_client::TestClient;
-use rustsmb_auth::AnonymousAuthProvider;
+use rustsmb_auth::{NtlmAuthProvider, SpnegoProvider};
 use rustsmb_backend_memory::MemoryBackend;
 use rustsmb_server::{ServerConfig, ShareConfig, SmbServer};
 use rustsmb_state::StateStore;
@@ -88,8 +88,10 @@ impl MultiServerCluster {
                 ..Default::default()
             };
 
+            let ntlm_provider = NtlmAuthProvider::new("RUSTSMB", "WORKGROUP").with_anonymous();
+            ntlm_provider.add_user("testuser", "testpass", false);
             let auth: Arc<dyn rustsmb_auth::AuthProvider> =
-                Arc::new(AnonymousAuthProvider::allow_both().with_guest_fallback());
+                Arc::new(SpnegoProvider::ntlm(Arc::new(ntlm_provider)));
 
             let server = SmbServer::new(config, state_store.clone(), auth);
 

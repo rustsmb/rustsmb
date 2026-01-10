@@ -199,7 +199,9 @@ impl CreditManager {
         }
 
         // Cap at remaining headroom, but ensure at least 1 if possible
-        grant.min(headroom).max(MIN_CREDITS_PER_RESPONSE.min(headroom))
+        grant
+            .min(headroom)
+            .max(MIN_CREDITS_PER_RESPONSE.min(headroom))
     }
 
     /// Calculate the credit charge for a multi-credit operation.
@@ -670,9 +672,6 @@ mod tests {
 
         // Check stats updated
         assert_eq!(manager.total_consumed(), 10);
-        assert_eq!(
-            manager.total_granted(),
-            DEFAULT_INITIAL_CREDITS as u64 + 50
-        );
+        assert_eq!(manager.total_granted(), DEFAULT_INITIAL_CREDITS as u64 + 50);
     }
 }
