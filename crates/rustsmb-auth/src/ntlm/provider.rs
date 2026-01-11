@@ -1,6 +1,8 @@
 //! NTLM authentication provider.
 
-use super::crypto::{decrypt_session_key, generate_challenge, nt_hash, ntowf_v2, verify_ntlmv2_response};
+use super::crypto::{
+    decrypt_session_key, generate_challenge, nt_hash, ntowf_v2, verify_ntlmv2_response,
+};
 use super::messages::{AuthenticateMessage, ChallengeMessage, NegotiateMessage};
 use super::{build_target_info, current_filetime, NtlmFlags};
 use crate::{AuthContext, AuthMechanism, AuthProvider, AuthResult, AuthState, BoxFuture, UserInfo};
@@ -110,12 +112,9 @@ impl NtlmAuthProvider {
             timestamp,
         );
 
-        // Negotiate flags
+        // Negotiate flags: intersect server capabilities with client offer.
         let mut flags = NtlmFlags::server_default();
-        // Honor client's unicode/oem preference
-        if msg.flags.has(NtlmFlags::NEGOTIATE_UNICODE) {
-            flags.set(NtlmFlags::NEGOTIATE_UNICODE);
-        }
+        flags.0 &= msg.flags.0;
 
         // Build challenge message
         let challenge = ChallengeMessage::new(
@@ -494,6 +493,35 @@ mod tests {
             }
             _ => panic!("Expected success"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_challenge_flags_mask_client_offered_flags() {
+        let provider = NtlmAuthProvider::new("SERVER", "DOMAIN");
+
+        // Client only offers a small subset of flags.
+        let mut negotiate = NegotiateMessage::default();
+        negotiate.flags = NtlmFlags(
+            NtlmFlags::NEGOTIATE_UNICODE | NtlmFlags::NEGOTIATE_NTLM | NtlmFlags::REQUEST_TARGET,
+        );
+
+        let mut context = AuthContext::default();
+        let result = provider
+            .authenticate(&mut context, &negotiate.build())
+            .await
+            .unwrap();
+
+        let challenge_bytes = match result {
+            AuthResult::Continue { response_token } => response_token,
+            _ => panic!("Expected challenge response"),
+        };
+
+        let challenge = ChallengeMessage::parse(&challenge_bytes).unwrap();
+
+        // Flags not offered by the client should be cleared (e.g., KEY_EXCH, VERSION).
+        assert!(challenge.flags.has(NtlmFlags::NEGOTIATE_UNICODE));
+        assert!(!challenge.flags.has(NtlmFlags::NEGOTIATE_KEY_EXCH));
+        assert!(!challenge.flags.has(NtlmFlags::NEGOTIATE_VERSION));
     }
 
     /// Helper to build authenticate message for tests.

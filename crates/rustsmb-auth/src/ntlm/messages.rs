@@ -283,7 +283,8 @@ pub struct AuthenticateMessage {
 impl AuthenticateMessage {
     /// Parse from bytes.
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 88 {
+        // Minimum header without Version or MIC is 64 bytes.
+        if data.len() < 64 {
             return None;
         }
 
@@ -527,6 +528,32 @@ mod tests {
         assert_eq!(parsed.major, ver.major);
         assert_eq!(parsed.minor, ver.minor);
         assert_eq!(parsed.build, ver.build);
+    }
+
+    #[test]
+    fn test_authenticate_parse_minimal_no_version_or_mic() {
+        let mut buf = vec![0u8; 64];
+        buf[..8].copy_from_slice(NTLM_SIGNATURE);
+        buf[8..12].copy_from_slice(&(NtlmMessageType::Authenticate as u32).to_le_bytes());
+
+        let parsed = AuthenticateMessage::parse(&buf);
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn test_authenticate_parse_with_version_without_mic() {
+        let mut buf = vec![0u8; 72];
+        buf[..8].copy_from_slice(NTLM_SIGNATURE);
+        buf[8..12].copy_from_slice(&(NtlmMessageType::Authenticate as u32).to_le_bytes());
+
+        // Include NEGOTIATE_VERSION flag so version bytes are parsed.
+        let flags = NtlmFlags::NEGOTIATE_VERSION;
+        buf[60..64].copy_from_slice(&flags.to_le_bytes());
+        buf[64..72].copy_from_slice(&[10, 0, 0, 0, 0, 0, 0, 15]);
+
+        let parsed = AuthenticateMessage::parse(&buf).unwrap();
+        assert!(parsed.version.is_some());
+        assert!(parsed.mic.is_none());
     }
 
     #[test]
