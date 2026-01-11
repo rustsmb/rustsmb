@@ -637,4 +637,138 @@ mod tests {
         assert!(id2 > id1);
         assert!(id3 > id2);
     }
+
+    // ==========================================================================
+    // Session Persistence Tests (MS-SMB2 Section 3.2.4.2.4 - Session Binding)
+    // ==========================================================================
+    // Per MS-SMB2, sessions must persist in external state store for HA session
+    // binding. When a client reconnects to a different server, it uses the
+    // SESSION_BINDING flag to bind to an existing session via PreviousSessionId.
+    //
+    // Key requirements:
+    // - Session stored → retrievable with all data intact
+    // - Unknown session → returns None (triggers STATUS_USER_SESSION_DELETED)
+    // - Session expiry tracked via expires_at field
+
+    #[tokio::test]
+    async fn test_session_persists_with_full_data() {
+        // MS-SMB2: Session state must persist for HA binding from other servers
+        use rustsmb_core::SmbDialect;
+
+        let store = MemoryStateStore::new();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expires = now + 3600; // 1 hour from now
+
+        let session = SessionState {
+            session_id: 42,
+            user_id: "testuser".to_string(),
+            domain: Some("TESTDOMAIN".to_string()),
+            is_guest: false,
+            session_key: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            signing_required: true,
+            encryption_required: false,
+            dialect: SmbDialect::Smb311,
+            expires_at: expires,
+            bound_server_id: Some("server-1".to_string()),
+            ..Default::default()
+        };
+
+        store.create_session(&session).await.unwrap();
+
+        // Retrieve and verify all fields preserved
+        let retrieved = store.get_session(42).await.unwrap().unwrap();
+
+        assert_eq!(retrieved.session_id, 42);
+        assert_eq!(retrieved.user_id, "testuser");
+        assert_eq!(retrieved.domain, Some("TESTDOMAIN".to_string()));
+        assert!(!retrieved.is_guest);
+        assert_eq!(retrieved.session_key.len(), 16);
+        assert!(retrieved.signing_required);
+        assert!(!retrieved.encryption_required);
+        assert_eq!(retrieved.dialect, SmbDialect::Smb311);
+        assert!(retrieved.expires_at > now);
+        assert_eq!(retrieved.bound_server_id, Some("server-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_session_lookup_returns_none_for_unknown_id() {
+        // MS-SMB2: Unknown PreviousSessionId → STATUS_USER_SESSION_DELETED (0xC0000203)
+        // StateStore returns None to trigger this NT_STATUS in the handler
+        let store = MemoryStateStore::new();
+
+        // Create one session
+        let session = SessionState {
+            session_id: 1,
+            user_id: "user1".to_string(),
+            ..Default::default()
+        };
+        store.create_session(&session).await.unwrap();
+
+        // Lookup unknown session IDs
+        let result1 = store.get_session(0xDEADBEEF).await.unwrap();
+        assert!(result1.is_none(), "Unknown session ID should return None");
+
+        let result2 = store.get_session(999999).await.unwrap();
+        assert!(
+            result2.is_none(),
+            "Non-existent session ID should return None"
+        );
+
+        // Verify original session still accessible
+        let result3 = store.get_session(1).await.unwrap();
+        assert!(
+            result3.is_some(),
+            "Existing session should still be accessible"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_expiry_field_can_be_checked() {
+        // MS-SMB2: Sessions have TTL; expired sessions should not be bindable
+        // The expires_at field allows the handler to validate session freshness
+        let store = MemoryStateStore::new();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let past = now - 3600; // 1 hour ago (Unix epoch seconds)
+        let future = now + 3600; // 1 hour from now
+
+        // Create expired session
+        let expired_session = SessionState {
+            session_id: 1,
+            user_id: "expired_user".to_string(),
+            expires_at: past,
+            ..Default::default()
+        };
+        store.create_session(&expired_session).await.unwrap();
+
+        // Create valid session
+        let valid_session = SessionState {
+            session_id: 2,
+            user_id: "valid_user".to_string(),
+            expires_at: future,
+            ..Default::default()
+        };
+        store.create_session(&valid_session).await.unwrap();
+
+        // Both sessions are retrievable (expiry check is handler's responsibility)
+        let expired = store.get_session(1).await.unwrap().unwrap();
+        let valid = store.get_session(2).await.unwrap().unwrap();
+
+        // Handler can check expiry to determine if binding should be allowed
+        assert!(
+            expired.expires_at < now,
+            "Expired session should have past expires_at"
+        );
+        assert!(
+            valid.expires_at > now,
+            "Valid session should have future expires_at"
+        );
+    }
 }

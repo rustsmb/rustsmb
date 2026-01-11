@@ -1438,4 +1438,116 @@ mod tests {
         assert_eq!(data, b"nested");
         backend.close(handle).await.unwrap();
     }
+
+    // ==========================================================================
+    // Directory Creation via open() Tests (MS-SMB2 Section 2.2.13)
+    // ==========================================================================
+    // Per SMB2 spec, FILE_DIRECTORY_FILE (0x00000001) in CreateOptions indicates
+    // directory open. Valid CreateDisposition values for directories:
+    // - FILE_CREATE (0x02): Create new; fail if exists (STATUS_OBJECT_NAME_COLLISION)
+    // - FILE_OPEN_IF (0x03): Open if exists; create if not
+    // - FILE_OPEN (0x01): Open if exists; fail if not (STATUS_OBJECT_NAME_NOT_FOUND)
+
+    /// Helper to create a CreateParams for directory operations.
+    fn create_params_directory(disposition: u32) -> CreateParams {
+        use rustsmb_vfs::create_options::FILE_DIRECTORY_FILE;
+        CreateParams {
+            desired_access: access_mask::GENERIC_READ | access_mask::GENERIC_WRITE,
+            share_access: 0,
+            create_disposition: disposition,
+            create_options: FILE_DIRECTORY_FILE,
+            file_attributes: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_directory_create_new() {
+        // MS-SMB2: FILE_CREATE + FILE_DIRECTORY_FILE creates a new directory
+        let backend = MemoryBackend::new();
+        let params = create_params_directory(disposition::CREATE);
+
+        // Create new directory
+        let handle = backend.open("newdir", &params).await.unwrap();
+        backend.close(handle).await.unwrap();
+
+        // Verify it's a directory
+        let meta = backend.stat("newdir").await.unwrap();
+        assert_eq!(meta.file_type, FileType::Directory);
+    }
+
+    #[tokio::test]
+    async fn test_open_directory_create_fails_if_exists() {
+        // MS-SMB2: FILE_CREATE on existing directory returns STATUS_OBJECT_NAME_COLLISION
+        let backend = MemoryBackend::new();
+
+        // Pre-create the directory
+        backend.mkdir("existingdir", 0o755).await.unwrap();
+
+        // Try to create again with FILE_CREATE - should fail
+        let params = create_params_directory(disposition::CREATE);
+        let result = backend.open("existingdir", &params).await;
+        assert!(
+            matches!(result, Err(VfsError::AlreadyExists(_))),
+            "Expected AlreadyExists error, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_directory_open_if_creates_when_missing() {
+        // MS-SMB2: FILE_OPEN_IF on missing directory creates it
+        let backend = MemoryBackend::new();
+        let params = create_params_directory(disposition::OPEN_IF);
+
+        // Directory doesn't exist - should create it
+        let handle = backend.open("autodir", &params).await.unwrap();
+        backend.close(handle).await.unwrap();
+
+        // Verify it was created as directory
+        let meta = backend.stat("autodir").await.unwrap();
+        assert_eq!(meta.file_type, FileType::Directory);
+    }
+
+    #[tokio::test]
+    async fn test_open_directory_open_if_opens_existing() {
+        // MS-SMB2: FILE_OPEN_IF on existing directory opens it
+        let backend = MemoryBackend::new();
+
+        // Pre-create the directory with a file in it
+        backend.mkdir("predir", 0o755).await.unwrap();
+        let file_params = create_params_rw_create();
+        let fh = backend.open("predir/file.txt", &file_params).await.unwrap();
+        backend.close(fh).await.unwrap();
+
+        // Open the existing directory with OPEN_IF
+        let params = create_params_directory(disposition::OPEN_IF);
+        let handle = backend.open("predir", &params).await.unwrap();
+        backend.close(handle).await.unwrap();
+
+        // Verify directory still exists with its contents
+        let meta = backend.stat("predir").await.unwrap();
+        assert_eq!(meta.file_type, FileType::Directory);
+        let entries = backend.readdir("predir").await.unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_open_directory_fails_if_file_at_path() {
+        // MS-SMB2: FILE_DIRECTORY_FILE on path with regular file returns STATUS_NOT_A_DIRECTORY
+        let backend = MemoryBackend::new();
+
+        // Create a regular file
+        let file_params = create_params_rw_create();
+        let handle = backend.open("regularfile", &file_params).await.unwrap();
+        backend.close(handle).await.unwrap();
+
+        // Try to open as directory - should fail
+        let dir_params = create_params_directory(disposition::OPEN_IF);
+        let result = backend.open("regularfile", &dir_params).await;
+        assert!(
+            matches!(result, Err(VfsError::NotADirectory(_))),
+            "Expected NotADirectory error, got: {:?}",
+            result
+        );
+    }
 }

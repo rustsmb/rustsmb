@@ -582,6 +582,123 @@ mod tests {
         assert!(!challenge.flags.has(NtlmFlags::NEGOTIATE_56));
     }
 
+    // ==========================================================================
+    // Empty Token Anonymous Auth Tests (MS-SMB2 Section 3.3.5.5.1)
+    // ==========================================================================
+    // Per MS-SMB2 Section 3.3.5.5.1, an empty security buffer (length=0)
+    // indicates anonymous access request. This is distinct from NTLM anonymous
+    // which involves sending an authenticate message with empty credentials.
+
+    #[tokio::test]
+    async fn test_empty_token_returns_anonymous_when_allowed() {
+        // MS-SMB2: Empty security buffer with allow_anonymous=true → anonymous session
+        // Per spec: IS_NULL session flag (0x0002), no signing required
+        let provider = NtlmAuthProvider::new("SERVER", "DOMAIN").with_anonymous();
+
+        let mut context = AuthContext::default();
+
+        // Send empty token (0 bytes) - this is the SMB-level anonymous request
+        let result = provider.authenticate(&mut context, &[]).await.unwrap();
+
+        match result {
+            AuthResult::Success {
+                user, session_key, ..
+            } => {
+                // Per MS-SMB2 Section 3.3.5.5.1: Anonymous session has IS_NULL flag (0x0002)
+                // is_anonymous=true is distinct from is_guest (which would be IS_GUEST flag 0x0001)
+                assert!(
+                    user.is_anonymous,
+                    "Anonymous user should have is_anonymous=true"
+                );
+                assert!(
+                    !user.is_guest,
+                    "Anonymous user should not be guest (different flags)"
+                );
+                // Per MS-SMB2: "ANONYMOUS LOGON" is the standard Windows anonymous username
+                assert_eq!(user.username, "ANONYMOUS LOGON");
+                // Per MS-SMB2: Anonymous sessions cannot sign, so session key should be empty
+                assert!(
+                    session_key.is_empty(),
+                    "Anonymous session should have empty session key"
+                );
+            }
+            _ => panic!("Expected Success for empty token anonymous auth"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_token_rejected_when_anonymous_disabled() {
+        // MS-SMB2: Empty security buffer with allow_anonymous=false → STATUS_ACCESS_DENIED
+        let provider = NtlmAuthProvider::new("SERVER", "DOMAIN");
+
+        let mut context = AuthContext::default();
+
+        // Send empty token without anonymous enabled
+        let result = provider.authenticate(&mut context, &[]).await;
+
+        assert!(
+            result.is_err(),
+            "Empty token should be rejected when anonymous is disabled"
+        );
+        match result {
+            Err(AuthError::Failed(msg)) => {
+                assert!(
+                    msg.contains("Anonymous") || msg.contains("anonymous"),
+                    "Error message should mention anonymous: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected AuthError::Failed, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_anonymous_user_info_has_correct_properties() {
+        // Per MS-SMB2 Section 3.3.5.5.1: Anonymous sessions have specific properties
+        // IS_NULL flag (0x0002) should be set, IS_GUEST flag (0x0001) should not be set
+        let provider = NtlmAuthProvider::new("SERVER", "DOMAIN").with_anonymous();
+
+        let mut context = AuthContext::default();
+        let result = provider.authenticate(&mut context, &[]).await.unwrap();
+
+        if let AuthResult::Success {
+            user,
+            session_key,
+            response_token,
+        } = result
+        {
+            // Per MS-SMB2: "ANONYMOUS LOGON" is the Windows anonymous username
+            assert_eq!(user.username, "ANONYMOUS LOGON");
+
+            // Per MS-SMB2: Anonymous sessions have IS_NULL flag, not IS_GUEST
+            assert!(user.is_anonymous, "Anonymous should have is_anonymous=true");
+            assert!(
+                !user.is_guest,
+                "Anonymous is distinct from guest per SMB spec"
+            );
+
+            // Per MS-SMB2: Anonymous sessions cannot perform signing/encryption
+            assert!(
+                session_key.is_empty(),
+                "Anonymous cannot sign; session key should be empty"
+            );
+
+            // No further auth token should be returned
+            assert!(
+                response_token.is_none(),
+                "No response token for anonymous auth"
+            );
+
+            // Domain should be None for anonymous
+            assert!(
+                user.domain.is_none(),
+                "Anonymous user should have no domain"
+            );
+        } else {
+            panic!("Expected Success result");
+        }
+    }
+
     /// Helper to build authenticate message for tests.
     fn build_authenticate_message(
         username: &str,
