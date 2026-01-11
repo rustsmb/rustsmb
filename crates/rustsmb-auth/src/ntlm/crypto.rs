@@ -245,8 +245,8 @@ pub fn generate_challenge() -> [u8; 8] {
 pub fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
     // Key-scheduling algorithm (KSA)
     let mut s: [u8; 256] = [0; 256];
-    for i in 0..256 {
-        s[i] = i as u8;
+    for (i, byte) in s.iter_mut().enumerate() {
+        *byte = i as u8;
     }
 
     let mut j: usize = 0;

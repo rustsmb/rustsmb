@@ -371,6 +371,8 @@ where
 
         let selected_dialect = dialect.unwrap();
         self.connection.negotiate(selected_dialect);
+        // Store client GUID for ValidateNegotiate verification
+        self.connection.client_guid = request.client_guid;
         debug!(
             conn_id = self.connection.id,
             dialect = ?selected_dialect,
@@ -927,8 +929,8 @@ where
         body: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
         use rustsmb_protocol::create::{
-            parse_create_contexts, CreateContext, CreateContextBuilder, CreateRequest,
-            CreateResponse, CreateResponseFlags, OplockLevel,
+            parse_create_contexts, CreateContext, CreateContextBuilder, CreateDisposition,
+            CreateRequest, CreateResponse, CreateResponseFlags, OplockLevel,
         };
 
         debug!(conn_id = self.connection.id, "CREATE request");
@@ -1007,10 +1009,51 @@ where
             .get_share(&tree.share_name)
             .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
 
-        // Open/create file
-        let open_flags = rustsmb_vfs::OpenFlags::new(
-            rustsmb_vfs::OpenFlags::READ | rustsmb_vfs::OpenFlags::WRITE,
-        );
+        // Convert SMB CreateDisposition to VFS OpenFlags
+        let disposition = CreateDisposition::from_u32(request.create_disposition)
+            .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
+
+        let open_flags_value = match disposition {
+            CreateDisposition::Create => {
+                // Create new file, fail if exists
+                rustsmb_vfs::OpenFlags::READ
+                    | rustsmb_vfs::OpenFlags::WRITE
+                    | rustsmb_vfs::OpenFlags::CREATE
+                    | rustsmb_vfs::OpenFlags::EXCL
+            }
+            CreateDisposition::Open => {
+                // Open existing file, fail if not exists
+                rustsmb_vfs::OpenFlags::READ | rustsmb_vfs::OpenFlags::WRITE
+            }
+            CreateDisposition::OpenIf => {
+                // Open if exists, create if not
+                rustsmb_vfs::OpenFlags::READ
+                    | rustsmb_vfs::OpenFlags::WRITE
+                    | rustsmb_vfs::OpenFlags::CREATE
+            }
+            CreateDisposition::Overwrite => {
+                // Open and truncate, fail if not exists
+                rustsmb_vfs::OpenFlags::READ
+                    | rustsmb_vfs::OpenFlags::WRITE
+                    | rustsmb_vfs::OpenFlags::TRUNC
+            }
+            CreateDisposition::OverwriteIf => {
+                // Open and truncate if exists, create if not
+                rustsmb_vfs::OpenFlags::READ
+                    | rustsmb_vfs::OpenFlags::WRITE
+                    | rustsmb_vfs::OpenFlags::CREATE
+                    | rustsmb_vfs::OpenFlags::TRUNC
+            }
+            CreateDisposition::Supersede => {
+                // Similar to overwrite but also creates
+                rustsmb_vfs::OpenFlags::READ
+                    | rustsmb_vfs::OpenFlags::WRITE
+                    | rustsmb_vfs::OpenFlags::CREATE
+                    | rustsmb_vfs::OpenFlags::TRUNC
+            }
+        };
+        let open_flags = rustsmb_vfs::OpenFlags::new(open_flags_value);
+
         let _file_handle = backend
             .open(&filename, open_flags, 0o644)
             .await
@@ -1727,12 +1770,170 @@ where
     async fn handle_ioctl(
         &mut self,
         header: &Smb2Header,
-        _body: &[u8],
+        body: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
+        use rustsmb_protocol::ioctl::{FsctlCode, IoctlRequest};
+
         debug!(conn_id = self.connection.id, "IOCTL request");
-        // Most IOCTLs are not supported
-        let _ = header;
-        Err(HandlerError::Status(NtStatus::NotSupported))
+
+        let request = IoctlRequest::read(&mut Cursor::new(body))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to parse IOCTL: {}", e)))?;
+
+        let ctl_code = FsctlCode::from_u32(request.ctl_code);
+        debug!(conn_id = self.connection.id, ctl_code = ?ctl_code, "IOCTL control code");
+
+        match ctl_code {
+            Some(FsctlCode::ValidateNegotiateInfo) => {
+                self.handle_validate_negotiate_info(header, &request, body)
+                    .await
+            }
+            _ => {
+                debug!(
+                    conn_id = self.connection.id,
+                    ctl_code = request.ctl_code,
+                    "Unsupported IOCTL"
+                );
+                Err(HandlerError::Status(NtStatus::NotSupported))
+            }
+        }
+    }
+
+    /// Handle FSCTL_VALIDATE_NEGOTIATE_INFO.
+    ///
+    /// This verifies the negotiated parameters match what the client sent.
+    /// Required by SMB clients to verify the negotiation was not tampered with.
+    async fn handle_validate_negotiate_info(
+        &mut self,
+        header: &Smb2Header,
+        request: &rustsmb_protocol::ioctl::IoctlRequest,
+        body: &[u8],
+    ) -> Result<Vec<u8>, HandlerError> {
+        use rustsmb_protocol::ioctl::{IoctlResponse, IOCTL_RESPONSE_SIZE};
+        use rustsmb_protocol::negotiate::{Capabilities, SecurityMode};
+
+        // Input buffer offset is relative to the SMB2 header, body is after the header
+        // The IOCTL request structure is 56 bytes (57 - 1 for structure_size accounting)
+        let input_offset = request.input_offset as usize;
+        let input_count = request.input_count as usize;
+
+        // Calculate the actual offset in body (input_offset is from start of SMB2 header)
+        let body_offset = input_offset.saturating_sub(SMB2_HEADER_SIZE);
+
+        if body_offset + input_count > body.len() || input_count < 24 {
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        let input = &body[body_offset..body_offset + input_count];
+
+        // Parse ValidateNegotiateInfo request:
+        // Capabilities (4 bytes) + Guid (16 bytes) + SecurityMode (2 bytes) + DialectCount (2 bytes) + Dialects
+        let _client_caps = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+        let client_guid: [u8; 16] = input[4..20].try_into().unwrap();
+        let _client_security_mode = u16::from_le_bytes([input[20], input[21]]);
+        let dialect_count = u16::from_le_bytes([input[22], input[23]]) as usize;
+
+        // Verify client GUID matches what was sent in NEGOTIATE
+        if client_guid != self.connection.client_guid {
+            warn!(
+                conn_id = self.connection.id,
+                "ValidateNegotiate: client GUID mismatch"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
+
+        // Get our negotiated dialect
+        let negotiated_dialect = self
+            .connection
+            .dialect
+            .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
+
+        // Verify the client offered our negotiated dialect
+        let dialects_start = 24;
+        let mut dialect_found = false;
+        for i in 0..dialect_count {
+            let offset = dialects_start + i * 2;
+            if offset + 2 <= input.len() {
+                let dialect = u16::from_le_bytes([input[offset], input[offset + 1]]);
+                if dialect == negotiated_dialect.revision() {
+                    dialect_found = true;
+                    break;
+                }
+            }
+        }
+
+        if !dialect_found {
+            warn!(
+                conn_id = self.connection.id,
+                "ValidateNegotiate: negotiated dialect not in client list"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
+
+        // Build ValidateNegotiateInfo response:
+        // Capabilities (4 bytes) + Guid (16 bytes) + SecurityMode (2 bytes) + Dialect (2 bytes)
+        let mut output_buffer = Vec::with_capacity(24);
+
+        // Server capabilities (LARGE_MTU + ENCRYPTION for SMB 3.x)
+        let mut server_caps = Capabilities::LARGE_MTU;
+        if negotiated_dialect >= SmbDialect::Smb300 {
+            server_caps |= Capabilities::ENCRYPTION;
+        }
+        output_buffer.extend_from_slice(&server_caps.to_le_bytes());
+
+        // Server GUID
+        output_buffer.extend_from_slice(&self.config.server_guid);
+
+        // Security mode (signing enabled)
+        let security_mode = SecurityMode::new(SecurityMode::SIGNING_ENABLED);
+        output_buffer.extend_from_slice(&security_mode.0.to_le_bytes());
+
+        // Negotiated dialect
+        output_buffer.extend_from_slice(&negotiated_dialect.revision().to_le_bytes());
+
+        // Build IOCTL response
+        let output_offset = (SMB2_HEADER_SIZE + IOCTL_RESPONSE_SIZE as usize - 1) as u32;
+
+        let resp_header = self.build_response_header(header, NtStatus::Success);
+        let response = IoctlResponse {
+            structure_size: IOCTL_RESPONSE_SIZE,
+            reserved: 0,
+            ctl_code: request.ctl_code,
+            file_id_persistent: request.file_id_persistent,
+            file_id_volatile: request.file_id_volatile,
+            input_offset: 0,
+            input_count: 0,
+            output_offset,
+            output_count: output_buffer.len() as u32,
+            flags: 0,
+            reserved2: 0,
+        };
+
+        // Serialize response header + IOCTL response + output buffer
+        let mut result = Vec::with_capacity(SMB2_HEADER_SIZE + 48 + output_buffer.len());
+
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        resp_header
+            .write(&mut Cursor::new(&mut header_buf))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to write header: {}", e)))?;
+        result.extend_from_slice(&header_buf);
+
+        let mut body_buf = Vec::with_capacity(48);
+        response
+            .write(&mut Cursor::new(&mut body_buf))
+            .map_err(|e| {
+                HandlerError::Protocol(format!("Failed to write IOCTL response: {}", e))
+            })?;
+        result.extend_from_slice(&body_buf);
+
+        result.extend_from_slice(&output_buffer);
+
+        debug!(
+            conn_id = self.connection.id,
+            output_len = output_buffer.len(),
+            "ValidateNegotiate: success"
+        );
+
+        Ok(result)
     }
 
     async fn handle_cancel(
