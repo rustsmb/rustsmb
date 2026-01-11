@@ -256,16 +256,37 @@ impl StorageBackend for MemoryBackend {
             let path = Self::normalize_path(path);
             let flags = params.to_open_flags();
 
-            // Check if opening directory
+            // Check if opening/creating directory
             if flags.is_directory() {
-                let node = self.get_node(&path).await?;
-                if !matches!(node, MemoryNode::Directory { .. }) {
-                    return Err(VfsError::NotADirectory(path));
+                // Try to get existing directory
+                let existing = self.get_node(&path).await;
+
+                match existing {
+                    Ok(node) => {
+                        // Directory exists
+                        if !matches!(node, MemoryNode::Directory { .. }) {
+                            return Err(VfsError::NotADirectory(path));
+                        }
+                        // If CREATE|EXCL (FILE_CREATE), fail since it exists
+                        if flags.is_create() && flags.is_excl() {
+                            return Err(VfsError::AlreadyExists(path));
+                        }
+                        // Open existing directory
+                        let handle = FileHandle::new();
+                        let mut handles = self.handles.write().await;
+                        handles.insert(handle.id, HandleInfo { path, flags });
+                        return Ok(handle);
+                    }
+                    Err(VfsError::NotFound(_)) if flags.is_create() => {
+                        // Directory doesn't exist, create it
+                        self.mkdir(&path, 0o755).await?;
+                        let handle = FileHandle::new();
+                        let mut handles = self.handles.write().await;
+                        handles.insert(handle.id, HandleInfo { path, flags });
+                        return Ok(handle);
+                    }
+                    Err(e) => return Err(e),
                 }
-                let handle = FileHandle::new();
-                let mut handles = self.handles.write().await;
-                handles.insert(handle.id, HandleInfo { path, flags });
-                return Ok(handle);
             }
 
             let mut root = self.root.write().await;

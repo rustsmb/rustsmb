@@ -313,11 +313,32 @@ impl StorageBackend for LocalBackend {
             let validated = self.validate_path(&resolved).await?;
             let flags = params.to_open_flags();
 
-            // Check if opening directory
+            // Check if opening/creating directory
             if flags.is_directory() {
-                let meta = fs::metadata(&validated).await.map_err(VfsError::from)?;
-                if !meta.is_dir() {
-                    return Err(VfsError::NotADirectory(path.to_string()));
+                // Try to get metadata for existing path
+                let meta_result = fs::metadata(&validated).await;
+
+                match meta_result {
+                    Ok(meta) => {
+                        // Path exists
+                        if !meta.is_dir() {
+                            return Err(VfsError::NotADirectory(path.to_string()));
+                        }
+                        // If CREATE|EXCL (FILE_CREATE), fail since it exists
+                        if flags.is_create() && flags.is_excl() {
+                            return Err(VfsError::AlreadyExists(path.to_string()));
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Path doesn't exist
+                        if flags.is_create() {
+                            // Create the directory
+                            fs::create_dir(&validated).await.map_err(VfsError::from)?;
+                        } else {
+                            return Err(VfsError::NotFound(path.to_string()));
+                        }
+                    }
+                    Err(e) => return Err(VfsError::from(e)),
                 }
 
                 // For directories, we still create a handle but don't open a file
