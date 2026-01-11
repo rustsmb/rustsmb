@@ -2356,49 +2356,6 @@ impl HandlerError {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::DuplexStream;
-
-    #[test]
-    fn compute_signature_matches_smbprotocol_vector() {
-        // Captured from smbprotocol client during NTLM auth with KEY_EXCH.
-        let signing_key: [u8; 16] = [
-            0xb6, 0xb0, 0x55, 0x58, 0x0d, 0xed, 0xda, 0x89, 0xc6, 0x7b, 0x28, 0xd8, 0xd9, 0x86,
-            0x76, 0xbd,
-        ];
-
-        let message = hex_bytes(
-            "fe534d42400001000000000001001d02090000000000000002000000000000000000000000000000\
-             0200000000000000000000000000000000000000000000000900000048000900a1073005a0030a0100",
-        );
-
-        let signature = ConnectionHandler::<DuplexStream>::compute_signature(
-            &signing_key,
-            SmbDialect::Smb302,
-            &message,
-        )
-        .expect("signature computation should succeed");
-
-        assert_eq!(
-            signature,
-            [
-                0x39, 0xa6, 0x58, 0x63, 0x78, 0xdd, 0x5f, 0xcf, 0xab, 0x86, 0xe1, 0xde, 0x11, 0x67,
-                0x3e, 0xa7
-            ]
-        );
-    }
-
-    fn hex_bytes(s: &str) -> Vec<u8> {
-        assert!(s.len() % 2 == 0, "hex string must have even length");
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
-            .collect()
-    }
-}
-
 impl From<std::io::Error> for HandlerError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
@@ -2560,4 +2517,47 @@ fn build_file_info(metadata: &rustsmb_vfs::Metadata, info_class: u8) -> Vec<u8> 
     }
 
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::DuplexStream;
+
+    #[test]
+    fn compute_signature_matches_smbprotocol_vector() {
+        // Captured from smbprotocol client during NTLM auth with KEY_EXCH.
+        let signing_key: [u8; 16] = [
+            0xb6, 0xb0, 0x55, 0x58, 0x0d, 0xed, 0xda, 0x89, 0xc6, 0x7b, 0x28, 0xd8, 0xd9, 0x86,
+            0x76, 0xbd,
+        ];
+
+        let message = hex_bytes(
+            "fe534d42400001000000000001001d02090000000000000002000000000000000000000000000000\
+             0200000000000000000000000000000000000000000000000900000048000900a1073005a0030a0100",
+        );
+
+        let signature = ConnectionHandler::<DuplexStream>::compute_signature(
+            &signing_key,
+            SmbDialect::Smb302,
+            &message,
+        )
+        .expect("signature computation should succeed");
+
+        assert_eq!(
+            signature,
+            [
+                0x39, 0xa6, 0x58, 0x63, 0x78, 0xdd, 0x5f, 0xcf, 0xab, 0x86, 0xe1, 0xde, 0x11, 0x67,
+                0x3e, 0xa7
+            ]
+        );
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        assert!(s.len() % 2 == 0, "hex string must have even length");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
 }

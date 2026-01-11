@@ -529,10 +529,14 @@ mod tests {
         let provider = NtlmAuthProvider::new("SERVER", "DOMAIN");
 
         // Client only offers a small subset of flags.
-        let mut negotiate = NegotiateMessage::default();
-        negotiate.flags = NtlmFlags(
-            NtlmFlags::NEGOTIATE_UNICODE | NtlmFlags::NEGOTIATE_NTLM | NtlmFlags::REQUEST_TARGET,
-        );
+        let negotiate = NegotiateMessage {
+            flags: NtlmFlags(
+                NtlmFlags::NEGOTIATE_UNICODE
+                    | NtlmFlags::NEGOTIATE_NTLM
+                    | NtlmFlags::REQUEST_TARGET,
+            ),
+            ..Default::default()
+        };
 
         let mut context = AuthContext::default();
         let result = provider

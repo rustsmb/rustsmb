@@ -25,7 +25,7 @@ test-verbose:
 
 # Run clippy lints
 clippy:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # Format code
 fmt:
