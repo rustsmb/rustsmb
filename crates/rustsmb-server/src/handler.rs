@@ -12,7 +12,7 @@ use rustsmb_protocol::crypto::signing::{MessageSigner, SigningAlgorithm};
 use rustsmb_protocol::{Smb2Command, Smb2Flags, Smb2Header, SMB2_HEADER_SIZE, SMB2_MAGIC};
 use rustsmb_session::{Connection, SessionManager};
 use rustsmb_state::{HandleState, LeaseEntry, SessionState, TreeState};
-use rustsmb_vfs::FileType;
+use rustsmb_vfs::{CreateParams, FileType};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -929,8 +929,8 @@ where
         body: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
         use rustsmb_protocol::create::{
-            parse_create_contexts, CreateContext, CreateContextBuilder, CreateDisposition,
-            CreateRequest, CreateResponse, CreateResponseFlags, OplockLevel,
+            parse_create_contexts, CreateContext, CreateContextBuilder, CreateRequest,
+            CreateResponse, CreateResponseFlags, OplockLevel,
         };
 
         debug!(conn_id = self.connection.id, "CREATE request");
@@ -1105,53 +1105,17 @@ where
             }
         }
 
-        // Convert SMB CreateDisposition to VFS OpenFlags
-        let disposition = CreateDisposition::from_u32(request.create_disposition)
-            .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
-
-        let open_flags_value = match disposition {
-            CreateDisposition::Create => {
-                // Create new file, fail if exists
-                rustsmb_vfs::OpenFlags::READ
-                    | rustsmb_vfs::OpenFlags::WRITE
-                    | rustsmb_vfs::OpenFlags::CREATE
-                    | rustsmb_vfs::OpenFlags::EXCL
-            }
-            CreateDisposition::Open => {
-                // Open existing file, fail if not exists
-                rustsmb_vfs::OpenFlags::READ | rustsmb_vfs::OpenFlags::WRITE
-            }
-            CreateDisposition::OpenIf => {
-                // Open if exists, create if not
-                rustsmb_vfs::OpenFlags::READ
-                    | rustsmb_vfs::OpenFlags::WRITE
-                    | rustsmb_vfs::OpenFlags::CREATE
-            }
-            CreateDisposition::Overwrite => {
-                // Open and truncate, fail if not exists
-                rustsmb_vfs::OpenFlags::READ
-                    | rustsmb_vfs::OpenFlags::WRITE
-                    | rustsmb_vfs::OpenFlags::TRUNC
-            }
-            CreateDisposition::OverwriteIf => {
-                // Open and truncate if exists, create if not
-                rustsmb_vfs::OpenFlags::READ
-                    | rustsmb_vfs::OpenFlags::WRITE
-                    | rustsmb_vfs::OpenFlags::CREATE
-                    | rustsmb_vfs::OpenFlags::TRUNC
-            }
-            CreateDisposition::Supersede => {
-                // Similar to overwrite but also creates
-                rustsmb_vfs::OpenFlags::READ
-                    | rustsmb_vfs::OpenFlags::WRITE
-                    | rustsmb_vfs::OpenFlags::CREATE
-                    | rustsmb_vfs::OpenFlags::TRUNC
-            }
+        // Pass SMB parameters directly to the backend - it handles the conversion
+        let create_params = CreateParams {
+            desired_access: request.desired_access,
+            share_access: request.share_access,
+            create_disposition: request.create_disposition,
+            create_options: request.create_options,
+            file_attributes: request.file_attributes,
         };
-        let open_flags = rustsmb_vfs::OpenFlags::new(open_flags_value);
 
         let _file_handle = backend
-            .open(&filename, open_flags, 0o644)
+            .open(&filename, &create_params)
             .await
             .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 
@@ -1532,11 +1496,15 @@ where
             .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
 
         // Re-open the file with original access mask
-        let open_flags = rustsmb_vfs::OpenFlags::new(
-            rustsmb_vfs::OpenFlags::READ | rustsmb_vfs::OpenFlags::WRITE,
-        );
+        let reopen_params = CreateParams {
+            desired_access: handle.access_mask,
+            share_access: handle.share_access,
+            create_disposition: rustsmb_vfs::disposition::OPEN, // Open existing file
+            create_options: 0,
+            file_attributes: 0,
+        };
         let _file_handle = backend
-            .open(&handle.path, open_flags, 0o644)
+            .open(&handle.path, &reopen_params)
             .await
             .map_err(|e| {
                 warn!(
@@ -1739,9 +1707,15 @@ where
             .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
 
         // Re-open file for reading (stateless approach)
-        let open_flags = rustsmb_vfs::OpenFlags::new(rustsmb_vfs::OpenFlags::READ);
+        let read_params = CreateParams {
+            desired_access: rustsmb_vfs::access_mask::GENERIC_READ,
+            share_access: 0,
+            create_disposition: rustsmb_vfs::disposition::OPEN,
+            create_options: 0,
+            file_attributes: 0,
+        };
         let file_handle = backend
-            .open(&handle.path, open_flags, 0o644)
+            .open(&handle.path, &read_params)
             .await
             .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 
@@ -1809,9 +1783,15 @@ where
             .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
 
         // Re-open file for writing (stateless approach)
-        let open_flags = rustsmb_vfs::OpenFlags::new(rustsmb_vfs::OpenFlags::WRITE);
+        let write_params = CreateParams {
+            desired_access: rustsmb_vfs::access_mask::GENERIC_WRITE,
+            share_access: 0,
+            create_disposition: rustsmb_vfs::disposition::OPEN,
+            create_options: 0,
+            file_attributes: 0,
+        };
         let file_handle = backend
-            .open(&handle.path, open_flags, 0o644)
+            .open(&handle.path, &write_params)
             .await
             .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 

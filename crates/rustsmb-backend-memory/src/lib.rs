@@ -5,8 +5,8 @@
 
 use rustsmb_core::VfsError;
 use rustsmb_vfs::{
-    BackendCapabilities, BoxFuture, DirEntry, FileHandle, FileLock, FileType, FsStats, LockType,
-    Metadata, OpenFlags, StorageBackend,
+    BackendCapabilities, BoxFuture, CreateParams, DirEntry, FileHandle, FileLock, FileType,
+    FsStats, LockType, Metadata, OpenFlags, StorageBackend,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -250,11 +250,11 @@ impl StorageBackend for MemoryBackend {
     fn open<'a>(
         &'a self,
         path: &'a str,
-        flags: OpenFlags,
-        mode: u32,
+        params: &'a CreateParams,
     ) -> BoxFuture<'a, Result<FileHandle, VfsError>> {
         Box::pin(async move {
             let path = Self::normalize_path(path);
+            let flags = params.to_open_flags();
 
             // Check if opening directory
             if flags.is_directory() {
@@ -324,7 +324,8 @@ impl StorageBackend for MemoryBackend {
                     }
                 }
             } else if flags.is_create() {
-                // Create new file
+                // Create new file - use default mode since SMB uses file_attributes instead
+                let mode = 0o644;
                 let ino = self.next_inode();
                 children.insert(
                     filename.to_string(),
@@ -1160,14 +1161,37 @@ impl StorageBackend for MemoryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustsmb_vfs::{access_mask, disposition};
+
+    /// Helper to create a CreateParams for read+write+create
+    fn create_params_rw_create() -> CreateParams {
+        CreateParams {
+            desired_access: access_mask::GENERIC_READ | access_mask::GENERIC_WRITE,
+            share_access: 0,
+            create_disposition: disposition::OPEN_IF,
+            create_options: 0,
+            file_attributes: 0,
+        }
+    }
+
+    /// Helper to create a CreateParams for read-only
+    fn create_params_read() -> CreateParams {
+        CreateParams {
+            desired_access: access_mask::GENERIC_READ,
+            share_access: 0,
+            create_disposition: disposition::OPEN,
+            create_options: 0,
+            file_attributes: 0,
+        }
+    }
 
     #[tokio::test]
     async fn test_create_and_read_file() {
         let backend = MemoryBackend::new();
 
         // Create a file
-        let flags = OpenFlags::new(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE);
-        let handle = backend.open("test.txt", flags, 0o644).await.unwrap();
+        let params = create_params_rw_create();
+        let handle = backend.open("test.txt", &params).await.unwrap();
 
         // Write data
         let data = b"Hello, World!";
@@ -1194,11 +1218,8 @@ mod tests {
         assert_eq!(meta.file_type, FileType::Directory);
 
         // Create file in directory
-        let flags = OpenFlags::new(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE);
-        let handle = backend
-            .open("testdir/file.txt", flags, 0o644)
-            .await
-            .unwrap();
+        let params = create_params_rw_create();
+        let handle = backend.open("testdir/file.txt", &params).await.unwrap();
         backend.write(&handle, 0, b"test").await.unwrap();
         backend.close(handle).await.unwrap();
 
@@ -1223,8 +1244,8 @@ mod tests {
         let backend = MemoryBackend::new();
 
         // Create target file
-        let flags = OpenFlags::new(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE);
-        let handle = backend.open("target.txt", flags, 0o644).await.unwrap();
+        let params = create_params_rw_create();
+        let handle = backend.open("target.txt", &params).await.unwrap();
         backend.close(handle).await.unwrap();
 
         // Create symlink
@@ -1240,8 +1261,8 @@ mod tests {
         let backend = MemoryBackend::new();
 
         // Create file
-        let flags = OpenFlags::new(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE);
-        let handle = backend.open("old.txt", flags, 0o644).await.unwrap();
+        let params = create_params_rw_create();
+        let handle = backend.open("old.txt", &params).await.unwrap();
         backend.write(&handle, 0, b"content").await.unwrap();
         backend.close(handle).await.unwrap();
 
@@ -1252,10 +1273,8 @@ mod tests {
         assert!(backend.stat("old.txt").await.is_err());
 
         // New path should exist with same content
-        let handle = backend
-            .open("new.txt", OpenFlags::new(OpenFlags::READ), 0)
-            .await
-            .unwrap();
+        let read_params = create_params_read();
+        let handle = backend.open("new.txt", &read_params).await.unwrap();
         let data = backend.read(&handle, 0, 100).await.unwrap();
         assert_eq!(data, b"content");
         backend.close(handle).await.unwrap();
@@ -1266,8 +1285,8 @@ mod tests {
         let backend = MemoryBackend::new();
 
         // Create file
-        let flags = OpenFlags::new(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE);
-        let handle = backend.open("test.txt", flags, 0o644).await.unwrap();
+        let params = create_params_rw_create();
+        let handle = backend.open("test.txt", &params).await.unwrap();
         backend.close(handle).await.unwrap();
 
         // Set xattr
@@ -1294,8 +1313,8 @@ mod tests {
         let backend = MemoryBackend::new();
 
         // Create file
-        let flags = OpenFlags::new(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE);
-        let handle = backend.open("test.txt", flags, 0o644).await.unwrap();
+        let params = create_params_rw_create();
+        let handle = backend.open("test.txt", &params).await.unwrap();
 
         // Acquire lock
         let lock = FileLock {
@@ -1335,8 +1354,8 @@ mod tests {
         let backend = MemoryBackend::new();
 
         // Create file with content
-        let flags = OpenFlags::new(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE);
-        let handle = backend.open("test.txt", flags, 0o644).await.unwrap();
+        let params = create_params_rw_create();
+        let handle = backend.open("test.txt", &params).await.unwrap();
         backend.write(&handle, 0, b"Hello, World!").await.unwrap();
         backend.close(handle).await.unwrap();
 
@@ -1348,10 +1367,8 @@ mod tests {
         assert_eq!(meta.size, 5);
 
         // Read content
-        let handle = backend
-            .open("test.txt", OpenFlags::new(OpenFlags::READ), 0)
-            .await
-            .unwrap();
+        let read_params = create_params_read();
+        let handle = backend.open("test.txt", &read_params).await.unwrap();
         let data = backend.read(&handle, 0, 100).await.unwrap();
         assert_eq!(data, b"Hello");
         backend.close(handle).await.unwrap();
@@ -1362,8 +1379,8 @@ mod tests {
         let backend = MemoryBackend::new();
 
         // Create file
-        let flags = OpenFlags::new(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE);
-        let handle = backend.open("test.txt", flags, 0o644).await.unwrap();
+        let params = create_params_rw_create();
+        let handle = backend.open("test.txt", &params).await.unwrap();
         backend.close(handle).await.unwrap();
 
         // Change mode
@@ -1388,16 +1405,14 @@ mod tests {
         backend.mkdir("a/b/c", 0o755).await.unwrap();
 
         // Create file in nested directory
-        let flags = OpenFlags::new(OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE);
-        let handle = backend.open("a/b/c/file.txt", flags, 0o644).await.unwrap();
+        let params = create_params_rw_create();
+        let handle = backend.open("a/b/c/file.txt", &params).await.unwrap();
         backend.write(&handle, 0, b"nested").await.unwrap();
         backend.close(handle).await.unwrap();
 
         // Read from nested path
-        let handle = backend
-            .open("a/b/c/file.txt", OpenFlags::new(OpenFlags::READ), 0)
-            .await
-            .unwrap();
+        let read_params = create_params_read();
+        let handle = backend.open("a/b/c/file.txt", &read_params).await.unwrap();
         let data = backend.read(&handle, 0, 100).await.unwrap();
         assert_eq!(data, b"nested");
         backend.close(handle).await.unwrap();

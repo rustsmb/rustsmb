@@ -123,8 +123,7 @@ mod tests {
         fn open<'a>(
             &'a self,
             _path: &'a str,
-            _flags: rustsmb_vfs::OpenFlags,
-            _mode: u32,
+            _params: &'a rustsmb_vfs::CreateParams,
         ) -> rustsmb_vfs::BoxFuture<'a, Result<rustsmb_vfs::FileHandle, rustsmb_core::VfsError>>
         {
             Box::pin(async { Ok(rustsmb_vfs::FileHandle::new()) })

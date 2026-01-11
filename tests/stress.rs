@@ -15,9 +15,31 @@
 use rustsmb_backend_local::LocalBackend;
 use rustsmb_backend_memory::MemoryBackend;
 use rustsmb_state_memory::MemoryStateStore;
-use rustsmb_vfs::{OpenFlags, StorageBackend};
+use rustsmb_vfs::{access_mask, disposition, CreateParams, StorageBackend};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Helper to create a CreateParams for read+write+create
+fn create_params_rw_create() -> CreateParams {
+    CreateParams {
+        desired_access: access_mask::GENERIC_READ | access_mask::GENERIC_WRITE,
+        share_access: 0,
+        create_disposition: disposition::OPEN_IF,
+        create_options: 0,
+        file_attributes: 0,
+    }
+}
+
+/// Helper to create a CreateParams for read-only
+fn create_params_read() -> CreateParams {
+    CreateParams {
+        desired_access: access_mask::GENERIC_READ,
+        share_access: 0,
+        create_disposition: disposition::OPEN,
+        create_options: 0,
+        file_attributes: 0,
+    }
+}
 use tempfile::TempDir;
 use tokio::sync::Barrier;
 
@@ -47,11 +69,7 @@ mod concurrent_connections {
 
                 // Create file
                 let handle = backend
-                    .open(
-                        &filename,
-                        OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                        0o644,
-                    )
+                    .open(&filename, &create_params_rw_create())
                     .await
                     .expect("Failed to create file");
 
@@ -66,7 +84,7 @@ mod concurrent_connections {
                 backend.close(handle).await.expect("Failed to close");
 
                 let handle = backend
-                    .open(&filename, OpenFlags::new(OpenFlags::READ), 0)
+                    .open(&filename, &create_params_read())
                     .await
                     .expect("Failed to reopen");
 
@@ -94,11 +112,7 @@ mod concurrent_connections {
 
         // Create shared file
         let handle = backend
-            .open(
-                "shared.txt",
-                OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                0o644,
-            )
+            .open("shared.txt", &create_params_rw_create())
             .await
             .unwrap();
         backend.write(&handle, 0, content.as_bytes()).await.unwrap();
@@ -116,7 +130,7 @@ mod concurrent_connections {
                 barrier.wait().await;
 
                 let handle = backend
-                    .open("shared.txt", OpenFlags::new(OpenFlags::READ), 0)
+                    .open("shared.txt", &create_params_read())
                     .await
                     .expect("Failed to open");
 
@@ -153,11 +167,7 @@ mod concurrent_connections {
 
                 let filename = format!("writer_{}.txt", i);
                 let handle = backend
-                    .open(
-                        &filename,
-                        OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                        0o644,
-                    )
+                    .open(&filename, &create_params_rw_create())
                     .await
                     .expect("Failed to create");
 
@@ -196,11 +206,7 @@ mod large_files {
         let size = 100 * 1024 * 1024; // 100 MB
 
         let handle = backend
-            .open(
-                "large.bin",
-                OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                0o644,
-            )
+            .open("large.bin", &create_params_rw_create())
             .await
             .unwrap();
 
@@ -230,11 +236,7 @@ mod large_files {
         let size: u64 = 1024 * 1024 * 1024; // 1 GB
 
         let handle = backend
-            .open(
-                "huge.bin",
-                OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                0o644,
-            )
+            .open("huge.bin", &create_params_rw_create())
             .await
             .unwrap();
 
@@ -260,7 +262,7 @@ mod large_files {
 
         // Read back and verify
         let handle = backend
-            .open("huge.bin", OpenFlags::new(OpenFlags::READ), 0)
+            .open("huge.bin", &create_params_read())
             .await
             .unwrap();
 
@@ -286,11 +288,7 @@ mod large_files {
         let backend = MemoryBackend::new();
 
         let handle = backend
-            .open(
-                "sparse.bin",
-                OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                0o644,
-            )
+            .open("sparse.bin", &create_params_rw_create())
             .await
             .unwrap();
 
@@ -304,7 +302,7 @@ mod large_files {
 
         // Verify reads at those offsets
         let handle = backend
-            .open("sparse.bin", OpenFlags::new(OpenFlags::READ), 0)
+            .open("sparse.bin", &create_params_read())
             .await
             .unwrap();
 
@@ -448,11 +446,7 @@ mod throughput {
     async fn test_sequential_write_throughput() {
         let backend = MemoryBackend::new();
         let handle = backend
-            .open(
-                "throughput.bin",
-                OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                0o644,
-            )
+            .open("throughput.bin", &create_params_rw_create())
             .await
             .unwrap();
 
@@ -487,11 +481,7 @@ mod throughput {
 
         // Setup: create file
         let handle = backend
-            .open(
-                "throughput.bin",
-                OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                0o644,
-            )
+            .open("throughput.bin", &create_params_rw_create())
             .await
             .unwrap();
         let chunk = vec![0xAAu8; 64 * 1024];
@@ -502,7 +492,7 @@ mod throughput {
 
         // Test read
         let handle = backend
-            .open("throughput.bin", OpenFlags::new(OpenFlags::READ), 0)
+            .open("throughput.bin", &create_params_read())
             .await
             .unwrap();
 
@@ -540,11 +530,7 @@ mod throughput {
             let backend: Arc<MemoryBackend> = Arc::clone(&backend);
             handles.push(tokio::spawn(async move {
                 let handle = backend
-                    .open(
-                        &format!("file_{}.bin", i),
-                        OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                        0o644,
-                    )
+                    .open(&format!("file_{}.bin", i), &create_params_rw_create())
                     .await
                     .unwrap();
 
@@ -589,11 +575,7 @@ mod memory_pressure {
         let start = Instant::now();
         for i in 0..10000 {
             let handle = backend
-                .open(
-                    &format!("small_{}.txt", i),
-                    OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                    0o644,
-                )
+                .open(&format!("small_{}.txt", i), &create_params_rw_create())
                 .await
                 .expect("Create failed");
             backend

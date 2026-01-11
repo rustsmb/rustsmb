@@ -107,6 +107,161 @@ impl OpenFlags {
     }
 }
 
+/// SMB create disposition values.
+pub mod disposition {
+    /// If the file exists, supersede it. If not, create it.
+    pub const SUPERSEDE: u32 = 0;
+    /// If the file exists, open it. If not, fail.
+    pub const OPEN: u32 = 1;
+    /// If the file exists, fail. If not, create it.
+    pub const CREATE: u32 = 2;
+    /// If the file exists, open it. If not, create it.
+    pub const OPEN_IF: u32 = 3;
+    /// If the file exists, open and truncate it. If not, fail.
+    pub const OVERWRITE: u32 = 4;
+    /// If the file exists, open and truncate it. If not, create it.
+    pub const OVERWRITE_IF: u32 = 5;
+}
+
+/// SMB create options flags.
+pub mod create_options {
+    /// The file being opened is a directory.
+    pub const FILE_DIRECTORY_FILE: u32 = 0x00000001;
+    /// The file being opened must not be a directory.
+    pub const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
+    /// Delete the file when the last handle is closed.
+    pub const FILE_DELETE_ON_CLOSE: u32 = 0x00001000;
+}
+
+/// SMB access mask flags.
+pub mod access_mask {
+    /// Read data from the file.
+    pub const FILE_READ_DATA: u32 = 0x00000001;
+    /// Write data to the file.
+    pub const FILE_WRITE_DATA: u32 = 0x00000002;
+    /// Append data to the file.
+    pub const FILE_APPEND_DATA: u32 = 0x00000004;
+    /// Read extended attributes.
+    pub const FILE_READ_EA: u32 = 0x00000008;
+    /// Write extended attributes.
+    pub const FILE_WRITE_EA: u32 = 0x00000010;
+    /// Execute the file.
+    pub const FILE_EXECUTE: u32 = 0x00000020;
+    /// Delete child entries (for directories).
+    pub const FILE_DELETE_CHILD: u32 = 0x00000040;
+    /// Read file attributes.
+    pub const FILE_READ_ATTRIBUTES: u32 = 0x00000080;
+    /// Write file attributes.
+    pub const FILE_WRITE_ATTRIBUTES: u32 = 0x00000100;
+    /// Delete the file.
+    pub const DELETE: u32 = 0x00010000;
+    /// Generic read access.
+    pub const GENERIC_READ: u32 = 0x80000000;
+    /// Generic write access.
+    pub const GENERIC_WRITE: u32 = 0x40000000;
+    /// Generic execute access.
+    pub const GENERIC_EXECUTE: u32 = 0x20000000;
+    /// Generic all access.
+    pub const GENERIC_ALL: u32 = 0x10000000;
+}
+
+/// SMB share access flags.
+pub mod share_access {
+    /// Allow other opens for read.
+    pub const FILE_SHARE_READ: u32 = 0x00000001;
+    /// Allow other opens for write.
+    pub const FILE_SHARE_WRITE: u32 = 0x00000002;
+    /// Allow other opens for delete.
+    pub const FILE_SHARE_DELETE: u32 = 0x00000004;
+}
+
+/// Parameters for opening/creating a file (SMB-native).
+///
+/// This struct contains SMB-level parameters that backends translate
+/// to their internal representation.
+#[derive(Debug, Clone, Default)]
+pub struct CreateParams {
+    /// Desired access mask (FILE_READ_DATA, FILE_WRITE_DATA, etc.)
+    pub desired_access: u32,
+    /// Share access (FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE)
+    pub share_access: u32,
+    /// Create disposition (Open, Create, OpenIf, Overwrite, etc.)
+    pub create_disposition: u32,
+    /// Create options (FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, etc.)
+    pub create_options: u32,
+    /// File attributes (FILE_ATTRIBUTE_NORMAL, READONLY, HIDDEN, etc.)
+    pub file_attributes: u32,
+}
+
+impl CreateParams {
+    /// Check if this is a directory open.
+    #[inline]
+    pub fn is_directory(&self) -> bool {
+        (self.create_options & create_options::FILE_DIRECTORY_FILE) != 0
+    }
+
+    /// Check if read access is requested.
+    #[inline]
+    pub fn wants_read(&self) -> bool {
+        (self.desired_access & access_mask::FILE_READ_DATA) != 0
+            || (self.desired_access & access_mask::GENERIC_READ) != 0
+            || (self.desired_access & access_mask::GENERIC_ALL) != 0
+    }
+
+    /// Check if write access is requested.
+    #[inline]
+    pub fn wants_write(&self) -> bool {
+        (self.desired_access & access_mask::FILE_WRITE_DATA) != 0
+            || (self.desired_access & access_mask::GENERIC_WRITE) != 0
+            || (self.desired_access & access_mask::GENERIC_ALL) != 0
+    }
+
+    /// Convert to internal OpenFlags for backend use.
+    pub fn to_open_flags(&self) -> OpenFlags {
+        let mut flags = 0u32;
+
+        // Set read/write based on desired access
+        if self.wants_read() {
+            flags |= OpenFlags::READ;
+        }
+        if self.wants_write() {
+            flags |= OpenFlags::WRITE;
+        }
+
+        // Set create/truncate flags based on disposition
+        match self.create_disposition {
+            disposition::CREATE => {
+                // Create new, fail if exists
+                flags |= OpenFlags::CREATE | OpenFlags::EXCL;
+            }
+            disposition::OPEN => {
+                // Open existing, fail if not exists
+                // No additional flags
+            }
+            disposition::OPEN_IF => {
+                // Open if exists, create if not
+                flags |= OpenFlags::CREATE;
+            }
+            disposition::OVERWRITE => {
+                // Open and truncate, fail if not exists
+                flags |= OpenFlags::TRUNC;
+            }
+            disposition::OVERWRITE_IF | disposition::SUPERSEDE => {
+                // Open and truncate if exists, create if not
+                flags |= OpenFlags::CREATE | OpenFlags::TRUNC;
+            }
+            _ => {}
+        }
+
+        // Directory flag
+        if self.is_directory() {
+            flags |= OpenFlags::DIRECTORY;
+        }
+
+        OpenFlags::new(flags)
+    }
+}
+
 /// File metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {

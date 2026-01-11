@@ -8,8 +8,30 @@
 //! Run with: cargo test --test security
 
 use rustsmb_backend_local::LocalBackend;
-use rustsmb_vfs::{OpenFlags, StorageBackend};
+use rustsmb_vfs::{access_mask, disposition, CreateParams, StorageBackend};
 use tempfile::TempDir;
+
+/// Helper to create a CreateParams for read+write+create
+fn create_params_rw_create() -> CreateParams {
+    CreateParams {
+        desired_access: access_mask::GENERIC_READ | access_mask::GENERIC_WRITE,
+        share_access: 0,
+        create_disposition: disposition::OPEN_IF,
+        create_options: 0,
+        file_attributes: 0,
+    }
+}
+
+/// Helper to create a CreateParams for read-only
+fn create_params_read() -> CreateParams {
+    CreateParams {
+        desired_access: access_mask::GENERIC_READ,
+        share_access: 0,
+        create_disposition: disposition::OPEN,
+        create_options: 0,
+        file_attributes: 0,
+    }
+}
 
 /// Create a test backend with a temporary directory.
 async fn setup_test_backend() -> (LocalBackend, TempDir) {
@@ -282,11 +304,7 @@ mod file_operations {
 
         // Try to create file outside root
         let result = backend
-            .open(
-                "../outside.txt",
-                OpenFlags::new(OpenFlags::CREATE | OpenFlags::WRITE),
-                0o644,
-            )
+            .open("../outside.txt", &create_params_rw_create())
             .await;
         assert!(
             result.is_err(),
@@ -408,9 +426,7 @@ mod race_conditions {
 
                 // Try to stat and open concurrently
                 let stat_result = backend.stat("shared.txt").await;
-                let open_result = backend
-                    .open("shared.txt", OpenFlags::new(OpenFlags::READ), 0)
-                    .await;
+                let open_result = backend.open("shared.txt", &create_params_read()).await;
 
                 (i, stat_result.is_ok(), open_result.is_ok())
             }));
@@ -476,11 +492,7 @@ mod resource_exhaustion {
         let mut handles = vec![];
         for i in 0..100 {
             let result = backend
-                .open(
-                    &format!("file{}.txt", i),
-                    OpenFlags::new(OpenFlags::READ),
-                    0,
-                )
+                .open(&format!("file{}.txt", i), &create_params_read())
                 .await;
             if let Ok(handle) = result {
                 handles.push(handle);

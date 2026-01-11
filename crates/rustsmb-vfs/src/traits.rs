@@ -17,12 +17,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// # Example
 ///
 /// ```ignore
-/// use rustsmb_vfs::{StorageBackend, BoxFuture};
+/// use rustsmb_vfs::{StorageBackend, BoxFuture, CreateParams};
 ///
 /// struct MyBackend;
 ///
 /// impl StorageBackend for MyBackend {
-///     fn open<'a>(&'a self, path: &'a str, flags: OpenFlags, mode: u32)
+///     fn open<'a>(&'a self, path: &'a str, params: &'a CreateParams)
 ///         -> BoxFuture<'a, Result<FileHandle, VfsError>>
 ///     {
 ///         Box::pin(async move {
@@ -37,11 +37,13 @@ pub trait StorageBackend: Send + Sync + 'static {
     // ========== File Operations ==========
 
     /// Open or create a file.
+    ///
+    /// The `params` argument contains SMB-native create parameters.
+    /// Backend implementations convert these to their internal representation.
     fn open<'a>(
         &'a self,
         path: &'a str,
-        flags: OpenFlags,
-        mode: u32,
+        params: &'a CreateParams,
     ) -> BoxFuture<'a, Result<FileHandle, VfsError>>;
 
     /// Read data from an open file.

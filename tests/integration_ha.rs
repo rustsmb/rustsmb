@@ -316,14 +316,17 @@ async fn test_data_persistence_across_servers() {
     let cluster = MultiServerCluster::new(2).await;
 
     // Write data directly to the shared backend
-    let open_flags = rustsmb_vfs::OpenFlags::new(
-        rustsmb_vfs::OpenFlags::READ
-            | rustsmb_vfs::OpenFlags::WRITE
-            | rustsmb_vfs::OpenFlags::CREATE,
-    );
+    let create_params = rustsmb_vfs::CreateParams {
+        desired_access: rustsmb_vfs::access_mask::GENERIC_READ
+            | rustsmb_vfs::access_mask::GENERIC_WRITE,
+        share_access: 0,
+        create_disposition: rustsmb_vfs::disposition::OPEN_IF,
+        create_options: 0,
+        file_attributes: 0,
+    };
     let handle = cluster
         .shared_backend
-        .open("testfile.txt", open_flags, 0o644)
+        .open("testfile.txt", &create_params)
         .await
         .expect("Should create file");
 

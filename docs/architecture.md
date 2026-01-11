@@ -480,13 +480,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_memory_backend_read_write() {
-        let backend = MemoryBackend::new();
-        let handle = backend.open("/test.txt", OpenFlags::CREATE, 0o644).await.unwrap();
-        backend.write(&handle, b"hello", 0).await.unwrap();
+        use rustsmb_vfs::{CreateParams, access_mask, disposition};
 
-        let mut buf = [0u8; 5];
-        backend.read(&handle, &mut buf, 0).await.unwrap();
-        assert_eq!(&buf, b"hello");
+        let backend = MemoryBackend::new();
+        let params = CreateParams {
+            desired_access: access_mask::GENERIC_READ | access_mask::GENERIC_WRITE,
+            share_access: 0,
+            create_disposition: disposition::OPEN_IF,
+            create_options: 0,
+            file_attributes: 0,
+        };
+        let handle = backend.open("/test.txt", &params).await.unwrap();
+        backend.write(&handle, 0, b"hello").await.unwrap();
+
+        let data = backend.read(&handle, 0, 5).await.unwrap();
+        assert_eq!(&data, b"hello");
     }
 }
 ```
