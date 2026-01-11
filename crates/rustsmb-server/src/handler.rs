@@ -1968,9 +1968,34 @@ where
         // Zero the signature field (bytes 48-63)
         message[48..64].fill(0);
 
-        // SMBProtocol signs only the 64-byte header; match that for compatibility.
-        let header_bytes = &message[..SMB2_HEADER_SIZE];
+        // SMB 3.x signs the entire SMB2 packet (header + body) with the signature
+        // field zeroed. Compute the signature over the full message for compatibility
+        // with Windows and smbprotocol.
+        let signature = Self::compute_signature(signing_key, dialect, message)?;
+        let header_only_signature =
+            Self::compute_signature(signing_key, dialect, &message[..SMB2_HEADER_SIZE])?;
 
+        // Write signature back to message
+        message[48..64].copy_from_slice(&signature);
+        debug!(
+            conn_id = self.connection.id,
+            "Signed message: signature={:02x?} header_only_signature={:02x?}",
+            signature,
+            header_only_signature
+        );
+
+        Ok(())
+    }
+
+    /// Compute SMB signing MAC for the provided message bytes.
+    ///
+    /// The caller is responsible for zeroing the signature field in `message`
+    /// before invoking this helper.
+    fn compute_signature(
+        signing_key: &[u8],
+        dialect: SmbDialect,
+        message: &[u8],
+    ) -> Result<[u8; 16], HandlerError> {
         // Select signing algorithm based on dialect
         let algorithm = match dialect {
             SmbDialect::Smb311 => SigningAlgorithm::AesCmac, // Default for 3.1.1 (GMAC needs proper nonce)
@@ -1990,23 +2015,9 @@ where
         let signer = MessageSigner::new(algorithm, &key)
             .map_err(|e| HandlerError::Protocol(format!("Failed to create signer: {}", e)))?;
 
-        let signature = signer
-            .sign(header_bytes)
-            .map_err(|e| HandlerError::Protocol(format!("Failed to sign message: {}", e)))?;
-        let header_only_signature = signer
-            .sign(header_bytes)
-            .map_err(|e| HandlerError::Protocol(format!("Failed to sign header: {}", e)))?;
-
-        // Write signature back to message
-        message[48..64].copy_from_slice(&signature);
-        debug!(
-            conn_id = self.connection.id,
-            "Signed message: signature={:02x?} header_only_signature={:02x?}",
-            signature,
-            header_only_signature
-        );
-
-        Ok(())
+        signer
+            .sign(message)
+            .map_err(|e| HandlerError::Protocol(format!("Failed to sign message: {}", e)))
     }
 
     /// Serialize a response with header and body.
@@ -2065,6 +2076,49 @@ impl HandlerError {
             Self::Internal(_) => NtStatus::InternalError,
             Self::Status(s) => *s,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::DuplexStream;
+
+    #[test]
+    fn compute_signature_matches_smbprotocol_vector() {
+        // Captured from smbprotocol client during NTLM auth with KEY_EXCH.
+        let signing_key: [u8; 16] = [
+            0xb6, 0xb0, 0x55, 0x58, 0x0d, 0xed, 0xda, 0x89, 0xc6, 0x7b, 0x28, 0xd8, 0xd9, 0x86,
+            0x76, 0xbd,
+        ];
+
+        let message = hex_bytes(
+            "fe534d42400001000000000001001d02090000000000000002000000000000000000000000000000\
+             0200000000000000000000000000000000000000000000000900000048000900a1073005a0030a0100",
+        );
+
+        let signature = ConnectionHandler::<DuplexStream>::compute_signature(
+            &signing_key,
+            SmbDialect::Smb302,
+            &message,
+        )
+        .expect("signature computation should succeed");
+
+        assert_eq!(
+            signature,
+            [
+                0x39, 0xa6, 0x58, 0x63, 0x78, 0xdd, 0x5f, 0xcf, 0xab, 0x86, 0xe1, 0xde, 0x11, 0x67,
+                0x3e, 0xa7
+            ]
+        );
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        assert!(s.len() % 2 == 0, "hex string must have even length");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
     }
 }
 

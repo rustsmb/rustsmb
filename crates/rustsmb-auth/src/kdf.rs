@@ -99,10 +99,13 @@ pub fn sp800_108_kdf(
         // Counter (32-bit big-endian)
         mac.update(&counter.to_be_bytes());
 
-        // Label (caller includes trailing NUL if desired)
+        // Label (caller may include trailing NUL if desired)
         mac.update(label);
 
-        // Context (caller includes trailing NUL if desired)
+        // Required 0x00 separator between label and context per SP800-108.
+        mac.update(&[0u8]);
+
+        // Context (caller may include trailing NUL if desired)
         mac.update(context);
 
         // Output length in bits (32-bit big-endian)
@@ -494,5 +497,23 @@ mod tests {
         let k1 = sp800_108_kdf(session_key, label, context, 16);
         let k2 = sp800_108_kdf(session_key, label, context, 16);
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn test_smb3_signing_key_matches_known_vector() {
+        // Captured from smbprotocol NTLM authentication with key exchange enabled.
+        let session_key: [u8; 16] = [
+            0x4c, 0x4e, 0x75, 0xda, 0x93, 0x2e, 0xd1, 0xb3, 0x24, 0x41, 0x03, 0x0b, 0x7d, 0x1c,
+            0x66, 0xc4,
+        ];
+
+        let keys = SessionKeys::derive_smb3(&session_key);
+        assert_eq!(
+            keys.signing_key,
+            vec![
+                0xb6, 0xb0, 0x55, 0x58, 0x0d, 0xed, 0xda, 0x89, 0xc6, 0x7b, 0x28, 0xd8, 0xd9, 0x86,
+                0x76, 0xbd
+            ]
+        );
     }
 }

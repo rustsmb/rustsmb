@@ -252,9 +252,9 @@ impl NtlmAuthProvider {
                 "NTLMv2 session_base_key={:02x?} decrypted_session_key={:02x?}",
                 session_base_key, decrypted
             );
-            // Some client stacks continue to derive SMB keys from the base key even
-            // when KEY_EXCH is set; align with that behavior for compatibility.
-            session_base_key
+            // Per MS-NLMP 3.4.5, SMB should derive signing/encryption keys from the
+            // exported (decrypted) session key when KEY_EXCH is negotiated.
+            decrypted
         } else {
             session_base_key
         };

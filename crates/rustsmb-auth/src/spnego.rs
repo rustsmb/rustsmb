@@ -149,9 +149,7 @@ impl SpnegoProvider {
                     })
                 }
                 AuthResult::Success {
-                    user,
-                    session_key,
-                    ..
+                    user, session_key, ..
                 } => {
                     let resp = build_neg_token_resp(
                         Some(NegState::AcceptCompleted),
@@ -223,9 +221,7 @@ impl SpnegoProvider {
                 })
             }
             AuthResult::Success {
-                user,
-                session_key,
-                ..
+                user, session_key, ..
             } => {
                 let resp = build_neg_token_resp(Some(NegState::AcceptCompleted), None, None, None);
                 Ok(AuthResult::Success {
