@@ -25,7 +25,7 @@ sleep 1
 
 # Start server in background
 echo "Starting server on $SERVER:$PORT..."
-RUST_LOG=info "$PROJECT_DIR/target/release/rustsmb" --listen "$SERVER:$PORT" > /tmp/rustsmb-test.log 2>&1 &
+RUST_LOG=${RUST_LOG:-info} "$PROJECT_DIR/target/release/rustsmb" --listen "$SERVER:$PORT" > /tmp/rustsmb-test.log 2>&1 &
 SERVER_PID=$!
 
 # Wait for server to start

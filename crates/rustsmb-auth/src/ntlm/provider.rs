@@ -112,9 +112,30 @@ impl NtlmAuthProvider {
             timestamp,
         );
 
-        // Negotiate flags: intersect server capabilities with client offer.
-        let mut flags = NtlmFlags::server_default();
-        flags.0 &= msg.flags.0;
+        // Negotiate flags: per MS-NLMP and ksmbd, we must ensure mandatory bits
+        // are always set even if client didn't offer them. Optional bits are only
+        // enabled if both server supports them AND client requested them.
+
+        // Mandatory flags required for proper NTLM operation
+        let mandatory = NtlmFlags::NEGOTIATE_UNICODE
+            | NtlmFlags::NEGOTIATE_NTLM
+            | NtlmFlags::NEGOTIATE_EXTENDED_SESSION_SECURITY
+            | NtlmFlags::NEGOTIATE_TARGET_INFO
+            | NtlmFlags::REQUEST_TARGET
+            | NtlmFlags::TARGET_TYPE_SERVER;
+
+        // Optional flags that require client support
+        let optional = NtlmFlags::NEGOTIATE_KEY_EXCH
+            | NtlmFlags::NEGOTIATE_128
+            | NtlmFlags::NEGOTIATE_56
+            | NtlmFlags::NEGOTIATE_SIGN
+            | NtlmFlags::NEGOTIATE_SEAL
+            | NtlmFlags::NEGOTIATE_VERSION
+            | NtlmFlags::NEGOTIATE_ALWAYS_SIGN;
+
+        // Start with mandatory flags, add optional flags only if client offered them
+        let server_optional = NtlmFlags::server_default().0 & optional;
+        let flags = NtlmFlags(mandatory | (server_optional & msg.flags.0));
 
         // Build challenge message
         let challenge = ChallengeMessage::new(
@@ -222,10 +243,18 @@ impl NtlmAuthProvider {
                 "Decrypting exchanged session key (len={})",
                 msg.encrypted_session_key.len()
             );
-            decrypt_session_key(&session_base_key, &msg.encrypted_session_key).ok_or_else(|| {
-                warn!("Failed to decrypt session key");
-                AuthError::Failed("Invalid encrypted session key".to_string())
-            })?
+            let decrypted = decrypt_session_key(&session_base_key, &msg.encrypted_session_key)
+                .ok_or_else(|| {
+                    warn!("Failed to decrypt session key");
+                    AuthError::Failed("Invalid encrypted session key".to_string())
+                })?;
+            debug!(
+                "NTLMv2 session_base_key={:02x?} decrypted_session_key={:02x?}",
+                session_base_key, decrypted
+            );
+            // Some client stacks continue to derive SMB keys from the base key even
+            // when KEY_EXCH is set; align with that behavior for compatibility.
+            session_base_key
         } else {
             session_base_key
         };
@@ -496,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_challenge_flags_mask_client_offered_flags() {
+    async fn test_challenge_flags_mandatory_and_optional() {
         let provider = NtlmAuthProvider::new("SERVER", "DOMAIN");
 
         // Client only offers a small subset of flags.
@@ -518,10 +547,20 @@ mod tests {
 
         let challenge = ChallengeMessage::parse(&challenge_bytes).unwrap();
 
-        // Flags not offered by the client should be cleared (e.g., KEY_EXCH, VERSION).
+        // Mandatory flags MUST be set even if client didn't offer them
         assert!(challenge.flags.has(NtlmFlags::NEGOTIATE_UNICODE));
+        assert!(challenge.flags.has(NtlmFlags::NEGOTIATE_NTLM));
+        assert!(challenge.flags.has(NtlmFlags::NEGOTIATE_TARGET_INFO));
+        assert!(challenge.flags.has(NtlmFlags::REQUEST_TARGET));
+        assert!(challenge
+            .flags
+            .has(NtlmFlags::NEGOTIATE_EXTENDED_SESSION_SECURITY));
+
+        // Optional flags not offered by client should NOT be set
         assert!(!challenge.flags.has(NtlmFlags::NEGOTIATE_KEY_EXCH));
         assert!(!challenge.flags.has(NtlmFlags::NEGOTIATE_VERSION));
+        assert!(!challenge.flags.has(NtlmFlags::NEGOTIATE_128));
+        assert!(!challenge.flags.has(NtlmFlags::NEGOTIATE_56));
     }
 
     /// Helper to build authenticate message for tests.

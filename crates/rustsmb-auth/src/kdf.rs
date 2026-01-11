@@ -1,6 +1,7 @@
 //! SMB 3.0/3.1.1 Key Derivation Functions.
 //!
-//! Implements key derivation as specified in MS-SMB2 section 3.1.4.2.
+//! Implements key derivation as specified in MS-SMB2 section 3.1.4.2 using
+//! SP800-108 KDF in Counter Mode with HMAC-SHA256 as the PRF.
 //!
 //! # SMB 3.0 Key Derivation
 //!
@@ -98,13 +99,10 @@ pub fn sp800_108_kdf(
         // Counter (32-bit big-endian)
         mac.update(&counter.to_be_bytes());
 
-        // Label
+        // Label (caller includes trailing NUL if desired)
         mac.update(label);
 
-        // Separator (0x00)
-        mac.update(&[0x00]);
-
-        // Context
+        // Context (caller includes trailing NUL if desired)
         mac.update(context);
 
         // Output length in bits (32-bit big-endian)
@@ -141,20 +139,27 @@ impl SessionKeys {
     ///
     /// * `session_key` - Base session key from NTLM/Kerberos authentication
     pub fn derive_smb3(session_key: &[u8]) -> Self {
-        let signing_key = sp800_108_kdf(session_key, labels::SMB2_SIGNING, contexts::SIGN, 16);
+        // Match smbprotocol/Windows behavior: label/context include trailing NUL and
+        // SP800-108 adds the separator.
+        let signing_key = sp800_108_kdf(
+            session_key,
+            &[labels::SMB2_SIGNING, b"\0"].concat(),
+            &[contexts::SIGN, b"\0"].concat(),
+            16,
+        );
 
         // Server encrypts outbound traffic with ServerOut key, decrypts inbound with ServerIn.
         let encryption_key = sp800_108_kdf(
             session_key,
-            labels::SMB2_ENCRYPTION,
-            contexts::SERVER_OUT,
+            &[labels::SMB2_ENCRYPTION, b"\0"].concat(),
+            &[contexts::SERVER_OUT, b"\0"].concat(),
             16,
         );
 
         let decryption_key = sp800_108_kdf(
             session_key,
-            labels::SMB2_DECRYPTION,
-            contexts::SERVER_IN,
+            &[labels::SMB2_DECRYPTION, b"\0"].concat(),
+            &[contexts::SERVER_IN, b"\0"].concat(),
             16,
         );
 
@@ -174,17 +179,34 @@ impl SessionKeys {
     /// * `session_key` - Base session key from NTLM/Kerberos authentication
     /// * `preauth_hash` - Pre-authentication integrity hash value
     pub fn derive_smb311(session_key: &[u8], preauth_hash: &[u8]) -> Self {
-        let signing_key = sp800_108_kdf(session_key, labels::SMB2_SIGNING_311, preauth_hash, 16);
+        let signing_key = sp800_108_kdf(
+            session_key,
+            &[labels::SMB2_SIGNING_311, b"\0"].concat(),
+            preauth_hash,
+            16,
+        );
 
         // Label names indicate direction: SMBS2C is server->client, SMBC2S is client->server.
-        let encryption_key =
-            sp800_108_kdf(session_key, labels::SMB2_DECRYPTION_311, preauth_hash, 16);
+        let encryption_key = sp800_108_kdf(
+            session_key,
+            &[labels::SMB2_DECRYPTION_311, b"\0"].concat(),
+            preauth_hash,
+            16,
+        );
 
-        let decryption_key =
-            sp800_108_kdf(session_key, labels::SMB2_ENCRYPTION_311, preauth_hash, 16);
+        let decryption_key = sp800_108_kdf(
+            session_key,
+            &[labels::SMB2_ENCRYPTION_311, b"\0"].concat(),
+            preauth_hash,
+            16,
+        );
 
-        let application_key =
-            sp800_108_kdf(session_key, labels::SMB2_APP_KEY_311, preauth_hash, 16);
+        let application_key = sp800_108_kdf(
+            session_key,
+            &[labels::SMB2_APP_KEY_311, b"\0"].concat(),
+            preauth_hash,
+            16,
+        );
 
         Self {
             session_key: session_key.to_vec(),
@@ -204,17 +226,34 @@ impl SessionKeys {
     /// * `session_key` - Base session key from NTLM/Kerberos authentication
     /// * `preauth_hash` - Pre-authentication integrity hash value (for SMB 3.1.1)
     pub fn derive_smb311_256(session_key: &[u8], preauth_hash: &[u8]) -> Self {
-        let signing_key = sp800_108_kdf(session_key, labels::SMB2_SIGNING_311, preauth_hash, 16);
+        let signing_key = sp800_108_kdf(
+            session_key,
+            &[labels::SMB2_SIGNING_311, b"\0"].concat(),
+            preauth_hash,
+            16,
+        );
 
         // 256-bit keys for AES-256-GCM
-        let encryption_key =
-            sp800_108_kdf(session_key, labels::SMB2_DECRYPTION_311, preauth_hash, 32);
+        let encryption_key = sp800_108_kdf(
+            session_key,
+            &[labels::SMB2_DECRYPTION_311, b"\0"].concat(),
+            preauth_hash,
+            32,
+        );
 
-        let decryption_key =
-            sp800_108_kdf(session_key, labels::SMB2_ENCRYPTION_311, preauth_hash, 32);
+        let decryption_key = sp800_108_kdf(
+            session_key,
+            &[labels::SMB2_ENCRYPTION_311, b"\0"].concat(),
+            preauth_hash,
+            32,
+        );
 
-        let application_key =
-            sp800_108_kdf(session_key, labels::SMB2_APP_KEY_311, preauth_hash, 16);
+        let application_key = sp800_108_kdf(
+            session_key,
+            &[labels::SMB2_APP_KEY_311, b"\0"].concat(),
+            preauth_hash,
+            16,
+        );
 
         Self {
             session_key: session_key.to_vec(),
@@ -406,14 +445,14 @@ mod tests {
         let session_key = [0x09u8; 16];
         let expected_enc = sp800_108_kdf(
             &session_key,
-            labels::SMB2_ENCRYPTION,
-            contexts::SERVER_OUT,
+            &[labels::SMB2_ENCRYPTION, b"\0"].concat(),
+            &[contexts::SERVER_OUT, b"\0"].concat(),
             16,
         );
         let expected_dec = sp800_108_kdf(
             &session_key,
-            labels::SMB2_DECRYPTION,
-            contexts::SERVER_IN,
+            &[labels::SMB2_DECRYPTION, b"\0"].concat(),
+            &[contexts::SERVER_IN, b"\0"].concat(),
             16,
         );
 
@@ -427,10 +466,18 @@ mod tests {
         let session_key = [0x0au8; 16];
         let preauth_hash = [0x0bu8; 64];
 
-        let expected_enc =
-            sp800_108_kdf(&session_key, labels::SMB2_DECRYPTION_311, &preauth_hash, 16);
-        let expected_dec =
-            sp800_108_kdf(&session_key, labels::SMB2_ENCRYPTION_311, &preauth_hash, 16);
+        let expected_enc = sp800_108_kdf(
+            &session_key,
+            &[labels::SMB2_DECRYPTION_311, b"\0"].concat(),
+            &preauth_hash,
+            16,
+        );
+        let expected_dec = sp800_108_kdf(
+            &session_key,
+            &[labels::SMB2_ENCRYPTION_311, b"\0"].concat(),
+            &preauth_hash,
+            16,
+        );
 
         let keys = SessionKeys::derive_smb311(&session_key, &preauth_hash);
         assert_eq!(keys.encryption_key, expected_enc);

@@ -371,6 +371,11 @@ where
 
         let selected_dialect = dialect.unwrap();
         self.connection.negotiate(selected_dialect);
+        debug!(
+            conn_id = self.connection.id,
+            dialect = ?selected_dialect,
+            "Negotiated dialect"
+        );
 
         // Build capabilities
         let mut caps_value = Capabilities::LARGE_MTU;
@@ -387,7 +392,10 @@ where
                 &self.preauth_hash.value()[..8]
             );
             self.preauth_hash.update(full_message);
-            debug!("Preauth: hash after NEGOTIATE req: {:02x?}", &self.preauth_hash.value()[..8]);
+            debug!(
+                "Preauth: hash after NEGOTIATE req: {:02x?}",
+                &self.preauth_hash.value()[..8]
+            );
         }
 
         // Build response
@@ -419,7 +427,10 @@ where
                 result.len()
             );
             self.preauth_hash.update(&result);
-            debug!("Preauth: hash after NEGOTIATE resp: {:02x?}", &self.preauth_hash.value()[..8]);
+            debug!(
+                "Preauth: hash after NEGOTIATE resp: {:02x?}",
+                &self.preauth_hash.value()[..8]
+            );
         }
 
         Ok(result)
@@ -501,7 +512,10 @@ where
                         &self.preauth_hash.value()[..8]
                     );
                     self.preauth_hash.update(full_message);
-                    debug!("Preauth: hash after SS2 req: {:02x?}", &self.preauth_hash.value()[..8]);
+                    debug!(
+                        "Preauth: hash after SS2 req: {:02x?}",
+                        &self.preauth_hash.value()[..8]
+                    );
                 }
 
                 // Create session state (do this early to get session_id)
@@ -566,15 +580,23 @@ where
 
                 let mut result = self.serialize_response(&resp_header, &response)?;
                 result.extend_from_slice(&security_buffer);
+                debug!(
+                    conn_id = self.connection.id,
+                    "SessionSetup Success response header bytes={:02x?}",
+                    &result[..SMB2_HEADER_SIZE.min(result.len())]
+                );
 
-                // NOTE: The SUCCESS response is NOT included in the preauth hash for key derivation.
-                // smbprotocol does not add the SUCCESS response to its temp_storage,
-                // so we must match that behavior.
                 if dialect == SmbDialect::Smb311 {
                     debug!(
-                        "Preauth: NOT hashing SESSION_SETUP (Success) response - smbprotocol doesn't include it"
+                        "Preauth: hashing SESSION_SETUP (Success) response ({} bytes), hash before: {:02x?}",
+                        result.len(),
+                        &self.preauth_hash.value()[..8]
                     );
-                    debug!("Preauth: final hash for key derivation: {:02x?}", &self.preauth_hash.value()[..16]);
+                    self.preauth_hash.update(&result);
+                    debug!(
+                        "Preauth: final hash for key derivation: {:02x?}",
+                        &self.preauth_hash.value()[..16]
+                    );
                 }
 
                 // Step 4: Derive signing key
@@ -595,11 +617,12 @@ where
                         );
                         SessionKeys::derive_smb3(&session_key).signing_key
                     }
-                    _ => {
-                        session_key.clone()
-                    }
+                    _ => session_key.clone(),
                 };
-                debug!("Derived signing_key={:02x?}", &signing_key[..signing_key.len().min(16)]);
+                debug!(
+                    "Derived signing_key={:02x?}",
+                    &signing_key[..signing_key.len().min(16)]
+                );
 
                 // Step 5: Sign the response
                 if should_sign {
@@ -620,7 +643,10 @@ where
                         &self.preauth_hash.value()[..8]
                     );
                     self.preauth_hash.update(full_message);
-                    debug!("Preauth: hash after SESSION_SETUP (Continue) req: {:02x?}", &self.preauth_hash.value()[..8]);
+                    debug!(
+                        "Preauth: hash after SESSION_SETUP (Continue) req: {:02x?}",
+                        &self.preauth_hash.value()[..8]
+                    );
                 }
 
                 let resp_header =
@@ -639,9 +665,15 @@ where
 
                 // For SMB 3.1.1, update preauth hash with response
                 if dialect == SmbDialect::Smb311 {
-                    debug!("Preauth: hashing SESSION_SETUP (Continue) response ({} bytes)", result.len());
+                    debug!(
+                        "Preauth: hashing SESSION_SETUP (Continue) response ({} bytes)",
+                        result.len()
+                    );
                     self.preauth_hash.update(&result);
-                    debug!("Preauth: hash after SS1 resp: {:02x?}", &self.preauth_hash.value()[..8]);
+                    debug!(
+                        "Preauth: hash after SS1 resp: {:02x?}",
+                        &self.preauth_hash.value()[..8]
+                    );
                 }
 
                 Ok(result)
@@ -1903,7 +1935,7 @@ where
     fn select_dialect(&self, client_dialects: &[u16]) -> Option<SmbDialect> {
         // Prefer newer dialects
         let server_dialects = [
-            (0x0311, SmbDialect::Smb311),
+            // SMB 3.1.1 negotiation contexts are not yet implemented; prefer 3.0.x for now.
             (0x0302, SmbDialect::Smb302),
             (0x0300, SmbDialect::Smb300),
             (0x0210, SmbDialect::Smb210),
@@ -1936,6 +1968,9 @@ where
         // Zero the signature field (bytes 48-63)
         message[48..64].fill(0);
 
+        // SMBProtocol signs only the 64-byte header; match that for compatibility.
+        let header_bytes = &message[..SMB2_HEADER_SIZE];
+
         // Select signing algorithm based on dialect
         let algorithm = match dialect {
             SmbDialect::Smb311 => SigningAlgorithm::AesCmac, // Default for 3.1.1 (GMAC needs proper nonce)
@@ -1956,11 +1991,20 @@ where
             .map_err(|e| HandlerError::Protocol(format!("Failed to create signer: {}", e)))?;
 
         let signature = signer
-            .sign(message)
+            .sign(header_bytes)
             .map_err(|e| HandlerError::Protocol(format!("Failed to sign message: {}", e)))?;
+        let header_only_signature = signer
+            .sign(header_bytes)
+            .map_err(|e| HandlerError::Protocol(format!("Failed to sign header: {}", e)))?;
 
         // Write signature back to message
         message[48..64].copy_from_slice(&signature);
+        debug!(
+            conn_id = self.connection.id,
+            "Signed message: signature={:02x?} header_only_signature={:02x?}",
+            signature,
+            header_only_signature
+        );
 
         Ok(())
     }
