@@ -1009,6 +1009,102 @@ where
             .get_share(&tree.share_name)
             .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
 
+        // Check share mode conflicts with existing handles
+        let existing_handles = self
+            .session_manager
+            .state_store()
+            .get_handles_for_file(&tree.share_name, &filename)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+        let requested_access = request.desired_access;
+        let requested_share = request.share_access;
+
+        // Access mask constants
+        const FILE_READ_DATA: u32 = 0x00000001;
+        const FILE_WRITE_DATA: u32 = 0x00000002;
+        const DELETE: u32 = 0x00010000;
+        const GENERIC_READ: u32 = 0x80000000;
+        const GENERIC_WRITE: u32 = 0x40000000;
+        const GENERIC_ALL: u32 = 0x10000000;
+
+        // Share access constants
+        const FILE_SHARE_READ: u32 = 0x01;
+        const FILE_SHARE_WRITE: u32 = 0x02;
+        const FILE_SHARE_DELETE: u32 = 0x04;
+
+        // Helper to check if access implies read
+        let wants_read = |access: u32| -> bool {
+            (access & FILE_READ_DATA) != 0
+                || (access & GENERIC_READ) != 0
+                || (access & GENERIC_ALL) != 0
+        };
+
+        // Helper to check if access implies write
+        let wants_write = |access: u32| -> bool {
+            (access & FILE_WRITE_DATA) != 0
+                || (access & GENERIC_WRITE) != 0
+                || (access & GENERIC_ALL) != 0
+        };
+
+        // Helper to check if access implies delete
+        let wants_delete =
+            |access: u32| -> bool { (access & DELETE) != 0 || (access & GENERIC_ALL) != 0 };
+
+        for existing in &existing_handles {
+            // Check if our requested access conflicts with existing handle's share mode
+            // If existing handle doesn't share READ and we want READ -> conflict
+            if (existing.share_access & FILE_SHARE_READ) == 0 && wants_read(requested_access) {
+                debug!(
+                    conn_id = self.connection.id,
+                    "Sharing violation: existing handle doesn't share READ"
+                );
+                return Err(HandlerError::Status(NtStatus::SharingViolation));
+            }
+            // If existing handle doesn't share WRITE and we want WRITE -> conflict
+            if (existing.share_access & FILE_SHARE_WRITE) == 0 && wants_write(requested_access) {
+                debug!(
+                    conn_id = self.connection.id,
+                    "Sharing violation: existing handle doesn't share WRITE"
+                );
+                return Err(HandlerError::Status(NtStatus::SharingViolation));
+            }
+            // If existing handle doesn't share DELETE and we want DELETE -> conflict
+            if (existing.share_access & FILE_SHARE_DELETE) == 0 && wants_delete(requested_access) {
+                debug!(
+                    conn_id = self.connection.id,
+                    "Sharing violation: existing handle doesn't share DELETE"
+                );
+                return Err(HandlerError::Status(NtStatus::SharingViolation));
+            }
+
+            // Check if we don't share access that existing handle has
+            // If we don't share READ and existing has READ access -> conflict
+            if (requested_share & FILE_SHARE_READ) == 0 && wants_read(existing.access_mask) {
+                debug!(
+                    conn_id = self.connection.id,
+                    "Sharing violation: we don't share READ but existing has it"
+                );
+                return Err(HandlerError::Status(NtStatus::SharingViolation));
+            }
+            // If we don't share WRITE and existing has WRITE access -> conflict
+            if (requested_share & FILE_SHARE_WRITE) == 0 && wants_write(existing.access_mask) {
+                debug!(
+                    conn_id = self.connection.id,
+                    "Sharing violation: we don't share WRITE but existing has it"
+                );
+                return Err(HandlerError::Status(NtStatus::SharingViolation));
+            }
+            // If we don't share DELETE and existing has DELETE access -> conflict
+            if (requested_share & FILE_SHARE_DELETE) == 0 && wants_delete(existing.access_mask) {
+                debug!(
+                    conn_id = self.connection.id,
+                    "Sharing violation: we don't share DELETE but existing has it"
+                );
+                return Err(HandlerError::Status(NtStatus::SharingViolation));
+            }
+        }
+
         // Convert SMB CreateDisposition to VFS OpenFlags
         let disposition = CreateDisposition::from_u32(request.create_disposition)
             .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;

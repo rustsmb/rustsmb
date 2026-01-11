@@ -553,6 +553,45 @@ impl StateStore for RedisStateStore {
         })
     }
 
+    fn get_handles_for_file(
+        &self,
+        share_name: &str,
+        file_path: &str,
+    ) -> BoxFuture<'_, Result<Vec<HandleState>, StateError>> {
+        let share_name = share_name.to_string();
+        let file_path = file_path.to_string();
+        Box::pin(async move {
+            let mut conn = self.get_conn().await?;
+
+            // Scan all handle keys and filter by share_name and path
+            // This is inefficient but works for now - could be optimized with a secondary index
+            let pattern = format!("{}*", keys::HANDLE);
+            let keys: Vec<String> = redis::cmd("KEYS")
+                .arg(&pattern)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| StateError::Internal(e.to_string()))?;
+
+            let mut handles = Vec::new();
+            for key in keys {
+                let json: Option<String> = conn
+                    .get(&key)
+                    .await
+                    .map_err(|e| StateError::Internal(e.to_string()))?;
+
+                if let Some(j) = json {
+                    if let Ok(handle) = serde_json::from_str::<HandleState>(&j) {
+                        if handle.share_name == share_name && handle.path == file_path {
+                            handles.push(handle);
+                        }
+                    }
+                }
+            }
+
+            Ok(handles)
+        })
+    }
+
     fn delete_handle(&self, persistent_id: u128) -> BoxFuture<'_, Result<(), StateError>> {
         Box::pin(async move {
             let mut conn = self.get_conn().await?;

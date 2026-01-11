@@ -229,6 +229,24 @@ impl StateStore for MemoryStateStore {
         })
     }
 
+    fn get_handles_for_file(
+        &self,
+        share_name: &str,
+        file_path: &str,
+    ) -> BoxFuture<'_, Result<Vec<HandleState>, StateError>> {
+        let share_name = share_name.to_string();
+        let file_path = file_path.to_string();
+        Box::pin(async move {
+            let handles = self.handles.read().await;
+            let result: Vec<HandleState> = handles
+                .values()
+                .filter(|h| h.share_name == share_name && h.path == file_path)
+                .cloned()
+                .collect();
+            Ok(result)
+        })
+    }
+
     fn delete_handle(&self, persistent_id: u128) -> BoxFuture<'_, Result<(), StateError>> {
         Box::pin(async move {
             let mut handles = self.handles.write().await;

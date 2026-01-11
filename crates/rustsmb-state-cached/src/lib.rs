@@ -378,6 +378,15 @@ impl StateStore for CachedStateStore {
         self.bulk_store.get_handles_by_session(session_id)
     }
 
+    fn get_handles_for_file(
+        &self,
+        share_name: &str,
+        file_path: &str,
+    ) -> BoxFuture<'_, Result<Vec<HandleState>, StateError>> {
+        // List operations go directly to bulk store
+        self.bulk_store.get_handles_for_file(share_name, file_path)
+    }
+
     fn delete_handle(&self, persistent_id: u128) -> BoxFuture<'_, Result<(), StateError>> {
         Box::pin(async move {
             self.bulk_store.delete_handle(persistent_id).await?;

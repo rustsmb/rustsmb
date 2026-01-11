@@ -98,6 +98,15 @@ pub trait StateStore: Send + Sync + 'static {
         session_id: u64,
     ) -> BoxFuture<'_, Result<Vec<HandleState>, StateError>>;
 
+    /// List handles for a specific file path (across all sessions).
+    ///
+    /// Used for share mode conflict checking when opening files.
+    fn get_handles_for_file(
+        &self,
+        share_name: &str,
+        file_path: &str,
+    ) -> BoxFuture<'_, Result<Vec<HandleState>, StateError>>;
+
     /// Delete a file handle.
     fn delete_handle(&self, persistent_id: u128) -> BoxFuture<'_, Result<(), StateError>>;
 
