@@ -241,11 +241,30 @@ async fn test_smbtorture_all() {
     }
     println!("========================================\n");
 
-    // Don't fail the test completely - just report results
-    // This allows us to track progress as we fix issues
-    if failed > 0 {
-        eprintln!("Warning: {} suites failed", failed);
+    // Fail the test if any suites failed
+    assert!(
+        failed == 0,
+        "{} suite(s) failed: {}",
+        failed,
+        failures.join(", ")
+    );
+}
+
+/// Helper to run a smbtorture suite and assert it passes.
+fn assert_smbtorture_passes(output: std::process::Output, suite: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("=== {} output ===", suite);
+    println!("{}", stdout);
+    if !stderr.is_empty() {
+        eprintln!("stderr: {}", stderr);
     }
+    assert!(
+        output.status.success(),
+        "smbtorture suite '{}' failed with exit code {:?}",
+        suite,
+        output.status.code()
+    );
 }
 
 // Individual test functions for CI granularity
@@ -253,71 +272,70 @@ async fn test_smbtorture_all() {
 #[ignore]
 async fn test_smb2_connect() {
     if !has_smbtorture() {
+        eprintln!("smbtorture not installed, skipping test");
         return;
     }
     let server = TestServer::new().await;
     let output = server.run_smbtorture("smb2.connect");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{}", stdout);
-    // Don't assert - just run and report
+    assert_smbtorture_passes(output, "smb2.connect");
 }
 
 #[tokio::test]
 #[ignore]
 async fn test_smb2_session() {
     if !has_smbtorture() {
+        eprintln!("smbtorture not installed, skipping test");
         return;
     }
     let server = TestServer::new().await;
     let output = server.run_smbtorture("smb2.session");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{}", stdout);
+    assert_smbtorture_passes(output, "smb2.session");
 }
 
 #[tokio::test]
 #[ignore]
 async fn test_smb2_create() {
     if !has_smbtorture() {
+        eprintln!("smbtorture not installed, skipping test");
         return;
     }
     let server = TestServer::new().await;
     let output = server.run_smbtorture("smb2.create");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{}", stdout);
+    assert_smbtorture_passes(output, "smb2.create");
 }
 
 #[tokio::test]
 #[ignore]
 async fn test_smb2_lease() {
     if !has_smbtorture() {
+        eprintln!("smbtorture not installed, skipping test");
         return;
     }
     let server = TestServer::new().await;
     let output = server.run_smbtorture("smb2.lease");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{}", stdout);
+    assert_smbtorture_passes(output, "smb2.lease");
 }
 
 #[tokio::test]
 #[ignore]
 async fn test_smb2_durable_open() {
     if !has_smbtorture() {
+        eprintln!("smbtorture not installed, skipping test");
         return;
     }
     let server = TestServer::new().await;
     let output = server.run_smbtorture("smb2.durable-open");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{}", stdout);
+    assert_smbtorture_passes(output, "smb2.durable-open");
 }
 
 #[tokio::test]
 #[ignore]
 async fn test_smb2_compound() {
     if !has_smbtorture() {
+        eprintln!("smbtorture not installed, skipping test");
         return;
     }
     let server = TestServer::new().await;
     let output = server.run_smbtorture("smb2.compound");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    println!("{}", stdout);
+    assert_smbtorture_passes(output, "smb2.compound");
 }
