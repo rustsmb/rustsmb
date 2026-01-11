@@ -283,6 +283,21 @@ impl AuthProvider for NtlmAuthProvider {
         token: &'a [u8],
     ) -> BoxFuture<'a, Result<AuthResult, AuthError>> {
         Box::pin(async move {
+            // Handle empty token as anonymous auth request
+            if token.is_empty() {
+                if self.allow_anonymous {
+                    return Ok(AuthResult::Success {
+                        user: UserInfo::anonymous(),
+                        session_key: vec![],
+                        response_token: None,
+                    });
+                } else {
+                    return Err(AuthError::Failed(
+                        "Anonymous access not allowed".to_string(),
+                    ));
+                }
+            }
+
             if token.len() < 12 {
                 return Err(AuthError::Failed("Token too short".to_string()));
             }

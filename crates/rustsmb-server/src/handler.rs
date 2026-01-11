@@ -128,17 +128,18 @@ where
             }
         }
 
-        // Clean up all sessions for this connection
-        let session_ids: Vec<u64> = self.connection.session_ids().copied().collect();
-        if !session_ids.is_empty() {
+        // Note: Sessions are NOT deleted on connection close.
+        // In HA mode, sessions persist in the shared state store and can be
+        // bound from another server via SESSION_BINDING. Sessions expire based
+        // on their TTL (expires_at field) and are cleaned up by expiration.
+        // This allows transparent failover without re-authentication.
+        let session_count = self.connection.session_ids().count();
+        if session_count > 0 {
             debug!(
                 conn_id = self.connection.id,
-                session_count = session_ids.len(),
-                "Cleaning up sessions on connection close"
+                session_count,
+                "Connection closed with active sessions (sessions persist for HA binding)"
             );
-            for session_id in session_ids {
-                let _ = self.session_manager.delete_session(session_id).await;
-            }
         }
 
         info!(conn_id = self.connection.id, "Connection closed");
