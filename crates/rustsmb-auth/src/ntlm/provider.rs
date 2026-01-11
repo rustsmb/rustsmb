@@ -1,6 +1,6 @@
 //! NTLM authentication provider.
 
-use super::crypto::{generate_challenge, nt_hash, ntowf_v2, verify_ntlmv2_response};
+use super::crypto::{decrypt_session_key, generate_challenge, nt_hash, ntowf_v2, verify_ntlmv2_response};
 use super::messages::{AuthenticateMessage, ChallengeMessage, NegotiateMessage};
 use super::{build_target_info, current_filetime, NtlmFlags};
 use crate::{AuthContext, AuthMechanism, AuthProvider, AuthResult, AuthState, BoxFuture, UserInfo};
@@ -166,6 +166,7 @@ impl NtlmAuthProvider {
                         ..Default::default()
                     },
                     session_key: vec![0; 16],
+                    response_token: None,
                 });
             } else {
                 context.state = AuthState::Failed;
@@ -196,20 +197,39 @@ impl NtlmAuthProvider {
                 .ok_or(AuthError::InvalidCredentials)?
         };
 
-        // Compute NTOWFv2
-        let domain = if msg.domain_name.is_empty() {
-            &self.domain_name
-        } else {
-            &msg.domain_name
-        };
-        let ntowf = ntowf_v2(&nt, &msg.user_name, domain);
+        // Compute NTOWFv2 - MUST use the SAME domain the client used
+        // MS-NLMP: NTOWFv2 = HMAC_MD5(NT_Hash, UPPERCASE(Username) + UserDomain)
+        // If client sends empty domain, we must use empty domain (not server default)
+        debug!(
+            "NTLMv2 verification: user={} domain={:?} nt_response_len={}",
+            msg.user_name,
+            msg.domain_name,
+            msg.nt_response.len()
+        );
+        let ntowf = ntowf_v2(&nt, &msg.user_name, &msg.domain_name);
 
         // Verify NTLMv2 response
-        let session_key = verify_ntlmv2_response(&ntowf, &server_challenge, &msg.nt_response)
+        let session_base_key = verify_ntlmv2_response(&ntowf, &server_challenge, &msg.nt_response)
             .ok_or_else(|| {
                 warn!("NTLMv2 verification failed for user {}", msg.user_name);
                 AuthError::InvalidCredentials
             })?;
+
+        // If NEGOTIATE_KEY_EXCH is set, decrypt the exchanged session key
+        let session_key = if msg.flags.has(NtlmFlags::NEGOTIATE_KEY_EXCH)
+            && !msg.encrypted_session_key.is_empty()
+        {
+            debug!(
+                "Decrypting exchanged session key (len={})",
+                msg.encrypted_session_key.len()
+            );
+            decrypt_session_key(&session_base_key, &msg.encrypted_session_key).ok_or_else(|| {
+                warn!("Failed to decrypt session key");
+                AuthError::Failed("Invalid encrypted session key".to_string())
+            })?
+        } else {
+            session_base_key
+        };
 
         // Clean up pending challenge
         {
@@ -223,6 +243,7 @@ impl NtlmAuthProvider {
         Ok(AuthResult::Success {
             user: user_info,
             session_key: session_key.to_vec(),
+            response_token: None,
         })
     }
 }
@@ -380,7 +401,9 @@ mod tests {
             .unwrap();
 
         match result {
-            AuthResult::Success { user, session_key } => {
+            AuthResult::Success {
+                user, session_key, ..
+            } => {
                 assert_eq!(user.username, "testuser");
                 assert_eq!(session_key.len(), 16);
             }

@@ -149,8 +149,9 @@ impl SpnegoProvider {
                     })
                 }
                 AuthResult::Success {
-                    user: _,
-                    session_key: _,
+                    user,
+                    session_key,
+                    ..
                 } => {
                     let resp = build_neg_token_resp(
                         Some(NegState::AcceptCompleted),
@@ -158,11 +159,12 @@ impl SpnegoProvider {
                         None,
                         None,
                     );
-                    // Return success with wrapped token
-                    Ok(AuthResult::Continue {
-                        response_token: resp,
+                    // Return success with wrapped SPNEGO token
+                    Ok(AuthResult::Success {
+                        user,
+                        session_key,
+                        response_token: Some(resp),
                     })
-                    // Note: In real impl, we'd track state and return Success on next call
                 }
                 AuthResult::Failure { reason } => {
                     let _resp = build_neg_token_resp(Some(NegState::Reject), None, None, None);
@@ -220,9 +222,17 @@ impl SpnegoProvider {
                     response_token: resp,
                 })
             }
-            AuthResult::Success { user, session_key } => {
-                let _resp = build_neg_token_resp(Some(NegState::AcceptCompleted), None, None, None);
-                Ok(AuthResult::Success { user, session_key })
+            AuthResult::Success {
+                user,
+                session_key,
+                ..
+            } => {
+                let resp = build_neg_token_resp(Some(NegState::AcceptCompleted), None, None, None);
+                Ok(AuthResult::Success {
+                    user,
+                    session_key,
+                    response_token: Some(resp),
+                })
             }
             AuthResult::Failure { reason } => {
                 let _resp = build_neg_token_resp(Some(NegState::Reject), None, None, None);

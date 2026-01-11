@@ -130,6 +130,8 @@ pub enum AuthResult {
     Success {
         user: UserInfo,
         session_key: Vec<u8>,
+        /// Optional final response token (e.g., SPNEGO AcceptCompleted).
+        response_token: Option<Vec<u8>>,
     },
     /// More data needed, send response token.
     Continue { response_token: Vec<u8> },
@@ -321,6 +323,7 @@ impl AuthProvider for AnonymousAuthProvider {
                 return Ok(AuthResult::Success {
                     user: UserInfo::anonymous(),
                     session_key: vec![0; 16], // Null session key
+                    response_token: None,
                 });
             }
 
@@ -329,6 +332,7 @@ impl AuthProvider for AnonymousAuthProvider {
                 return Ok(AuthResult::Success {
                     user: UserInfo::guest(),
                     session_key: vec![0; 16], // Guest session key
+                    response_token: None,
                 });
             }
 

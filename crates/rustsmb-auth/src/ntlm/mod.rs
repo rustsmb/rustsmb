@@ -75,6 +75,9 @@ impl NtlmFlags {
     pub const NEGOTIATE_UNICODE: u32 = 0x00000001;
 
     /// Default flags for server.
+    ///
+    /// Includes NEGOTIATE_SIGN and NEGOTIATE_ALWAYS_SIGN which are required
+    /// for SPNEGO MIC (Message Integrity Check) to work properly.
     pub fn server_default() -> Self {
         Self(
             Self::NEGOTIATE_UNICODE
@@ -85,7 +88,10 @@ impl NtlmFlags {
                 | Self::NEGOTIATE_128
                 | Self::NEGOTIATE_56
                 | Self::NEGOTIATE_KEY_EXCH
-                | Self::REQUEST_TARGET,
+                | Self::REQUEST_TARGET
+                | Self::NEGOTIATE_SIGN
+                | Self::NEGOTIATE_ALWAYS_SIGN
+                | Self::NEGOTIATE_VERSION,
         )
     }
 

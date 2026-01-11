@@ -77,6 +77,7 @@ impl AuthProvider for SimpleAuthProvider {
                     return Ok(AuthResult::Success {
                         user: UserInfo::guest(),
                         session_key: vec![0; 16],
+                        response_token: None,
                     });
                 }
                 return Err(AuthError::InvalidCredentials);
@@ -98,7 +99,11 @@ impl AuthProvider for SimpleAuthProvider {
                         let hash = hasher.finish();
                         hash.to_le_bytes().repeat(2)
                     };
-                    Ok(AuthResult::Success { user, session_key })
+                    Ok(AuthResult::Success {
+                        user,
+                        session_key,
+                        response_token: None,
+                    })
                 }
                 None => {
                     context.state = AuthState::Failed;

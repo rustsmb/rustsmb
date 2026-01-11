@@ -239,6 +239,54 @@ pub fn generate_challenge() -> [u8; 8] {
     challenge
 }
 
+/// RC4 stream cipher (used for session key exchange).
+///
+/// RC4 is symmetric, so this function works for both encryption and decryption.
+pub fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+    // Key-scheduling algorithm (KSA)
+    let mut s: [u8; 256] = [0; 256];
+    for i in 0..256 {
+        s[i] = i as u8;
+    }
+
+    let mut j: usize = 0;
+    for i in 0..256 {
+        j = (j + s[i] as usize + key[i % key.len()] as usize) % 256;
+        s.swap(i, j);
+    }
+
+    // Pseudo-random generation algorithm (PRGA)
+    let mut i: usize = 0;
+    j = 0;
+    let mut result = Vec::with_capacity(data.len());
+
+    for &byte in data {
+        i = (i + 1) % 256;
+        j = (j + s[i] as usize) % 256;
+        s.swap(i, j);
+        let k = s[(s[i] as usize + s[j] as usize) % 256];
+        result.push(byte ^ k);
+    }
+
+    result
+}
+
+/// Decrypt the encrypted session key using RC4.
+///
+/// When NEGOTIATE_KEY_EXCH is set, the client generates a random session key,
+/// encrypts it with RC4 using the session base key, and sends it.
+/// This function decrypts it to get the actual session key.
+pub fn decrypt_session_key(session_base_key: &[u8; 16], encrypted_key: &[u8]) -> Option<[u8; 16]> {
+    if encrypted_key.len() != 16 {
+        return None;
+    }
+
+    let decrypted = rc4(session_base_key, encrypted_key);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&decrypted);
+    Some(key)
+}
+
 /// Compute LMv2 response.
 ///
 /// LMv2 response is simpler: HMAC_MD5(ntowf, ServerChallenge || ClientChallenge)

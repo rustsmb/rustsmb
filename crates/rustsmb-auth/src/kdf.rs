@@ -30,7 +30,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// SMB 3.0 key labels.
+/// SMB 3.0 key labels (WITHOUT null terminator - KDF adds 0x00 separator).
 pub mod labels {
     /// Label for SMB 3.0 signing key.
     pub const SMB2_SIGNING: &[u8] = b"SMB2AESCMAC";
@@ -54,7 +54,7 @@ pub mod labels {
     pub const SMB2_APP_KEY_311: &[u8] = b"SMBAppKey";
 }
 
-/// SMB 3.0 context strings.
+/// SMB 3.0 context strings (WITHOUT null terminator - KDF adds 0x00 separator).
 pub mod contexts {
     /// Context for signing key.
     pub const SIGN: &[u8] = b"SmbSign";

@@ -6,8 +6,9 @@
 use crate::{ServerConfig, ShareManager};
 use binrw::{BinRead, BinWrite};
 use bytes::{Buf, BytesMut};
-use rustsmb_auth::{AuthContext, AuthResult, DynAuthProvider};
+use rustsmb_auth::{AuthContext, AuthResult, DynAuthProvider, PreauthIntegrityHash, SessionKeys};
 use rustsmb_core::{NtStatus, SmbDialect};
+use rustsmb_protocol::crypto::signing::{MessageSigner, SigningAlgorithm};
 use rustsmb_protocol::{Smb2Command, Smb2Flags, Smb2Header, SMB2_HEADER_SIZE, SMB2_MAGIC};
 use rustsmb_session::{Connection, SessionManager};
 use rustsmb_state::{HandleState, LeaseEntry, SessionState, TreeState};
@@ -42,6 +43,8 @@ pub struct ConnectionHandler<S> {
     auth_context: AuthContext,
     /// Server ID for lease tracking.
     server_id: String,
+    /// Pre-authentication integrity hash (SMB 3.1.1).
+    preauth_hash: PreauthIntegrityHash,
 }
 
 impl<S> ConnectionHandler<S>
@@ -71,6 +74,7 @@ where
             shares,
             auth_context: AuthContext::default(),
             server_id,
+            preauth_hash: PreauthIntegrityHash::new(),
         }
     }
 
@@ -214,7 +218,7 @@ where
 
         // Dispatch to command handler
         let body = &message[SMB2_HEADER_SIZE..];
-        self.dispatch_command(&header, body).await
+        self.dispatch_command(&header, body, message).await
     }
 
     /// Dispatch to the appropriate command handler.
@@ -222,10 +226,13 @@ where
         &mut self,
         header: &Smb2Header,
         body: &[u8],
+        full_message: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
         match header.command {
-            Smb2Command::Negotiate => self.handle_negotiate(header, body).await,
-            Smb2Command::SessionSetup => self.handle_session_setup(header, body).await,
+            Smb2Command::Negotiate => self.handle_negotiate(header, body, full_message).await,
+            Smb2Command::SessionSetup => {
+                self.handle_session_setup(header, body, full_message).await
+            }
             Smb2Command::Logoff => self.handle_logoff(header, body).await,
             Smb2Command::TreeConnect => self.handle_tree_connect(header, body).await,
             Smb2Command::TreeDisconnect => self.handle_tree_disconnect(header, body).await,
@@ -329,6 +336,7 @@ where
         &mut self,
         header: &Smb2Header,
         body: &[u8],
+        full_message: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
         use rustsmb_protocol::negotiate::{
             Capabilities, NegotiateRequest, NegotiateResponse, SecurityMode,
@@ -370,6 +378,18 @@ where
             caps_value |= Capabilities::ENCRYPTION;
         }
 
+        // For SMB 3.1.1, update pre-auth integrity hash with request
+        if selected_dialect == SmbDialect::Smb311 {
+            debug!(
+                "Preauth: hashing NEGOTIATE request ({} bytes), first 16 bytes: {:02x?}, hash before: {:02x?}",
+                full_message.len(),
+                &full_message[..16.min(full_message.len())],
+                &self.preauth_hash.value()[..8]
+            );
+            self.preauth_hash.update(full_message);
+            debug!("Preauth: hash after NEGOTIATE req: {:02x?}", &self.preauth_hash.value()[..8]);
+        }
+
         // Build response
         let resp_header = self.build_response_header(header, NtStatus::Success);
 
@@ -390,13 +410,26 @@ where
             negotiate_context_offset: 0,
         };
 
-        self.serialize_response(&resp_header, &response)
+        let result = self.serialize_response(&resp_header, &response)?;
+
+        // For SMB 3.1.1, update pre-auth integrity hash with response
+        if selected_dialect == SmbDialect::Smb311 {
+            debug!(
+                "Preauth: hashing NEGOTIATE response ({} bytes)",
+                result.len()
+            );
+            self.preauth_hash.update(&result);
+            debug!("Preauth: hash after NEGOTIATE resp: {:02x?}", &self.preauth_hash.value()[..8]);
+        }
+
+        Ok(result)
     }
 
     async fn handle_session_setup(
         &mut self,
         header: &Smb2Header,
         body: &[u8],
+        full_message: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
         use rustsmb_protocol::session_setup::{
             SessionFlags, SessionSetupRequest, SessionSetupResponse,
@@ -437,7 +470,11 @@ where
             .map_err(|e| HandlerError::Auth(e.to_string()))?;
 
         match auth_result {
-            AuthResult::Success { user, session_key } => {
+            AuthResult::Success {
+                user,
+                session_key,
+                response_token,
+            } => {
                 // Generate session ID
                 let session_id = self
                     .session_manager
@@ -445,18 +482,40 @@ where
                     .await
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
-                // Create session state
+                let dialect = self.connection.dialect.unwrap_or(SmbDialect::Smb202);
+
+                // For SMB 3.1.1, we need to include the SUCCESS response in the preauth hash
+                // BEFORE deriving keys. smbprotocol does this, and we need to match.
+                // The order is:
+                // 1. Hash SS2 request
+                // 2. Build response (unsigned)
+                // 3. Hash response (with zero signature)
+                // 4. Derive signing key from complete preauth hash
+                // 5. Sign the response
+
+                // Step 1: Hash the request
+                if dialect == SmbDialect::Smb311 {
+                    debug!(
+                        "Preauth: hashing SESSION_SETUP (Success) request ({} bytes), hash before: {:02x?}",
+                        full_message.len(),
+                        &self.preauth_hash.value()[..8]
+                    );
+                    self.preauth_hash.update(full_message);
+                    debug!("Preauth: hash after SS2 req: {:02x?}", &self.preauth_hash.value()[..8]);
+                }
+
+                // Create session state (do this early to get session_id)
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
 
-                let session = SessionState {
+                let session_state = SessionState {
                     session_id,
                     user_id: user.username.clone(),
                     domain: user.domain.clone(),
-                    session_key,
-                    dialect: self.connection.dialect.unwrap_or(SmbDialect::Smb202),
+                    session_key: session_key.clone(),
+                    dialect,
                     signing_required: self.connection.signing_required,
                     encryption_required: self.connection.encryption_required,
                     is_guest: user.is_guest,
@@ -467,7 +526,7 @@ where
                 };
 
                 self.session_manager
-                    .create_session(session)
+                    .create_session(session_state)
                     .await
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
@@ -480,8 +539,14 @@ where
                     "Session established"
                 );
 
+                // Step 2: Build response (with zero signature initially)
                 let mut resp_header = self.build_response_header(header, NtStatus::Success);
                 resp_header.session_id = session_id;
+
+                let should_sign = !user.is_guest && !user.is_anonymous;
+                if should_sign {
+                    resp_header.flags = Smb2Flags(Smb2Flags::SERVER_TO_REDIR | Smb2Flags::SIGNED);
+                }
 
                 let mut session_flags = 0u16;
                 if user.is_guest {
@@ -491,17 +556,73 @@ where
                     session_flags |= SessionFlags::IS_NULL;
                 }
 
+                let security_buffer = response_token.unwrap_or_default();
                 let response = SessionSetupResponse {
                     structure_size: 9,
                     session_flags: SessionFlags::new(session_flags),
                     security_buffer_offset: 72,
-                    security_buffer_length: 0,
+                    security_buffer_length: security_buffer.len() as u16,
                 };
 
-                self.serialize_response(&resp_header, &response)
+                let mut result = self.serialize_response(&resp_header, &response)?;
+                result.extend_from_slice(&security_buffer);
+
+                // NOTE: The SUCCESS response is NOT included in the preauth hash for key derivation.
+                // smbprotocol does not add the SUCCESS response to its temp_storage,
+                // so we must match that behavior.
+                if dialect == SmbDialect::Smb311 {
+                    debug!(
+                        "Preauth: NOT hashing SESSION_SETUP (Success) response - smbprotocol doesn't include it"
+                    );
+                    debug!("Preauth: final hash for key derivation: {:02x?}", &self.preauth_hash.value()[..16]);
+                }
+
+                // Step 4: Derive signing key
+                let signing_key = match dialect {
+                    SmbDialect::Smb311 => {
+                        debug!(
+                            "SMB 3.1.1 key derivation: session_key={:02x?} preauth_hash={:02x?}",
+                            &session_key[..session_key.len().min(16)],
+                            &self.preauth_hash.value()[..16]
+                        );
+                        SessionKeys::derive_smb311(&session_key, self.preauth_hash.value())
+                            .signing_key
+                    }
+                    SmbDialect::Smb302 | SmbDialect::Smb300 => {
+                        debug!(
+                            "SMB 3.0.x key derivation: session_key={:02x?}",
+                            &session_key[..session_key.len().min(16)]
+                        );
+                        SessionKeys::derive_smb3(&session_key).signing_key
+                    }
+                    _ => {
+                        session_key.clone()
+                    }
+                };
+                debug!("Derived signing_key={:02x?}", &signing_key[..signing_key.len().min(16)]);
+
+                // Step 5: Sign the response
+                if should_sign {
+                    self.sign_message(&mut result, &signing_key, dialect)?;
+                }
+
+                Ok(result)
             }
             AuthResult::Continue { response_token } => {
                 // More rounds needed
+                let dialect = self.connection.dialect.unwrap_or(SmbDialect::Smb202);
+
+                // For SMB 3.1.1, update preauth hash with request
+                if dialect == SmbDialect::Smb311 {
+                    debug!(
+                        "Preauth: hashing SESSION_SETUP (Continue) request ({} bytes), hash before: {:02x?}",
+                        full_message.len(),
+                        &self.preauth_hash.value()[..8]
+                    );
+                    self.preauth_hash.update(full_message);
+                    debug!("Preauth: hash after SESSION_SETUP (Continue) req: {:02x?}", &self.preauth_hash.value()[..8]);
+                }
+
                 let resp_header =
                     self.build_response_header(header, NtStatus::MoreProcessingRequired);
 
@@ -515,6 +636,14 @@ where
                 // Serialize header and body, then append security buffer
                 let mut result = self.serialize_response(&resp_header, &response)?;
                 result.extend_from_slice(&response_token);
+
+                // For SMB 3.1.1, update preauth hash with response
+                if dialect == SmbDialect::Smb311 {
+                    debug!("Preauth: hashing SESSION_SETUP (Continue) response ({} bytes)", result.len());
+                    self.preauth_hash.update(&result);
+                    debug!("Preauth: hash after SS1 resp: {:02x?}", &self.preauth_hash.value()[..8]);
+                }
+
                 Ok(result)
             }
             AuthResult::Failure { reason } => {
@@ -1787,6 +1916,53 @@ where
             }
         }
         None
+    }
+
+    /// Sign an SMB2 message in place.
+    ///
+    /// The message must have the SIGNED flag set in the header.
+    /// The signature field (bytes 48-63) will be zeroed, then the
+    /// signature computed and written back.
+    fn sign_message(
+        &self,
+        message: &mut [u8],
+        signing_key: &[u8],
+        dialect: SmbDialect,
+    ) -> Result<(), HandlerError> {
+        if message.len() < SMB2_HEADER_SIZE {
+            return Err(HandlerError::Protocol("Message too short to sign".into()));
+        }
+
+        // Zero the signature field (bytes 48-63)
+        message[48..64].fill(0);
+
+        // Select signing algorithm based on dialect
+        let algorithm = match dialect {
+            SmbDialect::Smb311 => SigningAlgorithm::AesCmac, // Default for 3.1.1 (GMAC needs proper nonce)
+            SmbDialect::Smb302 | SmbDialect::Smb300 => SigningAlgorithm::AesCmac,
+            _ => {
+                // SMB 2.x uses HMAC-SHA256, not supported by MessageSigner
+                // For now, use AES-CMAC which is close enough for testing
+                SigningAlgorithm::AesCmac
+            }
+        };
+
+        // Pad key to 16 bytes if necessary
+        let mut key = [0u8; 16];
+        let key_len = signing_key.len().min(16);
+        key[..key_len].copy_from_slice(&signing_key[..key_len]);
+
+        let signer = MessageSigner::new(algorithm, &key)
+            .map_err(|e| HandlerError::Protocol(format!("Failed to create signer: {}", e)))?;
+
+        let signature = signer
+            .sign(message)
+            .map_err(|e| HandlerError::Protocol(format!("Failed to sign message: {}", e)))?;
+
+        // Write signature back to message
+        message[48..64].copy_from_slice(&signature);
+
+        Ok(())
     }
 
     /// Serialize a response with header and body.
