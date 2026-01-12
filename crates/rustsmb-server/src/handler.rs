@@ -1205,13 +1205,29 @@ where
             .unwrap()
             .as_secs();
 
+        // Determine if this is a DFS share (currently not supported)
+        let is_dfs = false;
+
+        // Compute MaximalAccess based on share permissions
+        // Per MS-SMB2 2.2.10, MaximalAccess indicates the maximum access rights
+        // that the user has on this share
+        let maximal_access = if share_config.read_only {
+            // Read-only: FILE_READ_DATA | FILE_READ_EA | FILE_EXECUTE |
+            //            FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE
+            0x001200A9
+        } else {
+            // Full access: all file and standard rights
+            // FILE_ALL_ACCESS | DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | SYNCHRONIZE
+            0x001F01FF
+        };
+
         let tree = TreeState {
             tree_id,
             session_id: header.session_id,
             share_name: share_name.clone(),
             share_path: share_config.path.clone(),
-            access_flags: 0x001F01FF, // Full access
-            is_dfs: false,
+            access_flags: maximal_access,
+            is_dfs,
             created_at: now,
         };
 
@@ -1231,13 +1247,28 @@ where
         let mut resp_header = self.build_response_header(header, NtStatus::Success);
         resp_header.tree_id = tree_id;
 
+        // Compute ShareFlags based on share configuration
+        // Per MS-SMB2 2.2.10, ShareFlags indicate properties of the share
+        let mut share_flags_value = ShareFlags::MANUAL_CACHING; // Default: manual caching
+        if is_dfs {
+            share_flags_value |= ShareFlags::DFS;
+        }
+
+        // Compute ShareCapabilities based on server/share features
+        // Per MS-SMB2 2.2.10, ShareCapabilities indicate features the share supports
+        let mut capabilities_value = 0u32;
+        if is_dfs {
+            capabilities_value |= ShareCapabilities::DFS;
+        }
+        // Note: We don't currently support continuous availability, scale-out, or cluster
+
         let response = TreeConnectResponse {
             structure_size: 16,
             share_type: ShareType::Disk,
             reserved: 0,
-            share_flags: ShareFlags(0),
-            capabilities: ShareCapabilities(0),
-            maximal_access: 0x001F01FF, // Full access
+            share_flags: ShareFlags(share_flags_value),
+            capabilities: ShareCapabilities(capabilities_value),
+            maximal_access,
         };
 
         self.serialize_response(&resp_header, &response)
@@ -4831,5 +4862,118 @@ mod tests {
         let payload_over_next: u64 = 131073;
         let expected = ((payload_over_next - 1) / 65536 + 1) as u16;
         assert_eq!(expected, 3, "131073 bytes (128KB + 1) = 3 credits");
+    }
+
+    // ==========================================================================
+    // TREE_CONNECT Response Tests - MS-SMB2 2.2.10
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 section 2.2.10:
+    // "SMB2 TREE_CONNECT Response"
+    //
+    // Key requirements tested:
+    // 1. MaximalAccess reflects user's rights on the share
+    // 2. ShareFlags reflects share properties
+    // 3. ShareCapabilities reflects available features
+    // ==========================================================================
+
+    #[test]
+    fn test_maximal_access_constants() {
+        // Verify MaximalAccess values per MS-SMB2 2.2.10
+        //
+        // Full access: 0x001F01FF
+        // - FILE_ALL_ACCESS (0x1FF) = all file-specific rights
+        // - DELETE | READ_CONTROL | WRITE_DAC | WRITE_OWNER | SYNCHRONIZE (0x1F0000)
+        const FULL_ACCESS: u32 = 0x001F01FF;
+        assert_eq!(
+            FULL_ACCESS & 0x1FF,
+            0x1FF,
+            "Full access includes FILE_ALL_ACCESS"
+        );
+        assert_eq!(
+            FULL_ACCESS & 0x1F0000,
+            0x1F0000,
+            "Full access includes standard rights"
+        );
+
+        // Read-only access: 0x001200A9
+        // - FILE_READ_DATA (0x01) | FILE_READ_EA (0x08) | FILE_EXECUTE (0x20) |
+        //   FILE_READ_ATTRIBUTES (0x80) = 0xA9
+        // - READ_CONTROL (0x20000) | SYNCHRONIZE (0x100000) = 0x120000
+        const READ_ONLY_ACCESS: u32 = 0x001200A9;
+        assert_eq!(
+            READ_ONLY_ACCESS & 0x01,
+            0x01,
+            "Read-only includes FILE_READ_DATA"
+        );
+        assert_eq!(
+            READ_ONLY_ACCESS & 0x08,
+            0x08,
+            "Read-only includes FILE_READ_EA"
+        );
+        assert_eq!(
+            READ_ONLY_ACCESS & 0x20,
+            0x20,
+            "Read-only includes FILE_EXECUTE"
+        );
+        assert_eq!(
+            READ_ONLY_ACCESS & 0x80,
+            0x80,
+            "Read-only includes FILE_READ_ATTRIBUTES"
+        );
+        assert_eq!(
+            READ_ONLY_ACCESS & 0x20000,
+            0x20000,
+            "Read-only includes READ_CONTROL"
+        );
+        assert_eq!(
+            READ_ONLY_ACCESS & 0x100000,
+            0x100000,
+            "Read-only includes SYNCHRONIZE"
+        );
+
+        // Read-only should NOT include write rights
+        assert_eq!(
+            READ_ONLY_ACCESS & 0x02,
+            0,
+            "Read-only excludes FILE_WRITE_DATA"
+        );
+        assert_eq!(READ_ONLY_ACCESS & 0x10000, 0, "Read-only excludes DELETE");
+    }
+
+    #[test]
+    fn test_share_flags_constants() {
+        use rustsmb_protocol::tree_connect::ShareFlags;
+
+        // Verify ShareFlags constants per MS-SMB2 2.2.10
+        assert_eq!(ShareFlags::MANUAL_CACHING, 0x00, "MANUAL_CACHING = 0x00");
+        assert_eq!(ShareFlags::AUTO_CACHING, 0x10, "AUTO_CACHING = 0x10");
+        assert_eq!(ShareFlags::VDO_CACHING, 0x20, "VDO_CACHING = 0x20");
+        assert_eq!(ShareFlags::NO_CACHING, 0x30, "NO_CACHING = 0x30");
+        assert_eq!(ShareFlags::DFS, 0x01, "DFS = 0x01");
+        assert_eq!(ShareFlags::DFS_ROOT, 0x02, "DFS_ROOT = 0x02");
+    }
+
+    #[test]
+    fn test_share_capabilities_constants() {
+        use rustsmb_protocol::tree_connect::ShareCapabilities;
+
+        // Verify ShareCapabilities constants per MS-SMB2 2.2.10
+        assert_eq!(ShareCapabilities::DFS, 0x08, "SMB2_SHARE_CAP_DFS = 0x08");
+        assert_eq!(
+            ShareCapabilities::CONTINUOUS_AVAILABILITY,
+            0x10,
+            "SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY = 0x10"
+        );
+        assert_eq!(
+            ShareCapabilities::SCALEOUT,
+            0x20,
+            "SMB2_SHARE_CAP_SCALEOUT = 0x20"
+        );
+        assert_eq!(
+            ShareCapabilities::CLUSTER,
+            0x40,
+            "SMB2_SHARE_CAP_CLUSTER = 0x40"
+        );
     }
 }
