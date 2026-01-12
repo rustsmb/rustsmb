@@ -90,7 +90,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build smbtorture Docker image
-        run: docker build -f tests/Dockerfile.smbtorture -t rustsmb-smbtorture .
+        run: |
+          docker build -f tests/Dockerfile.smbtorture \
+            --build-context scripts=tests/scripts \
+            -t rustsmb-smbtorture .
       - name: Run smbtorture tests
         run: docker run --rm rustsmb-smbtorture all
 

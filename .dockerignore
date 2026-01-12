@@ -20,7 +20,7 @@ docs/
 *.md
 !README.md
 
-# Tests (not needed for server build)
+# Tests and benchmarks (not needed for server build)
 tests/
 benches/
 

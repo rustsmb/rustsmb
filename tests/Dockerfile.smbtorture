@@ -4,8 +4,10 @@
 #   - Stage 1 (builder): Compiles RustSMB binary
 #   - Stage 2 (runtime): Runs smbtorture tests
 #
-# Build:
-#   docker build -f tests/Dockerfile.smbtorture -t rustsmb-smbtorture .
+# Build (requires --build-context for test scripts):
+#   docker build -f tests/Dockerfile.smbtorture \
+#     --build-context scripts=tests/scripts \
+#     -t rustsmb-smbtorture .
 #
 # Run (runs smbtorture tests):
 #   docker run --rm rustsmb-smbtorture
