@@ -540,7 +540,8 @@ Fix all failing smbtorture tests by implementing missing SMB2 functionality per 
   - Compute MaximalAccess based on share read_only config
   - Set ShareFlags based on share properties (DFS support)
   - Set ShareCapabilities based on available features
-- [ ] Phase 16C: Fix smb2.read (MinimumCount validation)
+- [x] Phase 16C: Fix smb2.read (MinimumCount validation per MS-SMB2 3.3.5.14)
+  - Return STATUS_END_OF_FILE when read returns less than MinimumCount at EOF
 - [ ] Phase 16D: Fix smb2.getinfo (InfoType routing, more info classes)
 - [ ] Phase 16E: Fix smb2.setinfo (implement actual SET_INFO handler)
 - [ ] Phase 16F: Fix smb2.create (create contexts, CreateAction values)
