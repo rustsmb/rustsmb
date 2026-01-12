@@ -12,7 +12,7 @@ use rustsmb_protocol::crypto::signing::{MessageSigner, SigningAlgorithm};
 use rustsmb_protocol::{Smb2Command, Smb2Flags, Smb2Header, SMB2_HEADER_SIZE, SMB2_MAGIC};
 use rustsmb_session::{Connection, SessionManager};
 use rustsmb_state::{HandleState, LeaseEntry, SessionState, TreeState};
-use rustsmb_vfs::{CreateParams, FileType};
+use rustsmb_vfs::{CreateParams, FileHandle, FileLock, FileType, LockType};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -1329,6 +1329,17 @@ where
         let request = CreateRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse create: {}", e)))?;
 
+        // Validate impersonation level (MS-SMB2 3.3.5.9)
+        // Valid values are 0 (Anonymous), 1 (Identification), 2 (Impersonation), 3 (Delegation)
+        if request.impersonation_level > 3 {
+            debug!(
+                conn_id = self.connection.id,
+                impersonation = request.impersonation_level,
+                "Invalid impersonation level"
+            );
+            return Err(HandlerError::Status(NtStatus::BadImpersonationLevel));
+        }
+
         // Parse filename from after the fixed structure
         let name_offset = request.name_offset as usize;
         let name_len = request.name_length as usize;
@@ -1341,6 +1352,17 @@ where
         };
 
         let filename = decode_utf16le(name_bytes);
+
+        // Validate path (MS-SMB2 3.3.5.9) - paths starting with / or \ are invalid
+        // The path should be relative to the share root
+        if filename.starts_with('/') || filename.starts_with('\\') {
+            debug!(
+                conn_id = self.connection.id,
+                path = %filename,
+                "Path starts with leading slash"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
 
         // Parse CREATE contexts if present
         let contexts = if request.create_contexts_length > 0 {
@@ -1564,10 +1586,17 @@ where
         let mut requested_oplock = request.requested_oplock_level;
         let mut lease_key: Option<[u8; 16]> = None;
         let mut lease_state: u32 = 0;
+        let mut requested_allocation_size: u64 = 0;
+        let mut query_maximal_access = false;
 
         for ctx in &contexts {
             match ctx {
                 CreateContext::DurableHandleRequest => {
+                    // Mark as durable request; actual grant depends on oplock/lease
+                    // Per MS-SMB2 3.3.5.9.7, durable handles require:
+                    // - Batch oplock (without lease), OR
+                    // - Lease with handle caching component (0x02)
+                    // We check this after parsing all contexts
                     is_durable = true;
                     debug!(
                         conn_id = self.connection.id,
@@ -1635,8 +1664,42 @@ where
                         "Lease V2 requested"
                     );
                 }
+                CreateContext::AllocationSize { allocation_size } => {
+                    requested_allocation_size = *allocation_size;
+                    debug!(
+                        conn_id = self.connection.id,
+                        allocation_size, "Allocation size context"
+                    );
+                }
+                CreateContext::QueryMaximalAccess { .. } => {
+                    query_maximal_access = true;
+                    debug!(
+                        conn_id = self.connection.id,
+                        "Query maximal access requested"
+                    );
+                }
                 _ => {}
             }
+        }
+
+        // MS-SMB2 3.3.5.9.7: Check if durable handle can actually be granted
+        // Without a lease: requires OplockLevel::Batch
+        // With a lease: requires handle caching component (0x02)
+        if is_durable && lease_key.is_none() && requested_oplock != OplockLevel::Batch {
+            // Cannot grant durable handle without Batch oplock
+            is_durable = false;
+            debug!(
+                conn_id = self.connection.id,
+                oplock_level = ?requested_oplock,
+                "Cannot grant durable handle: requires Batch oplock without lease"
+            );
+        } else if is_durable && lease_key.is_some() && (lease_state & 0x02) == 0 {
+            // Cannot grant durable handle without handle caching in lease
+            is_durable = false;
+            debug!(
+                conn_id = self.connection.id,
+                lease_state, "Cannot grant durable handle: requires handle caching in lease"
+            );
         }
 
         // Generate create GUID if durable but client didn't provide one
@@ -1791,6 +1854,14 @@ where
             ctx_builder = ctx_builder.add_lease_response(key, granted_lease_state, 0);
         }
 
+        // Add maximal access response if requested (MxAc)
+        if query_maximal_access {
+            // Full access for authenticated users (this is simplified)
+            // FILE_ALL_ACCESS = 0x001F01FF
+            ctx_builder =
+                ctx_builder.add_maximal_access_response(NtStatus::Success.code(), 0x001F01FF);
+        }
+
         let ctx_data = ctx_builder.build();
         let (ctx_offset, ctx_len) = if ctx_data.is_empty() {
             (0u32, 0u32)
@@ -1800,6 +1871,9 @@ where
             // But CreateResponse structure_size is 89 which includes variable parts
             (152u32, ctx_data.len() as u32)
         };
+
+        // Get file metadata for response attributes and sizes
+        let file_metadata = backend.stat(&filename).await.ok();
 
         // Determine file_attributes for response
         // Per MS-SMB2: FILE_ATTRIBUTE_ARCHIVE (0x20) should be set for new files
@@ -1816,9 +1890,8 @@ where
             }
         } else {
             // FILE_OPENED/OVERWRITTEN/SUPERSEDED - get actual file attributes
-            backend
-                .stat(&filename)
-                .await
+            file_metadata
+                .as_ref()
                 .map(|m| {
                     // Convert file type to SMB attributes
                     let mut attrs = 0x20u32; // FILE_ATTRIBUTE_ARCHIVE
@@ -1833,6 +1906,35 @@ where
                 .unwrap_or(0x20) // Default to ARCHIVE if stat fails
         };
 
+        // Determine allocation_size for response
+        // If client requested allocation_size via context, use it (rounded up to 4KB block)
+        // Otherwise use actual file allocation or 0 for new files
+        // Note: Directories should return 0 regardless of requested allocation size
+        let is_directory = (response_file_attributes & 0x10) != 0; // FILE_ATTRIBUTE_DIRECTORY
+        let response_allocation_size = if is_directory {
+            // Directories always have 0 allocation size per MS-SMB2
+            0
+        } else if requested_allocation_size > 0 {
+            // Round up to 4KB block boundary (common filesystem block size)
+            ((requested_allocation_size + 4095) / 4096) * 4096
+        } else {
+            file_metadata
+                .as_ref()
+                .map(|m| {
+                    // Allocation size is typically size rounded up to block size
+                    // For new/empty files, return 0
+                    if m.size > 0 {
+                        ((m.size + 4095) / 4096) * 4096
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0)
+        };
+
+        // Get end_of_file (actual file size)
+        let response_end_of_file = file_metadata.as_ref().map(|m| m.size).unwrap_or(0);
+
         let response = CreateResponse {
             structure_size: 89,
             oplock_level: requested_oplock,
@@ -1842,8 +1944,8 @@ where
             last_access_time: current_filetime(),
             last_write_time: current_filetime(),
             change_time: current_filetime(),
-            allocation_size: 0,
-            end_of_file: 0,
+            allocation_size: response_allocation_size,
+            end_of_file: response_end_of_file,
             file_attributes: response_file_attributes,
             reserved2: 0,
             file_id_persistent,
@@ -2319,13 +2421,169 @@ where
     async fn handle_lock(
         &mut self,
         header: &Smb2Header,
-        _body: &[u8],
+        body: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
-        use rustsmb_protocol::lock::LockResponse;
+        use rustsmb_protocol::lock::{LockElement, LockRequest, LockResponse};
 
         debug!(conn_id = self.connection.id, "LOCK request");
 
-        // Simplified: just acknowledge
+        // Parse request
+        let request = LockRequest::read(&mut Cursor::new(body))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to parse LOCK: {}", e)))?;
+
+        // MS-SMB2 3.3.5.14: If LockCount is 0, return INVALID_PARAMETER
+        if request.lock_count == 0 {
+            debug!(conn_id = self.connection.id, "LOCK failed: LockCount is 0");
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Validate handle
+        let handle_id =
+            ((request.file_id_volatile as u128) << 64) | (request.file_id_persistent as u128);
+
+        // MS-SMB2 3.3.5.14: If the FileId is not found, return STATUS_FILE_CLOSED
+        let handle = self
+            .session_manager
+            .get_handle(handle_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::FileClosed))?;
+
+        // Validate handle belongs to this session
+        if handle.session_id != header.session_id {
+            return Err(HandlerError::Status(NtStatus::FileClosed));
+        }
+
+        // Parse lock elements
+        let lock_elements_offset = 24; // LockRequest fixed part is 24 bytes
+        let mut locks = Vec::with_capacity(request.lock_count as usize);
+        for i in 0..request.lock_count as usize {
+            let elem_start = lock_elements_offset + i * 24; // Each LockElement is 24 bytes
+            if elem_start + 24 > body.len() {
+                return Err(HandlerError::Status(NtStatus::InvalidParameter));
+            }
+            let elem = LockElement::read(&mut Cursor::new(&body[elem_start..])).map_err(|e| {
+                HandlerError::Protocol(format!("Failed to parse LockElement: {}", e))
+            })?;
+            locks.push(elem);
+        }
+
+        // Get backend for file locking
+        let tree = self
+            .session_manager
+            .get_tree(header.session_id, handle.tree_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::NetworkNameDeleted))?;
+
+        let backend = self
+            .shares
+            .get_share(&tree.share_name)
+            .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
+
+        let file_handle = FileHandle {
+            id: handle_id as u64,
+            persistent_id: handle_id,
+            volatile_id: handle_id,
+        };
+
+        // Process each lock
+        for lock in &locks {
+            let is_unlock = lock.flags.is_unlock();
+            let is_shared = lock.flags.is_shared();
+            let is_exclusive = lock.flags.is_exclusive();
+
+            // MS-SMB2 3.3.5.14: Validate lock flags
+            // Must have exactly one of SHARED, EXCLUSIVE, or UNLOCK
+            if !is_unlock && !is_shared && !is_exclusive {
+                // No lock type specified
+                debug!(
+                    conn_id = self.connection.id,
+                    flags = lock.flags.0,
+                    "LOCK failed: no lock type specified"
+                );
+                return Err(HandlerError::Status(NtStatus::InvalidParameter));
+            }
+            if is_shared && is_exclusive {
+                // Cannot have both SHARED and EXCLUSIVE
+                debug!(
+                    conn_id = self.connection.id,
+                    flags = lock.flags.0,
+                    "LOCK failed: both SHARED and EXCLUSIVE specified"
+                );
+                return Err(HandlerError::Status(NtStatus::InvalidParameter));
+            }
+            if is_unlock && (is_shared || is_exclusive) {
+                // Cannot have UNLOCK with SHARED or EXCLUSIVE
+                debug!(
+                    conn_id = self.connection.id,
+                    flags = lock.flags.0,
+                    "LOCK failed: UNLOCK with SHARED or EXCLUSIVE"
+                );
+                return Err(HandlerError::Status(NtStatus::InvalidParameter));
+            }
+
+            // MS-SMB2 3.3.5.14: Validate lock range doesn't overflow
+            // Check if offset + length exceeds what the file system can represent (i64::MAX)
+            if lock.offset.checked_add(lock.length).is_none()
+                || lock.offset.saturating_add(lock.length) > i64::MAX as u64
+            {
+                debug!(
+                    conn_id = self.connection.id,
+                    offset = lock.offset,
+                    length = lock.length,
+                    "LOCK failed: lock range exceeds maximum"
+                );
+                return Err(HandlerError::Status(NtStatus::InvalidLockRange));
+            }
+
+            let lock_type = if is_exclusive {
+                LockType::Exclusive
+            } else {
+                LockType::Shared
+            };
+            let file_lock = FileLock {
+                lock_type,
+                start: lock.offset,
+                length: lock.length,
+                pid: 0, // SMB doesn't use PID for lock ownership
+            };
+
+            if is_unlock {
+                // Unlock operation
+                match backend.unlock(&file_handle, file_lock).await {
+                    Ok(_) => {}
+                    Err(VfsError::LockConflict) => {
+                        return Err(HandlerError::Status(NtStatus::InvalidLockRange));
+                    }
+                    Err(e) => {
+                        warn!(
+                            conn_id = self.connection.id,
+                            error = %e,
+                            "Unlock failed"
+                        );
+                        return Err(HandlerError::Vfs(e.to_string()));
+                    }
+                }
+            } else {
+                // Lock operation
+                match backend.lock(&file_handle, file_lock).await {
+                    Ok(_) => {}
+                    Err(VfsError::LockConflict) => {
+                        return Err(HandlerError::Status(NtStatus::FileLockConflict));
+                    }
+                    Err(e) => {
+                        warn!(
+                            conn_id = self.connection.id,
+                            error = %e,
+                            "Lock failed"
+                        );
+                        return Err(HandlerError::Vfs(e.to_string()));
+                    }
+                }
+            }
+        }
+
         let resp_header = self.build_response_header(header, NtStatus::Success);
         let response = LockResponse {
             structure_size: 4,

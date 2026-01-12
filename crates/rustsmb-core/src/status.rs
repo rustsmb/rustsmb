@@ -100,6 +100,10 @@ pub enum NtStatus {
     AccountLockedOut = 0xC0000234,
     /// Password expired.
     PasswordExpired = 0xC0000071,
+
+    // Impersonation errors
+    /// Bad impersonation level.
+    BadImpersonationLevel = 0xC00000A5,
 }
 
 impl NtStatus {
@@ -172,6 +176,7 @@ impl NtStatus {
             0xC0000072 => Self::AccountDisabled,
             0xC0000234 => Self::AccountLockedOut,
             0xC0000071 => Self::PasswordExpired,
+            0xC00000A5 => Self::BadImpersonationLevel,
             _ => return None,
         })
     }

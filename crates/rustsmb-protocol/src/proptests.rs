@@ -69,12 +69,12 @@ mod tests {
         ]
     }
 
-    fn arb_impersonation_level() -> impl Strategy<Value = ImpersonationLevel> {
+    fn arb_impersonation_level() -> impl Strategy<Value = u32> {
         prop_oneof![
-            Just(ImpersonationLevel::Anonymous),
-            Just(ImpersonationLevel::Identification),
-            Just(ImpersonationLevel::Impersonation),
-            Just(ImpersonationLevel::Delegation),
+            Just(0u32), // Anonymous
+            Just(1u32), // Identification
+            Just(2u32), // Impersonation
+            Just(3u32), // Delegation
         ]
     }
 

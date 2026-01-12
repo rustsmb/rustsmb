@@ -2,9 +2,9 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rustsmb_protocol::{
-    CreateOplockLevel, CreateRequest, CreateResponse, ImpersonationLevel, NegotiateRequest,
-    NegotiateResponse, ReadRequest, ReadResponse, Smb2Header, WriteRequest, WriteResponse,
-    SMB2_HEADER_SIZE, SMB2_MAGIC,
+    CreateOplockLevel, CreateRequest, CreateResponse, NegotiateRequest, NegotiateResponse,
+    ReadRequest, ReadResponse, Smb2Header, WriteRequest, WriteResponse, SMB2_HEADER_SIZE,
+    SMB2_MAGIC,
 };
 use std::io::Cursor;
 
@@ -82,7 +82,7 @@ fn benchmark_create_parse(c: &mut Criterion) {
         structure_size: 57,
         security_flags: 0,
         requested_oplock_level: CreateOplockLevel::Exclusive,
-        impersonation_level: ImpersonationLevel::Impersonation,
+        impersonation_level: 2, // Impersonation
         smb_create_flags: 0,
         reserved: 0,
         desired_access: 0x001F01FF,

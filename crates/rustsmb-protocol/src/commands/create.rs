@@ -33,8 +33,8 @@ pub struct CreateRequest {
     /// Requested oplock level.
     pub requested_oplock_level: OplockLevel,
 
-    /// Impersonation level.
-    pub impersonation_level: ImpersonationLevel,
+    /// Impersonation level (u32 for validation, valid values 0-3).
+    pub impersonation_level: u32,
 
     /// SMB2 create flags.
     pub smb_create_flags: u64,
@@ -78,7 +78,7 @@ impl Default for CreateRequest {
             structure_size: CREATE_REQUEST_SIZE,
             security_flags: 0,
             requested_oplock_level: OplockLevel::None,
-            impersonation_level: ImpersonationLevel::Impersonation,
+            impersonation_level: 2, // Impersonation
             smb_create_flags: 0,
             reserved: 0,
             desired_access: 0,
@@ -405,7 +405,7 @@ pub mod create_context_name {
     /// Durable handle reconnect (SMB 2.1).
     pub const DURABLE_HANDLE_RECONNECT: &[u8; 4] = b"DHnC";
     /// Allocation size.
-    pub const ALLOCATION_SIZE: &[u8; 4] = b"AISi";
+    pub const ALLOCATION_SIZE: &[u8; 4] = b"AlSi";
     /// Query maximal access.
     pub const QUERY_MAXIMAL_ACCESS: &[u8; 4] = b"MxAc";
     /// Timewarp token.
@@ -981,6 +981,8 @@ impl CreateContextBuilder {
             // Calculate sizes and offsets
             let name_offset = 16u16; // Right after header
             let name_len = name.len() as u16;
+            // Data offset is always calculated, even if data is empty
+            // This matches Windows client expectations (data_offset points past name+padding)
             let data_offset = ((16 + name.len() + 7) & !7) as u16; // 8-byte aligned
             let data_len = data.len() as u32;
 
