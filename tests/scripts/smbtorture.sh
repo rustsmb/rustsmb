@@ -217,12 +217,12 @@ if [ "$SUITE" = "all" ]; then
 
     for suite in "${SUITES[@]}"; do
         if run_suite "$suite"; then
-            ((PASSED++))
+            ((++PASSED))
         else
-            ((FAILED++))
+            ((++FAILED))
             FAILED_SUITES+=("$suite")
         fi
-        ((TOTAL++))
+        ((++TOTAL))
     done
 else
     # Run single suite
