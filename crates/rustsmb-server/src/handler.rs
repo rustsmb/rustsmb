@@ -256,16 +256,47 @@ where
         );
 
         // Validate session_id for commands that require it
-        if requires_session
-            && header.session_id != 0
-            && self
+        // Per MS-SMB2 3.3.5.2: "The server MUST look up the Session in Connection.SessionTable
+        // by using the SessionId in the SMB2 header of the request. If SessionId is not found
+        // in Connection.SessionTable, the server MUST fail the request with STATUS_USER_SESSION_DELETED."
+        if requires_session && header.session_id != 0 {
+            // First check: Is the session in THIS connection's session table?
+            // This is the Connection.SessionTable check per MS-SMB2.
+            let has_session = self.connection.has_session(header.session_id);
+            trace!(
+                conn_id = self.connection.id,
+                session_id = header.session_id,
+                has_session,
+                command = ?header.command,
+                "Session validation check"
+            );
+            if !has_session {
+                debug!(
+                    conn_id = self.connection.id,
+                    session_id = header.session_id,
+                    "Session not in Connection.SessionTable - returning USER_SESSION_DELETED"
+                );
+                return Err(HandlerError::Status(NtStatus::UserSessionDeleted));
+            }
+
+            // Second check: Does the session still exist in the global state store?
+            // This handles session expiration and cleanup.
+            if self
                 .session_manager
                 .get_session(header.session_id)
                 .await
                 .map_err(|e| HandlerError::Internal(e.to_string()))?
                 .is_none()
-        {
-            return Err(HandlerError::Status(NtStatus::UserSessionDeleted));
+            {
+                // Session was deleted from state store - remove from connection table
+                self.connection.remove_session(header.session_id);
+                debug!(
+                    conn_id = self.connection.id,
+                    session_id = header.session_id,
+                    "Session not in state store - returning USER_SESSION_DELETED"
+                );
+                return Err(HandlerError::Status(NtStatus::UserSessionDeleted));
+            }
         }
 
         // Commands that require a valid tree connection
@@ -516,11 +547,16 @@ where
             SessionFlags, SessionSetupRequest, SessionSetupResponse,
         };
 
-        debug!(conn_id = self.connection.id, "SESSION_SETUP request");
-
         // Parse request (fixed 25-byte structure)
         let request = SessionSetupRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse session_setup: {}", e)))?;
+
+        debug!(
+            conn_id = self.connection.id,
+            previous_session_id = request.previous_session_id,
+            is_binding = request.flags.is_binding(),
+            "SESSION_SETUP request"
+        );
 
         // Check for session binding request (HA failover)
         if request.flags.is_binding() {
@@ -624,6 +660,27 @@ where
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
                 self.connection.add_session(session_id);
+
+                // Per MS-SMB2 3.3.5.5.3: Session takeover when PreviousSessionId is set
+                // "If the PreviousSessionId field of the request is not equal to zero, the server
+                // MUST look up the previous session in GlobalSessionTable... If the session is found,
+                // the server SHOULD<293> delete the previous session."
+                //
+                // Only invalidate the specific session identified by PreviousSessionId, not all
+                // sessions for the user. This allows multiple concurrent sessions per user.
+                if request.previous_session_id != 0 && !user.is_guest && !user.is_anonymous {
+                    debug!(
+                        conn_id = self.connection.id,
+                        previous_session_id = request.previous_session_id,
+                        new_session_id = session_id,
+                        user = %user.username,
+                        "Session takeover: invalidating previous session"
+                    );
+                    let _ = self
+                        .session_manager
+                        .delete_session(request.previous_session_id)
+                        .await;
+                }
 
                 info!(
                     conn_id = self.connection.id,
