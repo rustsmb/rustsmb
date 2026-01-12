@@ -10,7 +10,6 @@
 //! Note: Requires smbclient/smbtorture to be installed.
 #![cfg(unix)]
 
-use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +21,9 @@ use rustsmb_backend_local::LocalBackend;
 use rustsmb_server::{ServerConfig, ShareConfig, SmbServer};
 use rustsmb_state_memory::MemoryStateStore;
 
+/// Fixed port for smbtorture testing.
+const TEST_PORT: u16 = 44445;
+
 /// Check if smbtorture is available on the system.
 fn has_smbtorture() -> bool {
     Command::new("smbtorture")
@@ -31,15 +33,6 @@ fn has_smbtorture() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-/// Find an available port for testing.
-fn find_available_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("Failed to bind to random port")
-        .local_addr()
-        .expect("Failed to get local address")
-        .port()
 }
 
 /// Test server context that manages lifecycle.
@@ -56,7 +49,7 @@ impl TestServer {
     /// Create a new test server with local filesystem backend.
     async fn new() -> Self {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let port = find_available_port();
+        let port = TEST_PORT;
 
         let config = ServerConfig {
             listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
