@@ -22,7 +22,7 @@ use rustsmb_server::{ServerConfig, ShareConfig, SmbServer};
 use rustsmb_state_memory::MemoryStateStore;
 
 /// Fixed port for smbtorture testing.
-const TEST_PORT: u16 = 44445;
+const TEST_PORT: u16 = 445;
 
 /// Check if smbtorture is available on the system.
 fn has_smbtorture() -> bool {
