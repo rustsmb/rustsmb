@@ -1,0 +1,18 @@
+# Build artifacts
+target/
+
+# Git
+.git/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker build cache
+.dockerignore

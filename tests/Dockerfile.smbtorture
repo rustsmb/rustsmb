@@ -1,0 +1,58 @@
+# Dockerfile for running smbtorture tests against RustSMB
+#
+# Build:
+#   docker build -f tests/Dockerfile.smbtorture -t rustsmb-smbtorture .
+#
+# Run (builds server and runs smbtorture tests):
+#   docker run --rm rustsmb-smbtorture
+#
+# Run specific test suite:
+#   docker run --rm rustsmb-smbtorture smb2.session
+#
+# Run with debug output:
+#   docker run --rm -e RUST_LOG=debug rustsmb-smbtorture
+
+FROM ubuntu:22.04
+
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    samba-testsuite \
+    smbclient \
+    protobuf-compiler \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Set working directory
+WORKDIR /app
+
+# Copy source code
+COPY . .
+
+# Build release binary
+RUN cargo build --release
+
+# Create test share directory
+RUN mkdir -p /tmp/share
+
+# Copy test runner script
+COPY tests/scripts/docker-smbtorture.sh /usr/local/bin/run-smbtorture
+RUN chmod +x /usr/local/bin/run-smbtorture
+
+# Default environment
+ENV RUST_LOG=info
+ENV SMB_PORT=445
+ENV SMB_SHARE=test
+
+# Run smbtorture tests
+ENTRYPOINT ["/usr/local/bin/run-smbtorture"]
+CMD ["all"]
