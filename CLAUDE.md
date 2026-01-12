@@ -283,6 +283,14 @@ make test      # Run all tests
 make clippy    # Run clippy
 make fmt       # Format code
 make ci        # Run fmt-check + clippy + test (full CI)
+
+# Run smbtorture tests (requires Docker)
+docker build -f tests/Dockerfile.smbtorture \
+  --build-context scripts=tests/scripts \
+  -t rustsmb-smbtorture .
+docker run --rm rustsmb-smbtorture              # Run all test suites
+docker run --rm rustsmb-smbtorture smb2.session # Run specific suite
+docker run --rm -e RUST_LOG=debug rustsmb-smbtorture smb2.connect  # With debug output
 ```
 
 ## Development Workflow
