@@ -460,6 +460,12 @@ where
             return self.handle_session_binding(header, &request).await;
         }
 
+        // Per MS-SMB2: SessionId == 0 means this is a NEW session, not a continuation
+        // We must reset auth_context to avoid reusing session_id from previous sessions
+        if header.session_id == 0 {
+            self.auth_context = AuthContext::default();
+        }
+
         // Parse security buffer from after the fixed structure
         let sec_offset = request.security_buffer_offset as usize;
         let sec_len = request.security_buffer_length as usize;
@@ -489,12 +495,15 @@ where
                 session_key,
                 response_token,
             } => {
-                // Generate session ID
-                let session_id = self
-                    .session_manager
-                    .next_session_id()
-                    .await
-                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                // Use existing session ID from Continue phase, or generate new one
+                let session_id = if let Some(id) = self.auth_context.session_id {
+                    id
+                } else {
+                    self.session_manager
+                        .next_session_id()
+                        .await
+                        .map_err(|e| HandlerError::Internal(e.to_string()))?
+                };
 
                 let dialect = self.connection.dialect.unwrap_or(SmbDialect::Smb202);
 
@@ -638,6 +647,25 @@ where
                 // More rounds needed
                 let dialect = self.connection.dialect.unwrap_or(SmbDialect::Smb202);
 
+                // Generate session ID if this is the first round (session_id not yet assigned)
+                // Per MS-SMB2: the server MUST return a session_id even in interim responses
+                let session_id = if let Some(id) = self.auth_context.session_id {
+                    id
+                } else {
+                    let id = self
+                        .session_manager
+                        .next_session_id()
+                        .await
+                        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                    self.auth_context.session_id = Some(id);
+                    debug!(
+                        conn_id = self.connection.id,
+                        session_id = id,
+                        "Allocated interim session ID for auth"
+                    );
+                    id
+                };
+
                 // For SMB 3.1.1, update preauth hash with request
                 if dialect == SmbDialect::Smb311 {
                     debug!(
@@ -652,8 +680,9 @@ where
                     );
                 }
 
-                let resp_header =
+                let mut resp_header =
                     self.build_response_header(header, NtStatus::MoreProcessingRequired);
+                resp_header.session_id = session_id;
 
                 let response = SessionSetupResponse {
                     structure_size: 9,
@@ -2560,5 +2589,601 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
             .collect()
+    }
+
+    // ==========================================================================
+    // SESSION_SETUP Unit Tests - MS-SMB2 Specification Compliance
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 sections:
+    // - 3.3.5.5: Receiving an SMB2 SESSION_SETUP Request
+    // - 3.3.5.5.1: Authenticating a New Session
+    // - 3.3.5.5.3: Handling GSS-API Authentication
+    // - 3.2.5.3.1: Client handling of SESSION_SETUP Response
+    //
+    // Key requirements tested:
+    // 1. SessionId == 0 in request means NEW session (auth context reset)
+    // 2. SessionId is allocated once and reused across auth rounds
+    // 3. Interim responses (MORE_PROCESSING_REQUIRED) include SessionId
+    // 4. Success responses include the same SessionId from interim phase
+    // ==========================================================================
+
+    use rustsmb_auth::{AuthContext, AuthMechanism, AuthProvider, AuthResult, AuthState, UserInfo};
+    use rustsmb_core::AuthError;
+    use rustsmb_protocol::session_setup::{
+        SessionCapabilities, SessionSecurityMode, SessionSetupFlags, SessionSetupRequest,
+    };
+    use rustsmb_state_memory::MemoryStateStore;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    /// NT_STATUS codes for comparison in tests.
+    const STATUS_SUCCESS: u32 = 0x00000000;
+    const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC0000016;
+
+    /// Mock auth provider for testing multi-round authentication.
+    ///
+    /// Supports configurable authentication flow:
+    /// - Single-round: Returns Success immediately
+    /// - Multi-round: Returns Continue N times, then Success
+    struct MockMultiRoundAuthProvider {
+        /// Number of Continue responses before Success.
+        rounds_before_success: u32,
+        /// Current round counter (per-context tracking via state).
+        round_counter: AtomicU32,
+    }
+
+    impl MockMultiRoundAuthProvider {
+        fn new(rounds_before_success: u32) -> Self {
+            Self {
+                rounds_before_success,
+                round_counter: AtomicU32::new(0),
+            }
+        }
+
+        /// Create a single-round auth provider (immediate success).
+        fn single_round() -> Self {
+            Self::new(0)
+        }
+
+        /// Create a two-round auth provider (Continue, then Success).
+        fn two_round() -> Self {
+            Self::new(1)
+        }
+
+        /// Create a three-round auth provider (Continue, Continue, Success).
+        fn three_round() -> Self {
+            Self::new(2)
+        }
+    }
+
+    impl AuthProvider for MockMultiRoundAuthProvider {
+        fn authenticate<'a>(
+            &'a self,
+            context: &'a mut AuthContext,
+            _token: &'a [u8],
+        ) -> rustsmb_auth::BoxFuture<'a, Result<AuthResult, AuthError>> {
+            Box::pin(async move {
+                let current_round = self.round_counter.fetch_add(1, AtomicOrdering::SeqCst);
+
+                if current_round < self.rounds_before_success {
+                    // More rounds needed - return Continue
+                    context.state = AuthState::ChallengeIssued;
+                    Ok(AuthResult::Continue {
+                        response_token: format!("challenge_round_{}", current_round + 1)
+                            .into_bytes(),
+                    })
+                } else {
+                    // Final round - return Success
+                    context.state = AuthState::Complete;
+                    Ok(AuthResult::Success {
+                        user: UserInfo::authenticated("testuser", Some("TESTDOMAIN")),
+                        session_key: vec![0x42; 16], // Mock session key
+                        response_token: Some(b"final_token".to_vec()),
+                    })
+                }
+            })
+        }
+
+        fn get_user<'a>(
+            &'a self,
+            username: &'a str,
+            domain: Option<&'a str>,
+        ) -> rustsmb_auth::BoxFuture<'a, Result<Option<UserInfo>, AuthError>> {
+            Box::pin(async move { Ok(Some(UserInfo::authenticated(username, domain))) })
+        }
+
+        fn validate_session_key<'a>(
+            &'a self,
+            _session_id: u64,
+            _key: &'a [u8],
+        ) -> rustsmb_auth::BoxFuture<'a, Result<bool, AuthError>> {
+            Box::pin(async move { Ok(true) })
+        }
+
+        fn supported_mechanisms(&self) -> Vec<AuthMechanism> {
+            vec![AuthMechanism::Ntlm]
+        }
+    }
+
+    /// Create a test ConnectionHandler with mock dependencies.
+    async fn create_test_handler(
+        auth_provider: impl AuthProvider,
+    ) -> ConnectionHandler<DuplexStream> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let _ = client; // We don't use the client side in unit tests
+
+        let state_store = Arc::new(MemoryStateStore::new());
+        let session_manager = Arc::new(SessionManager::new(
+            state_store,
+            rustsmb_session::SessionManagerConfig::default(),
+        ));
+        let config = Arc::new(ServerConfig::default());
+        let shares = Arc::new(ShareManager::new());
+
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+
+        ConnectionHandler::new(
+            server,
+            peer_addr,
+            config,
+            session_manager,
+            Arc::new(auth_provider),
+            shares,
+            "test-server-1".to_string(),
+        )
+    }
+
+    /// Build a SESSION_SETUP request message.
+    ///
+    /// Per MS-SMB2 2.2.5, the request structure is:
+    /// - SMB2 Header (64 bytes)
+    /// - SESSION_SETUP Request (variable)
+    fn build_session_setup_request(session_id: u64, security_buffer: &[u8]) -> Vec<u8> {
+        // Build SMB2 header (magic bytes are written by binrw via #[brw(magic = ...)])
+        let header = Smb2Header {
+            structure_size: 64,
+            credit_charge: 1,
+            status: 0,
+            command: Smb2Command::SessionSetup,
+            credits: 1,
+            flags: Smb2Flags(0),
+            next_command: 0,
+            message_id: 1,
+            async_id: 0,
+            tree_id: 0,
+            session_id,
+            signature: [0u8; 16],
+        };
+
+        // Build SESSION_SETUP request body
+        // SecurityBufferOffset = 64 (header) + 25 (fixed request size) = 89
+        // But we need to account for padding - offset is from message start
+        let request = SessionSetupRequest {
+            structure_size: 25,
+            flags: SessionSetupFlags::new(0),
+            security_mode: SessionSecurityMode(1), // SMB2_NEGOTIATE_SIGNING_ENABLED
+            capabilities: SessionCapabilities(0),
+            channel: 0,
+            security_buffer_offset: 88, // 64 + 24 (structure minus buffer fields)
+            security_buffer_length: security_buffer.len() as u16,
+            previous_session_id: 0,
+        };
+
+        // Serialize header to a temp buffer (binrw writes magic bytes)
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        header
+            .write(&mut Cursor::new(&mut header_buf))
+            .expect("header serialization should succeed");
+
+        // Serialize request body to a temp buffer
+        let mut request_buf = Vec::with_capacity(32);
+        request
+            .write(&mut Cursor::new(&mut request_buf))
+            .expect("request serialization should succeed");
+
+        // Combine all parts
+        let mut buf =
+            Vec::with_capacity(header_buf.len() + request_buf.len() + security_buffer.len());
+        buf.extend_from_slice(&header_buf);
+        buf.extend_from_slice(&request_buf);
+        buf.extend_from_slice(security_buffer);
+
+        buf
+    }
+
+    /// Extract SessionId from an SMB2 response message.
+    ///
+    /// SMB2 header layout (MS-SMB2 2.2.1):
+    /// - ProtocolId: 4 bytes (0-3)
+    /// - StructureSize: 2 bytes (4-5)
+    /// - CreditCharge: 2 bytes (6-7)
+    /// - Status: 4 bytes (8-11)
+    /// - Command: 2 bytes (12-13)
+    /// - Credits: 2 bytes (14-15)
+    /// - Flags: 4 bytes (16-19)
+    /// - NextCommand: 4 bytes (20-23)
+    /// - MessageId: 8 bytes (24-31)
+    /// - AsyncId: 4 bytes (32-35)
+    /// - TreeId: 4 bytes (36-39)
+    /// - SessionId: 8 bytes (40-47)
+    /// - Signature: 16 bytes (48-63)
+    fn extract_session_id_from_response(response: &[u8]) -> u64 {
+        assert!(response.len() >= 64, "Response too short for SMB2 header");
+        // SessionId is at offset 40-47 in the SMB2 header
+        u64::from_le_bytes(response[40..48].try_into().unwrap())
+    }
+
+    /// Extract NtStatus from an SMB2 response message.
+    fn extract_status_from_response(response: &[u8]) -> u32 {
+        assert!(response.len() >= 64, "Response too short for SMB2 header");
+        // Status is at offset 8-12 in the SMB2 header
+        u32::from_le_bytes(response[8..12].try_into().unwrap())
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.5 - SessionId == 0 means NEW session
+    // -------------------------------------------------------------------------
+    // "If SessionId in the SMB2 header of the request is zero, the server MUST
+    // process the authentication request as specified in section 3.3.5.5.1."
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_session_id_zero_resets_auth_context() {
+        // Create handler with single-round auth
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // Simulate a previous auth that left state in auth_context
+        handler.auth_context.session_id = Some(12345);
+        handler.auth_context.state = AuthState::ChallengeIssued;
+        handler.auth_context.challenge = Some(vec![0x01, 0x02, 0x03]);
+
+        // Build request with SessionId = 0 (NEW session)
+        let request = build_session_setup_request(0, b"test_token");
+        let header = Smb2Header::read(&mut Cursor::new(&request[..64])).unwrap();
+
+        // Handle the session setup
+        let response = handler
+            .handle_session_setup(&header, &request[64..], &request)
+            .await
+            .expect("SESSION_SETUP should succeed");
+
+        // Verify auth_context was reset (session_id should NOT be 12345)
+        // The new session should have a freshly allocated session_id
+        let response_session_id = extract_session_id_from_response(&response);
+        assert_ne!(
+            response_session_id, 12345,
+            "MS-SMB2 3.3.5.5: SessionId=0 should create NEW session, not reuse old"
+        );
+        assert_ne!(
+            response_session_id, 0,
+            "Server MUST allocate a unique SessionId for new sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_id_zero_starts_fresh_auth() {
+        // Create handler with two-round auth to test context reset
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::two_round()).await;
+
+        // Simulate leftover state from a previous incomplete auth
+        handler.auth_context.session_id = Some(99999);
+        handler.auth_context.state = AuthState::ChallengeIssued;
+
+        // First request with SessionId = 0 should reset everything
+        let request1 = build_session_setup_request(0, b"token1");
+        let header1 = Smb2Header::read(&mut Cursor::new(&request1[..64])).unwrap();
+
+        let response1 = handler
+            .handle_session_setup(&header1, &request1[64..], &request1)
+            .await
+            .expect("First SESSION_SETUP should succeed");
+
+        let session_id = extract_session_id_from_response(&response1);
+        let status = extract_status_from_response(&response1);
+
+        // Should be MORE_PROCESSING_REQUIRED with a NEW session ID (not 99999)
+        assert_eq!(
+            status, STATUS_MORE_PROCESSING_REQUIRED,
+            "First round should return MORE_PROCESSING_REQUIRED"
+        );
+        assert_ne!(
+            session_id, 99999,
+            "MS-SMB2 3.3.5.5: SessionId=0 must not reuse previous session_id"
+        );
+        assert_ne!(session_id, 0, "SessionId must be allocated");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.5.1 - SessionId allocated once at start
+    // -------------------------------------------------------------------------
+    // "A session object MUST be allocated for this request. The session MUST
+    // be inserted into the GlobalSessionTable and a unique Session.SessionId
+    // is assigned to serve as a lookup key in the table."
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_session_id_preserved_across_auth_rounds() {
+        // Create handler with two-round auth
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::two_round()).await;
+
+        // Round 1: SessionId = 0 (new session)
+        let request1 = build_session_setup_request(0, b"negotiate_token");
+        let header1 = Smb2Header::read(&mut Cursor::new(&request1[..64])).unwrap();
+
+        let response1 = handler
+            .handle_session_setup(&header1, &request1[64..], &request1)
+            .await
+            .expect("Round 1 should succeed");
+
+        let session_id_round1 = extract_session_id_from_response(&response1);
+        let status1 = extract_status_from_response(&response1);
+
+        assert_eq!(status1, STATUS_MORE_PROCESSING_REQUIRED);
+        assert_ne!(
+            session_id_round1, 0,
+            "SessionId must be allocated in round 1"
+        );
+
+        // Round 2: Use the allocated SessionId
+        let request2 = build_session_setup_request(session_id_round1, b"authenticate_token");
+        let header2 = Smb2Header::read(&mut Cursor::new(&request2[..64])).unwrap();
+
+        let response2 = handler
+            .handle_session_setup(&header2, &request2[64..], &request2)
+            .await
+            .expect("Round 2 should succeed");
+
+        let session_id_round2 = extract_session_id_from_response(&response2);
+        let status2 = extract_status_from_response(&response2);
+
+        assert_eq!(status2, STATUS_SUCCESS);
+        assert_eq!(
+            session_id_round1, session_id_round2,
+            "MS-SMB2 3.3.5.5.1: SessionId MUST be same across all auth rounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_three_round_auth_preserves_session_id() {
+        // Create handler with three-round auth (Continue, Continue, Success)
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::three_round()).await;
+
+        // Round 1: New session
+        let request1 = build_session_setup_request(0, b"token1");
+        let header1 = Smb2Header::read(&mut Cursor::new(&request1[..64])).unwrap();
+        let response1 = handler
+            .handle_session_setup(&header1, &request1[64..], &request1)
+            .await
+            .unwrap();
+
+        let session_id = extract_session_id_from_response(&response1);
+        assert_eq!(
+            extract_status_from_response(&response1),
+            STATUS_MORE_PROCESSING_REQUIRED
+        );
+
+        // Round 2: Continue with same session
+        let request2 = build_session_setup_request(session_id, b"token2");
+        let header2 = Smb2Header::read(&mut Cursor::new(&request2[..64])).unwrap();
+        let response2 = handler
+            .handle_session_setup(&header2, &request2[64..], &request2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            extract_session_id_from_response(&response2),
+            session_id,
+            "Round 2 must use same SessionId"
+        );
+        assert_eq!(
+            extract_status_from_response(&response2),
+            STATUS_MORE_PROCESSING_REQUIRED
+        );
+
+        // Round 3: Final success
+        let request3 = build_session_setup_request(session_id, b"token3");
+        let header3 = Smb2Header::read(&mut Cursor::new(&request3[..64])).unwrap();
+        let response3 = handler
+            .handle_session_setup(&header3, &request3[64..], &request3)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            extract_session_id_from_response(&response3),
+            session_id,
+            "MS-SMB2: Final SUCCESS must use same SessionId allocated in round 1"
+        );
+        assert_eq!(extract_status_from_response(&response3), STATUS_SUCCESS);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.2.5.3.1 - Interim responses include SessionId
+    // -------------------------------------------------------------------------
+    // "If the GSS protocol returns success and the Status code of the SMB2
+    // header of the response was STATUS_MORE_PROCESSING_REQUIRED, the client
+    // MUST process as follows: ... the client MUST look for a session object
+    // in Connection.PreAuthSessionTable by using the SessionId in the SMB2
+    // header of the SMB2 SESSION_SETUP Response."
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_interim_response_contains_session_id() {
+        // Create handler with multi-round auth
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::two_round()).await;
+
+        // Request with SessionId = 0 (new session)
+        let request = build_session_setup_request(0, b"negotiate");
+        let header = Smb2Header::read(&mut Cursor::new(&request[..64])).unwrap();
+
+        let response = handler
+            .handle_session_setup(&header, &request[64..], &request)
+            .await
+            .expect("SESSION_SETUP should succeed");
+
+        let session_id = extract_session_id_from_response(&response);
+        let status = extract_status_from_response(&response);
+
+        // Verify this is an interim response
+        assert_eq!(
+            status, STATUS_MORE_PROCESSING_REQUIRED,
+            "Should be an interim response"
+        );
+
+        // MS-SMB2 3.2.5.3.1: Client expects SessionId in interim responses
+        assert_ne!(
+            session_id, 0,
+            "MS-SMB2 3.2.5.3.1: Interim responses MUST include allocated SessionId"
+        );
+
+        // Verify the session_id was stored in auth_context for next round
+        assert_eq!(
+            handler.auth_context.session_id,
+            Some(session_id),
+            "auth_context.session_id should be set for subsequent rounds"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.5.3 - Session.SessionId in response header
+    // -------------------------------------------------------------------------
+    // "Session.SessionId MUST be placed in the SessionId field of the SMB2
+    // header." (for success responses)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_success_response_contains_session_id() {
+        // Create handler with single-round auth (immediate success)
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        let request = build_session_setup_request(0, b"credentials");
+        let header = Smb2Header::read(&mut Cursor::new(&request[..64])).unwrap();
+
+        let response = handler
+            .handle_session_setup(&header, &request[64..], &request)
+            .await
+            .expect("SESSION_SETUP should succeed");
+
+        let session_id = extract_session_id_from_response(&response);
+        let status = extract_status_from_response(&response);
+
+        assert_eq!(status, STATUS_SUCCESS);
+        assert_ne!(
+            session_id, 0,
+            "MS-SMB2 3.3.5.5.3: Session.SessionId MUST be in response header"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Multiple concurrent sessions get unique SessionIds
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.5.1: "a unique Session.SessionId is assigned"
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_multiple_sessions_get_unique_ids() {
+        // We need separate handlers to simulate different connections
+        let state_store = Arc::new(MemoryStateStore::new());
+        let session_manager = Arc::new(SessionManager::new(
+            state_store,
+            rustsmb_session::SessionManagerConfig::default(),
+        ));
+        let config = Arc::new(ServerConfig::default());
+        let shares = Arc::new(ShareManager::new());
+
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+
+        // Create two handlers sharing the same session manager
+        let (_, server1) = tokio::io::duplex(64 * 1024);
+        let (_, server2) = tokio::io::duplex(64 * 1024);
+
+        let mut handler1 = ConnectionHandler::new(
+            server1,
+            peer_addr,
+            config.clone(),
+            session_manager.clone(),
+            Arc::new(MockMultiRoundAuthProvider::single_round()),
+            shares.clone(),
+            "test-server-1".to_string(),
+        );
+
+        let mut handler2 = ConnectionHandler::new(
+            server2,
+            peer_addr,
+            config,
+            session_manager,
+            Arc::new(MockMultiRoundAuthProvider::single_round()),
+            shares,
+            "test-server-1".to_string(),
+        );
+
+        // Session 1
+        let request1 = build_session_setup_request(0, b"user1:pass1");
+        let header1 = Smb2Header::read(&mut Cursor::new(&request1[..64])).unwrap();
+        let response1 = handler1
+            .handle_session_setup(&header1, &request1[64..], &request1)
+            .await
+            .unwrap();
+        let session_id1 = extract_session_id_from_response(&response1);
+
+        // Session 2
+        let request2 = build_session_setup_request(0, b"user2:pass2");
+        let header2 = Smb2Header::read(&mut Cursor::new(&request2[..64])).unwrap();
+        let response2 = handler2
+            .handle_session_setup(&header2, &request2[64..], &request2)
+            .await
+            .unwrap();
+        let session_id2 = extract_session_id_from_response(&response2);
+
+        assert_ne!(
+            session_id1, session_id2,
+            "Each session MUST have unique SessionId"
+        );
+        assert_ne!(session_id1, 0);
+        assert_ne!(session_id2, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Auth context state tracking
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_auth_context_session_id_tracking() {
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::two_round()).await;
+
+        // Initially, auth_context.session_id should be None
+        assert!(
+            handler.auth_context.session_id.is_none(),
+            "Initial auth_context.session_id should be None"
+        );
+
+        // After first round (Continue), session_id should be set
+        let request1 = build_session_setup_request(0, b"token1");
+        let header1 = Smb2Header::read(&mut Cursor::new(&request1[..64])).unwrap();
+        let response1 = handler
+            .handle_session_setup(&header1, &request1[64..], &request1)
+            .await
+            .unwrap();
+
+        let allocated_session_id = extract_session_id_from_response(&response1);
+        assert_eq!(
+            handler.auth_context.session_id,
+            Some(allocated_session_id),
+            "auth_context.session_id should be set after Continue response"
+        );
+
+        // After second round (Success), same session_id should be used
+        let request2 = build_session_setup_request(allocated_session_id, b"token2");
+        let header2 = Smb2Header::read(&mut Cursor::new(&request2[..64])).unwrap();
+        let response2 = handler
+            .handle_session_setup(&header2, &request2[64..], &request2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            extract_session_id_from_response(&response2),
+            allocated_session_id,
+            "Success response should use the same allocated SessionId"
+        );
     }
 }
