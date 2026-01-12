@@ -80,6 +80,10 @@ pub enum NtStatus {
     MediaWriteProtected = 0xC00000A2,
     /// The name is too long.
     NameTooLong = 0xC0000106,
+    /// The file has been closed.
+    FileClosed = 0xC0000128,
+    /// The network name was deleted (tree disconnected).
+    NetworkNameDeleted = 0xC00000C9,
 
     // SMB-specific
     /// Invalid SMB.
@@ -160,6 +164,8 @@ impl NtStatus {
             0xC00000D4 => Self::NotSameDevice,
             0xC00000A2 => Self::MediaWriteProtected,
             0xC0000106 => Self::NameTooLong,
+            0xC0000128 => Self::FileClosed,
+            0xC00000C9 => Self::NetworkNameDeleted,
             0x00010002 => Self::InvalidSmb,
             0x00160002 => Self::SmbBadCommand,
             0xC000006D => Self::LogonFailure,

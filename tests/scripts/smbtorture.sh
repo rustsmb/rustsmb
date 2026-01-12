@@ -74,8 +74,8 @@ SHARE="${SMB_SHARE:-test}"
 SHARE_PATH="${SMB_SHARE_PATH:-/tmp/share}"
 SERVER_BIN="${RUSTSMB_BIN:-./target/release/rustsmb}"
 RESULTS_DIR="${RESULTS_DIR:-test-results/smbtorture}"
-SMB_USER="${CLI_USER:-${SMB_USER:-}}"
-SMB_PASS="${CLI_PASS:-${SMB_PASS:-}}"
+SMB_USER="${CLI_USER:-${SMB_USER:-testuser}}"
+SMB_PASS="${CLI_PASS:-${SMB_PASS:-testpass}}"
 
 # Determine server host
 if [ -n "$EXTERNAL_HOST" ]; then

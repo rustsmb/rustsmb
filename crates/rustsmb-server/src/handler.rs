@@ -13,6 +13,7 @@ use rustsmb_protocol::{Smb2Command, Smb2Flags, Smb2Header, SMB2_HEADER_SIZE, SMB
 use rustsmb_session::{Connection, SessionManager};
 use rustsmb_state::{HandleState, LeaseEntry, SessionState, TreeState};
 use rustsmb_vfs::{CreateParams, FileType};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +46,8 @@ pub struct ConnectionHandler<S> {
     server_id: String,
     /// Pre-authentication integrity hash (SMB 3.1.1).
     preauth_hash: PreauthIntegrityHash,
+    /// Signing keys per session (session_id -> signing_key).
+    signing_keys: HashMap<u64, Vec<u8>>,
 }
 
 impl<S> ConnectionHandler<S>
@@ -75,6 +78,7 @@ where
             auth_context: AuthContext::default(),
             server_id,
             preauth_hash: PreauthIntegrityHash::new(),
+            signing_keys: HashMap::new(),
         }
     }
 
@@ -114,6 +118,9 @@ where
             if response.is_empty() {
                 continue;
             }
+
+            // Sign response if we have a signing key for this session
+            let response = self.maybe_sign_response(response)?;
 
             // Send response
             if let Err(e) = self.send_response(&response).await {
@@ -229,6 +236,66 @@ where
         body: &[u8],
         full_message: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
+        // Commands that require a valid session
+        let requires_session = matches!(
+            header.command,
+            Smb2Command::Logoff
+                | Smb2Command::TreeConnect
+                | Smb2Command::TreeDisconnect
+                | Smb2Command::Create
+                | Smb2Command::Close
+                | Smb2Command::Flush
+                | Smb2Command::Read
+                | Smb2Command::Write
+                | Smb2Command::Lock
+                | Smb2Command::Ioctl
+                | Smb2Command::QueryDirectory
+                | Smb2Command::ChangeNotify
+                | Smb2Command::QueryInfo
+                | Smb2Command::SetInfo
+        );
+
+        // Validate session_id for commands that require it
+        if requires_session
+            && header.session_id != 0
+            && self
+                .session_manager
+                .get_session(header.session_id)
+                .await
+                .map_err(|e| HandlerError::Internal(e.to_string()))?
+                .is_none()
+        {
+            return Err(HandlerError::Status(NtStatus::UserSessionDeleted));
+        }
+
+        // Commands that require a valid tree connection
+        let requires_tree = matches!(
+            header.command,
+            Smb2Command::Create
+                | Smb2Command::Close
+                | Smb2Command::Flush
+                | Smb2Command::Read
+                | Smb2Command::Write
+                | Smb2Command::Lock
+                | Smb2Command::QueryDirectory
+                | Smb2Command::ChangeNotify
+                | Smb2Command::QueryInfo
+                | Smb2Command::SetInfo
+        );
+
+        // Validate tree_id for commands that require it
+        if requires_tree
+            && header.tree_id != 0
+            && self
+                .session_manager
+                .get_tree(header.session_id, header.tree_id)
+                .await
+                .map_err(|e| HandlerError::Internal(e.to_string()))?
+                .is_none()
+        {
+            return Err(HandlerError::Status(NtStatus::NetworkNameDeleted));
+        }
+
         match header.command {
             Smb2Command::Negotiate => self.handle_negotiate(header, body, full_message).await,
             Smb2Command::SessionSetup => {
@@ -636,6 +703,11 @@ where
                     &signing_key[..signing_key.len().min(16)]
                 );
 
+                // Store signing key for subsequent message signing
+                if should_sign {
+                    self.signing_keys.insert(session_id, signing_key.clone());
+                }
+
                 // Step 5: Sign the response
                 if should_sign {
                     self.sign_message(&mut result, &signing_key, dialect)?;
@@ -824,8 +896,22 @@ where
             "LOGOFF request"
         );
 
+        // Check if session exists
+        let session = self
+            .session_manager
+            .get_session(header.session_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+        if session.is_none() {
+            // Session doesn't exist - already logged off
+            return Err(HandlerError::Status(NtStatus::UserSessionDeleted));
+        }
+
         // Remove session
         self.connection.remove_session(header.session_id);
+        // Also remove signing key for this session
+        self.signing_keys.remove(&header.session_id);
         let _ = self.session_manager.delete_session(header.session_id).await;
 
         let resp_header = self.build_response_header(header, NtStatus::Success);
@@ -938,6 +1024,18 @@ where
             tree_id = header.tree_id,
             "TREE_DISCONNECT request"
         );
+
+        // Check if tree exists
+        let tree = self
+            .session_manager
+            .get_tree(header.session_id, header.tree_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+        if tree.is_none() {
+            // Tree doesn't exist - already disconnected
+            return Err(HandlerError::Status(NtStatus::NetworkNameDeleted));
+        }
 
         let _ = self
             .session_manager
@@ -1646,18 +1744,27 @@ where
         let handle_id =
             (request.file_id_volatile as u128) << 64 | request.file_id_persistent as u128;
 
-        // Get handle first to check for lease
-        if let Ok(Some(handle)) = self.session_manager.get_handle(handle_id).await {
-            // Delete lease if present
-            if let Some(lease_key) = &handle.lease_key {
-                if let Err(e) = self
-                    .session_manager
-                    .state_store()
-                    .delete_lease(lease_key)
-                    .await
-                {
-                    debug!(error = %e, lease_key = %lease_key, "Failed to delete lease on close");
-                }
+        // Get handle first - if it doesn't exist, the handle was already closed
+        let handle = match self.session_manager.get_handle(handle_id).await {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                // Handle doesn't exist - already closed
+                return Err(HandlerError::Status(NtStatus::FileClosed));
+            }
+            Err(e) => {
+                return Err(HandlerError::Internal(e.to_string()));
+            }
+        };
+
+        // Delete lease if present
+        if let Some(lease_key) = &handle.lease_key {
+            if let Err(e) = self
+                .session_manager
+                .state_store()
+                .delete_lease(lease_key)
+                .await
+            {
+                debug!(error = %e, lease_key = %lease_key, "Failed to delete lease on close");
             }
         }
 
@@ -2292,6 +2399,64 @@ where
         );
 
         Ok(())
+    }
+
+    /// Sign a response message if we have a signing key for the session.
+    ///
+    /// This is called from the main loop after the command handler returns
+    /// the response. It looks up the signing key based on the session_id
+    /// in the response header and signs the message if needed.
+    fn maybe_sign_response(&self, mut response: Vec<u8>) -> Result<Vec<u8>, HandlerError> {
+        // Need at least a full header
+        if response.len() < SMB2_HEADER_SIZE {
+            return Ok(response);
+        }
+
+        // Extract session_id from response header (offset 40, 8 bytes)
+        let session_id = u64::from_le_bytes([
+            response[40],
+            response[41],
+            response[42],
+            response[43],
+            response[44],
+            response[45],
+            response[46],
+            response[47],
+        ]);
+
+        // Check if we have a signing key for this session
+        if let Some(signing_key) = self.signing_keys.get(&session_id) {
+            // Check if already signed (SIGNED flag at offset 16, bit 0x08)
+            let flags =
+                u32::from_le_bytes([response[16], response[17], response[18], response[19]]);
+
+            if (flags & Smb2Flags::SIGNED) != 0 {
+                // Already signed by the handler (e.g., SESSION_SETUP Success)
+                return Ok(response);
+            }
+
+            // Set the SIGNED flag
+            let new_flags = flags | Smb2Flags::SIGNED;
+            response[16..20].copy_from_slice(&new_flags.to_le_bytes());
+
+            // Get dialect from connection
+            let dialect = self.connection.dialect.unwrap_or(SmbDialect::Smb302);
+
+            // Zero the signature field before computing signature
+            response[48..64].copy_from_slice(&[0u8; 16]);
+
+            // Compute and write signature
+            let signature = Self::compute_signature(signing_key, dialect, &response)?;
+            response[48..64].copy_from_slice(&signature);
+
+            trace!(
+                conn_id = self.connection.id,
+                session_id,
+                "Signed response message"
+            );
+        }
+
+        Ok(response)
     }
 
     /// Compute SMB signing MAC for the provided message bytes.
@@ -3184,6 +3349,405 @@ mod tests {
             extract_session_id_from_response(&response2),
             allocated_session_id,
             "Success response should use the same allocated SessionId"
+        );
+    }
+
+    // ==========================================================================
+    // MS-SMB2 Compliance Tests - Status Code Validation
+    // ==========================================================================
+    //
+    // These tests verify correct NT_STATUS codes per MS-SMB2:
+    // - 3.3.5.6: CLOSE - NT_STATUS_FILE_CLOSED for invalid handle
+    // - 3.3.5.4: TREE_DISCONNECT - NT_STATUS_NETWORK_NAME_DELETED for invalid tree
+    // - 3.3.5.3: LOGOFF - NT_STATUS_USER_SESSION_DELETED for invalid session
+    // ==========================================================================
+
+    /// NT_STATUS codes for status validation tests
+    const STATUS_FILE_CLOSED: u32 = 0xC0000128;
+    const STATUS_NETWORK_NAME_DELETED: u32 = 0xC00000C9;
+    const STATUS_USER_SESSION_DELETED: u32 = 0xC0000203;
+
+    /// Build a CLOSE request message.
+    fn build_close_request(session_id: u64, tree_id: u32, file_id: u128) -> Vec<u8> {
+        use rustsmb_protocol::close::{CloseFlags, CloseRequest};
+
+        let header = Smb2Header {
+            structure_size: 64,
+            credit_charge: 1,
+            status: 0,
+            command: Smb2Command::Close,
+            credits: 1,
+            flags: Smb2Flags(0),
+            next_command: 0,
+            message_id: 1,
+            async_id: 0,
+            tree_id,
+            session_id,
+            signature: [0u8; 16],
+        };
+
+        let request = CloseRequest {
+            structure_size: 24,
+            flags: CloseFlags(0),
+            reserved: 0,
+            file_id_persistent: file_id as u64,
+            file_id_volatile: (file_id >> 64) as u64,
+        };
+
+        // Write header and request to separate buffers, then combine
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        header
+            .write(&mut Cursor::new(&mut header_buf))
+            .expect("header serialization should succeed");
+
+        let mut request_buf = Vec::with_capacity(24);
+        request
+            .write(&mut Cursor::new(&mut request_buf))
+            .expect("request serialization should succeed");
+
+        let mut buf = Vec::with_capacity(header_buf.len() + request_buf.len());
+        buf.extend_from_slice(&header_buf);
+        buf.extend_from_slice(&request_buf);
+        buf
+    }
+
+    /// Build a TREE_DISCONNECT request message.
+    fn build_tree_disconnect_request(session_id: u64, tree_id: u32) -> Vec<u8> {
+        use rustsmb_protocol::tree_disconnect::TreeDisconnectRequest;
+
+        let header = Smb2Header {
+            structure_size: 64,
+            credit_charge: 1,
+            status: 0,
+            command: Smb2Command::TreeDisconnect,
+            credits: 1,
+            flags: Smb2Flags(0),
+            next_command: 0,
+            message_id: 1,
+            async_id: 0,
+            tree_id,
+            session_id,
+            signature: [0u8; 16],
+        };
+
+        let request = TreeDisconnectRequest {
+            structure_size: 4,
+            reserved: 0,
+        };
+
+        // Write header and request to separate buffers, then combine
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        header
+            .write(&mut Cursor::new(&mut header_buf))
+            .expect("header serialization should succeed");
+
+        let mut request_buf = Vec::with_capacity(4);
+        request
+            .write(&mut Cursor::new(&mut request_buf))
+            .expect("request serialization should succeed");
+
+        let mut buf = Vec::with_capacity(header_buf.len() + request_buf.len());
+        buf.extend_from_slice(&header_buf);
+        buf.extend_from_slice(&request_buf);
+        buf
+    }
+
+    /// Build a LOGOFF request message.
+    fn build_logoff_request(session_id: u64) -> Vec<u8> {
+        use rustsmb_protocol::logoff::LogoffRequest;
+
+        let header = Smb2Header {
+            structure_size: 64,
+            credit_charge: 1,
+            status: 0,
+            command: Smb2Command::Logoff,
+            credits: 1,
+            flags: Smb2Flags(0),
+            next_command: 0,
+            message_id: 1,
+            async_id: 0,
+            tree_id: 0,
+            session_id,
+            signature: [0u8; 16],
+        };
+
+        let request = LogoffRequest {
+            structure_size: 4,
+            reserved: 0,
+        };
+
+        // Write header and request to separate buffers, then combine
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        header
+            .write(&mut Cursor::new(&mut header_buf))
+            .expect("header serialization should succeed");
+
+        let mut request_buf = Vec::with_capacity(4);
+        request
+            .write(&mut Cursor::new(&mut request_buf))
+            .expect("request serialization should succeed");
+
+        let mut buf = Vec::with_capacity(header_buf.len() + request_buf.len());
+        buf.extend_from_slice(&header_buf);
+        buf.extend_from_slice(&request_buf);
+        buf
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.6 - CLOSE with invalid handle returns FILE_CLOSED
+    // -------------------------------------------------------------------------
+    // "If the FileId in the request is not valid, the server MUST fail the
+    // request with STATUS_FILE_CLOSED."
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_close_invalid_handle_returns_file_closed() {
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // First, establish a session
+        let session_request = build_session_setup_request(0, b"auth_token");
+        let session_header = Smb2Header::read(&mut Cursor::new(&session_request[..64])).unwrap();
+        let session_response = handler
+            .handle_session_setup(&session_header, &session_request[64..], &session_request)
+            .await
+            .unwrap();
+        let session_id = extract_session_id_from_response(&session_response);
+
+        // Try to close a handle that doesn't exist (file_id = 12345)
+        let close_request = build_close_request(session_id, 1, 12345);
+        let close_header = Smb2Header::read(&mut Cursor::new(&close_request[..64])).unwrap();
+
+        let result = handler
+            .handle_close(&close_header, &close_request[64..])
+            .await;
+
+        // Per MS-SMB2, closing an invalid handle should return STATUS_FILE_CLOSED
+        assert!(result.is_err());
+        if let Err(HandlerError::Status(status)) = result {
+            assert_eq!(
+                status.code(),
+                STATUS_FILE_CLOSED,
+                "MS-SMB2 3.3.5.6: Invalid handle MUST return STATUS_FILE_CLOSED"
+            );
+        } else {
+            panic!("Expected HandlerError::Status, got {:?}", result);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.4 - TREE_DISCONNECT with invalid tree returns error
+    // -------------------------------------------------------------------------
+    // "If the TreeId in the SMB2 header of the request is not valid, the server
+    // MUST fail the request with STATUS_NETWORK_NAME_DELETED."
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_tree_disconnect_invalid_tree_returns_network_name_deleted() {
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // First, establish a session
+        let session_request = build_session_setup_request(0, b"auth_token");
+        let session_header = Smb2Header::read(&mut Cursor::new(&session_request[..64])).unwrap();
+        let session_response = handler
+            .handle_session_setup(&session_header, &session_request[64..], &session_request)
+            .await
+            .unwrap();
+        let session_id = extract_session_id_from_response(&session_response);
+
+        // Try to disconnect a tree that doesn't exist (tree_id = 999)
+        let tdis_request = build_tree_disconnect_request(session_id, 999);
+        let tdis_header = Smb2Header::read(&mut Cursor::new(&tdis_request[..64])).unwrap();
+
+        let result = handler
+            .handle_tree_disconnect(&tdis_header, &tdis_request[64..])
+            .await;
+
+        // Per MS-SMB2, disconnecting an invalid tree should return STATUS_NETWORK_NAME_DELETED
+        assert!(result.is_err());
+        if let Err(HandlerError::Status(status)) = result {
+            assert_eq!(
+                status.code(),
+                STATUS_NETWORK_NAME_DELETED,
+                "MS-SMB2 3.3.5.4: Invalid tree MUST return STATUS_NETWORK_NAME_DELETED"
+            );
+        } else {
+            panic!("Expected HandlerError::Status, got {:?}", result);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.3 - LOGOFF with invalid session returns error
+    // -------------------------------------------------------------------------
+    // "If the SessionId in the SMB2 header of the request is not valid, the
+    // server MUST fail the request with STATUS_USER_SESSION_DELETED."
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_logoff_invalid_session_returns_user_session_deleted() {
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // Try to logoff a session that doesn't exist (session_id = 99999)
+        let logoff_request = build_logoff_request(99999);
+        let logoff_header = Smb2Header::read(&mut Cursor::new(&logoff_request[..64])).unwrap();
+
+        let result = handler
+            .handle_logoff(&logoff_header, &logoff_request[64..])
+            .await;
+
+        // Per MS-SMB2, logging off an invalid session should return STATUS_USER_SESSION_DELETED
+        assert!(result.is_err());
+        if let Err(HandlerError::Status(status)) = result {
+            assert_eq!(
+                status.code(),
+                STATUS_USER_SESSION_DELETED,
+                "MS-SMB2 3.3.5.3: Invalid session MUST return STATUS_USER_SESSION_DELETED"
+            );
+        } else {
+            panic!("Expected HandlerError::Status, got {:?}", result);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 - Double LOGOFF returns USER_SESSION_DELETED
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_double_logoff_returns_user_session_deleted() {
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // Establish a session
+        let session_request = build_session_setup_request(0, b"auth_token");
+        let session_header = Smb2Header::read(&mut Cursor::new(&session_request[..64])).unwrap();
+        let session_response = handler
+            .handle_session_setup(&session_header, &session_request[64..], &session_request)
+            .await
+            .unwrap();
+        let session_id = extract_session_id_from_response(&session_response);
+
+        // First logoff should succeed
+        let logoff1_request = build_logoff_request(session_id);
+        let logoff1_header = Smb2Header::read(&mut Cursor::new(&logoff1_request[..64])).unwrap();
+        let logoff1_result = handler
+            .handle_logoff(&logoff1_header, &logoff1_request[64..])
+            .await;
+        assert!(
+            logoff1_result.is_ok(),
+            "First logoff should succeed: {:?}",
+            logoff1_result
+        );
+
+        // Second logoff should fail with USER_SESSION_DELETED
+        let logoff2_request = build_logoff_request(session_id);
+        let logoff2_header = Smb2Header::read(&mut Cursor::new(&logoff2_request[..64])).unwrap();
+        let logoff2_result = handler
+            .handle_logoff(&logoff2_header, &logoff2_request[64..])
+            .await;
+
+        assert!(logoff2_result.is_err());
+        if let Err(HandlerError::Status(status)) = logoff2_result {
+            assert_eq!(
+                status.code(),
+                STATUS_USER_SESSION_DELETED,
+                "Second logoff MUST return STATUS_USER_SESSION_DELETED"
+            );
+        } else {
+            panic!("Expected HandlerError::Status, got {:?}", logoff2_result);
+        }
+    }
+
+    // ==========================================================================
+    // Test: Message Signing Key Storage
+    // ==========================================================================
+    // Per MS-SMB2 3.3.5.5.3: After successful authentication, the signing key
+    // must be stored and used for signing subsequent messages.
+    // ==========================================================================
+
+    #[tokio::test]
+    async fn test_signing_key_stored_after_session_setup() {
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // Before session setup, no signing keys
+        assert!(
+            handler.signing_keys.is_empty(),
+            "No signing keys before session setup"
+        );
+
+        // Establish a session
+        let session_request = build_session_setup_request(0, b"auth_token");
+        let session_header = Smb2Header::read(&mut Cursor::new(&session_request[..64])).unwrap();
+        let session_response = handler
+            .handle_session_setup(&session_header, &session_request[64..], &session_request)
+            .await
+            .unwrap();
+        let session_id = extract_session_id_from_response(&session_response);
+
+        // After successful session setup, signing key should be stored
+        assert!(
+            handler.signing_keys.contains_key(&session_id),
+            "MS-SMB2 3.3.5.5.3: Signing key MUST be stored after successful SESSION_SETUP"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_signing_key_removed_after_logoff() {
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // Establish a session
+        let session_request = build_session_setup_request(0, b"auth_token");
+        let session_header = Smb2Header::read(&mut Cursor::new(&session_request[..64])).unwrap();
+        let session_response = handler
+            .handle_session_setup(&session_header, &session_request[64..], &session_request)
+            .await
+            .unwrap();
+        let session_id = extract_session_id_from_response(&session_response);
+
+        // Verify signing key exists
+        assert!(handler.signing_keys.contains_key(&session_id));
+
+        // Logoff
+        let logoff_request = build_logoff_request(session_id);
+        let logoff_header = Smb2Header::read(&mut Cursor::new(&logoff_request[..64])).unwrap();
+        handler
+            .handle_logoff(&logoff_header, &logoff_request[64..])
+            .await
+            .unwrap();
+
+        // After logoff, signing key should be removed
+        assert!(
+            !handler.signing_keys.contains_key(&session_id),
+            "Signing key MUST be removed after LOGOFF"
+        );
+    }
+
+    // ==========================================================================
+    // Test: maybe_sign_response properly signs messages with stored key
+    // ==========================================================================
+
+    #[test]
+    fn test_maybe_sign_response_leaves_unsigned_when_no_key() {
+        // Create a mock response without a stored signing key
+        let mut response = [0u8; 72];
+        response[0..4].copy_from_slice(&[0xFE, b'S', b'M', b'B']);
+        response[4..6].copy_from_slice(&64u16.to_le_bytes());
+
+        let session_id: u64 = 999; // No key for this session
+        response[40..48].copy_from_slice(&session_id.to_le_bytes());
+
+        // Empty signing keys map
+        let signing_keys: HashMap<u64, Vec<u8>> = HashMap::new();
+
+        // The SIGNED flag should NOT be set when no key exists
+        let flags = u32::from_le_bytes([response[16], response[17], response[18], response[19]]);
+        assert_eq!(
+            flags & Smb2Flags::SIGNED,
+            0,
+            "Response should not be signed when no key exists"
+        );
+
+        // Verify signing_keys doesn't have the session
+        assert!(
+            !signing_keys.contains_key(&session_id),
+            "No signing key should exist for unknown session"
         );
     }
 }
