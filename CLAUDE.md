@@ -310,7 +310,11 @@ Do not commit code that fails any of these checks.
 
 ## Protocol References
 
-- [MS-SMB2 Specification](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/)
+**Primary Reference (all implementations and tests must be based on this):**
+- [docs/MS-SMB2-250728.md](./docs/MS-SMB2-250728.md) - Local copy of MS-SMB2 specification (July 2025)
+
+**Additional References:**
+- [MS-SMB2 Specification (online)](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/)
 - [Linux ksmbd Documentation](https://docs.kernel.org/filesystems/smb/ksmbd.html)
 
 ## SMB2 Commands (19 total)
