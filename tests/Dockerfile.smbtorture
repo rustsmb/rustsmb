@@ -68,124 +68,120 @@ WORKDIR /app
 # Copy binary from builder stage
 COPY --from=builder /app/target/release/rustsmb /app/rustsmb
 
-# Create test runner script inline (avoids needing tests/ in build context)
-RUN cat > /usr/local/bin/run-smbtorture << 'SCRIPT'
-#!/bin/bash
-# smbtorture test runner for RustSMB (embedded in Dockerfile)
-
-set -e
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-SUITE="${1:-all}"
-PORT="${SMB_PORT:-445}"
-SHARE="${SMB_SHARE:-test}"
-SHARE_PATH="${SMB_SHARE_PATH:-/tmp/share}"
-SERVER_BIN="${RUSTSMB_BIN:-/app/rustsmb}"
-RESULTS_DIR="${RESULTS_DIR:-/tmp/smbtorture-results}"
-
-mkdir -p "$RESULTS_DIR"
-
-SUITES=(
-    "smb2.connect" "smb2.session" "smb2.tcon" "smb2.create" "smb2.read"
-    "smb2.lock" "smb2.lease" "smb2.oplock" "smb2.durable-open"
-    "smb2.durable-v2-open" "smb2.compound" "smb2.credits" "smb2.dir"
-    "smb2.getinfo" "smb2.setinfo" "smb2.notify" "smb2.ioctl" "smb2.streams"
-    "smb2.delete-on-close" "smb2.deny" "smb2.sharemode" "smb2.replay"
-    "smb2.acls" "smb2.multichannel"
-)
-
-SERVER_PID=""
-cleanup() {
-    [ -n "$SERVER_PID" ] && kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-}
-trap cleanup EXIT INT TERM
-
-wait_for_port() {
-    echo -n "Waiting for 127.0.0.1:$PORT... "
-    for i in $(seq 1 30); do
-        if (echo >/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then
-            echo "ready"
-            return 0
-        fi
-        sleep 0.1
-    done
-    echo "timeout"
-    return 1
-}
-
-echo "Starting RustSMB server on port $PORT..."
-mkdir -p "$SHARE_PATH"
-"$SERVER_BIN" --listen "127.0.0.1:$PORT" --share-path "$SHARE_PATH" &
-SERVER_PID=$!
-
-if ! wait_for_port; then
-    echo -e "${RED}Error: Server failed to start${NC}"
-    exit 1
-fi
-echo "Server started (PID: $SERVER_PID)"
-echo ""
-
-run_suite() {
-    local suite=$1
-    local logfile="$RESULTS_DIR/${suite//\./_}.log"
-    echo -n "Running $suite... "
-    if smbtorture "//127.0.0.1/$SHARE" -N "$suite" > "$logfile" 2>&1; then
-        echo -e "${GREEN}PASS${NC}"
-        return 0
-    else
-        echo -e "${RED}FAIL${NC}"
-        return 1
-    fi
-}
-
-FAILED=0 PASSED=0 TOTAL=0
-FAILED_SUITES=()
-
-echo "========================================"
-echo "smbtorture SMB2 Test Suite"
-echo "Server: 127.0.0.1:$PORT"
-echo "Share: $SHARE"
-echo "========================================"
-echo ""
-
-if [ "$SUITE" = "all" ]; then
-    for suite in "${SUITES[@]}"; do
-        if run_suite "$suite"; then ((PASSED++)); else ((FAILED++)); FAILED_SUITES+=("$suite"); fi
-        ((TOTAL++))
-    done
-else
-    logfile="$RESULTS_DIR/${SUITE//\./_}.log"
-    if smbtorture "//127.0.0.1/$SHARE" -N "$SUITE" 2>&1 | tee "$logfile"; then
-        PASSED=1
-    else
-        FAILED=1
-        FAILED_SUITES+=("$SUITE")
-    fi
-    TOTAL=1
-fi
-
-echo ""
-echo "========================================"
-echo -e "Results: ${GREEN}$PASSED${NC}/${TOTAL} passed, ${RED}$FAILED${NC} failed"
-echo "========================================"
-
-if [ $FAILED -gt 0 ]; then
-    echo ""
-    echo "Failed suites:"
-    for suite in "${FAILED_SUITES[@]}"; do
-        echo "  - $suite"
-        tail -20 "$RESULTS_DIR/${suite//\./_}.log" 2>/dev/null || true
-    done
-fi
-
-exit $FAILED
-SCRIPT
-
-RUN chmod +x /usr/local/bin/run-smbtorture
+# Create test runner script (using printf to avoid HEREDOC issues)
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -e' \
+    '' \
+    'RED="\033[0;31m"' \
+    'GREEN="\033[0;32m"' \
+    'NC="\033[0m"' \
+    '' \
+    'SUITE="${1:-all}"' \
+    'PORT="${SMB_PORT:-445}"' \
+    'SHARE="${SMB_SHARE:-test}"' \
+    'SHARE_PATH="${SMB_SHARE_PATH:-/tmp/share}"' \
+    'SERVER_BIN="${RUSTSMB_BIN:-/app/rustsmb}"' \
+    'RESULTS_DIR="${RESULTS_DIR:-/tmp/smbtorture-results}"' \
+    '' \
+    'mkdir -p "$RESULTS_DIR"' \
+    '' \
+    'SUITES=(' \
+    '    "smb2.connect" "smb2.session" "smb2.tcon" "smb2.create" "smb2.read"' \
+    '    "smb2.lock" "smb2.lease" "smb2.oplock" "smb2.durable-open"' \
+    '    "smb2.durable-v2-open" "smb2.compound" "smb2.credits" "smb2.dir"' \
+    '    "smb2.getinfo" "smb2.setinfo" "smb2.notify" "smb2.ioctl" "smb2.streams"' \
+    '    "smb2.delete-on-close" "smb2.deny" "smb2.sharemode" "smb2.replay"' \
+    '    "smb2.acls" "smb2.multichannel"' \
+    ')' \
+    '' \
+    'SERVER_PID=""' \
+    'cleanup() {' \
+    '    [ -n "$SERVER_PID" ] && kill $SERVER_PID 2>/dev/null || true' \
+    '    wait $SERVER_PID 2>/dev/null || true' \
+    '}' \
+    'trap cleanup EXIT INT TERM' \
+    '' \
+    'wait_for_port() {' \
+    '    echo -n "Waiting for 127.0.0.1:$PORT... "' \
+    '    for i in $(seq 1 30); do' \
+    '        if (echo >/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; then' \
+    '            echo "ready"' \
+    '            return 0' \
+    '        fi' \
+    '        sleep 0.1' \
+    '    done' \
+    '    echo "timeout"' \
+    '    return 1' \
+    '}' \
+    '' \
+    'echo "Starting RustSMB server on port $PORT..."' \
+    'mkdir -p "$SHARE_PATH"' \
+    '"$SERVER_BIN" --listen "127.0.0.1:$PORT" --share-path "$SHARE_PATH" &' \
+    'SERVER_PID=$!' \
+    '' \
+    'if ! wait_for_port; then' \
+    '    echo -e "${RED}Error: Server failed to start${NC}"' \
+    '    exit 1' \
+    'fi' \
+    'echo "Server started (PID: $SERVER_PID)"' \
+    'echo ""' \
+    '' \
+    'run_suite() {' \
+    '    local suite=$1' \
+    '    local logfile="$RESULTS_DIR/${suite//\\./_}.log"' \
+    '    echo -n "Running $suite... "' \
+    '    if smbtorture "//127.0.0.1/$SHARE" -N "$suite" > "$logfile" 2>&1; then' \
+    '        echo -e "${GREEN}PASS${NC}"' \
+    '        return 0' \
+    '    else' \
+    '        echo -e "${RED}FAIL${NC}"' \
+    '        return 1' \
+    '    fi' \
+    '}' \
+    '' \
+    'FAILED=0 PASSED=0 TOTAL=0' \
+    'FAILED_SUITES=()' \
+    '' \
+    'echo "========================================"' \
+    'echo "smbtorture SMB2 Test Suite"' \
+    'echo "Server: 127.0.0.1:$PORT"' \
+    'echo "Share: $SHARE"' \
+    'echo "========================================"' \
+    'echo ""' \
+    '' \
+    'if [ "$SUITE" = "all" ]; then' \
+    '    for suite in "${SUITES[@]}"; do' \
+    '        if run_suite "$suite"; then ((PASSED++)); else ((FAILED++)); FAILED_SUITES+=("$suite"); fi' \
+    '        ((TOTAL++))' \
+    '    done' \
+    'else' \
+    '    logfile="$RESULTS_DIR/${SUITE//\\./_}.log"' \
+    '    if smbtorture "//127.0.0.1/$SHARE" -N "$SUITE" 2>&1 | tee "$logfile"; then' \
+    '        PASSED=1' \
+    '    else' \
+    '        FAILED=1' \
+    '        FAILED_SUITES+=("$SUITE")' \
+    '    fi' \
+    '    TOTAL=1' \
+    'fi' \
+    '' \
+    'echo ""' \
+    'echo "========================================"' \
+    'echo -e "Results: ${GREEN}$PASSED${NC}/${TOTAL} passed, ${RED}$FAILED${NC} failed"' \
+    'echo "========================================"' \
+    '' \
+    'if [ $FAILED -gt 0 ]; then' \
+    '    echo ""' \
+    '    echo "Failed suites:"' \
+    '    for suite in "${FAILED_SUITES[@]}"; do' \
+    '        echo "  - $suite"' \
+    '        tail -20 "$RESULTS_DIR/${suite//\\./_}.log" 2>/dev/null || true' \
+    '    done' \
+    'fi' \
+    '' \
+    'exit $FAILED' \
+    > /usr/local/bin/run-smbtorture && chmod +x /usr/local/bin/run-smbtorture
 
 # Create test share directory
 RUN mkdir -p /tmp/share
