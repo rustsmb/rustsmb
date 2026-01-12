@@ -175,6 +175,11 @@ pub struct HandleState {
     /// Used for cleanup when a server fails.
     #[serde(default)]
     pub bound_server_id: Option<String>,
+
+    /// Delete file when handle is closed.
+    /// Set via FileDispositionInformation (SET_INFO).
+    #[serde(default)]
+    pub delete_on_close: bool,
 }
 
 impl Default for HandleState {
@@ -207,6 +212,7 @@ impl Default for HandleState {
             lease_key: None,
             oplock_level: 0,
             bound_server_id: None,
+            delete_on_close: false,
         }
     }
 }

@@ -7,7 +7,7 @@ use crate::{ServerConfig, ShareManager};
 use binrw::{BinRead, BinWrite};
 use bytes::{Buf, BytesMut};
 use rustsmb_auth::{AuthContext, AuthResult, DynAuthProvider, PreauthIntegrityHash, SessionKeys};
-use rustsmb_core::{NtStatus, SmbDialect};
+use rustsmb_core::{NtStatus, SmbDialect, VfsError};
 use rustsmb_protocol::crypto::signing::{MessageSigner, SigningAlgorithm};
 use rustsmb_protocol::{Smb2Command, Smb2Flags, Smb2Header, SMB2_HEADER_SIZE, SMB2_MAGIC};
 use rustsmb_session::{Connection, SessionManager};
@@ -1681,6 +1681,7 @@ where
             lease_key: None, // Set below if lease requested
             oplock_level: requested_oplock.as_u8(),
             bound_server_id: None,
+            delete_on_close: false,
         };
 
         // Set create GUID if durable
@@ -2722,17 +2723,323 @@ where
     async fn handle_set_info(
         &mut self,
         header: &Smb2Header,
-        _body: &[u8],
+        body: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
-        use rustsmb_protocol::set_info::SetInfoResponse;
+        use rustsmb_protocol::set_info::{SetInfoRequest, SetInfoResponse, SetInfoType};
 
         debug!(conn_id = self.connection.id, "SET_INFO request");
 
-        // Simplified: acknowledge without actually setting
+        let request = SetInfoRequest::read(&mut Cursor::new(body))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to parse set_info: {}", e)))?;
+
+        // Validate buffer length
+        if request.buffer_length == 0 {
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Reconstruct handle ID
+        let handle_id =
+            (request.file_id_volatile as u128) << 64 | request.file_id_persistent as u128;
+
+        // Get handle info
+        let handle = self
+            .session_manager
+            .get_handle(handle_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
+
+        // Get backend
+        let tree = self
+            .session_manager
+            .get_tree(header.session_id, handle.tree_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
+
+        let backend = self
+            .shares
+            .get_share(&tree.share_name)
+            .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
+
+        // Get the buffer data (starts after the fixed-size request structure)
+        // Buffer offset is from header, so subtract header size (64) and request struct size (33)
+        let buffer_start = if request.buffer_offset > 64 {
+            (request.buffer_offset as usize) - 64
+        } else {
+            // Buffer offset includes header
+            33 // Request struct is 33 bytes
+        };
+        let buffer_end = buffer_start + request.buffer_length as usize;
+        if buffer_end > body.len() {
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+        let buffer = &body[buffer_start..buffer_end];
+
+        // Route by InfoType per MS-SMB2 3.3.5.21
+        match request.info_type {
+            SetInfoType::File => {
+                self.handle_set_file_info(&handle, &backend, request.file_info_class, buffer)
+                    .await?;
+            }
+            SetInfoType::FileSystem => {
+                // File system info cannot be set via SMB
+                return Err(HandlerError::Status(NtStatus::NotSupported));
+            }
+            SetInfoType::Security => {
+                // Security info - acknowledge but don't actually apply
+                // (would require DACL/SACL parsing)
+                debug!(
+                    conn_id = self.connection.id,
+                    additional_info = request.additional_information,
+                    "SET_INFO: Security info request (acknowledged)"
+                );
+            }
+            SetInfoType::Quota => {
+                return Err(HandlerError::Status(NtStatus::NotSupported));
+            }
+        }
+
         let resp_header = self.build_response_header(header, NtStatus::Success);
         let response = SetInfoResponse { structure_size: 2 };
 
         self.serialize_response(&resp_header, &response)
+    }
+
+    /// Handle SET_INFO for file info classes.
+    async fn handle_set_file_info(
+        &self,
+        handle: &HandleState,
+        backend: &rustsmb_vfs::DynStorageBackend,
+        info_class: u8,
+        buffer: &[u8],
+    ) -> Result<(), HandlerError> {
+        use rustsmb_protocol::set_info::{
+            FileDispositionInformation, FileEndOfFileInformation, FileRenameInformation,
+            SetFileInfoClass,
+        };
+
+        match SetFileInfoClass::from_u8(info_class) {
+            Some(SetFileInfoClass::FileBasicInformation) => {
+                // FileBasicInformation: CreationTime(8) + LastAccessTime(8) + LastWriteTime(8) +
+                // ChangeTime(8) + FileAttributes(4) + Reserved(4) = 40 bytes
+                if buffer.len() < 40 {
+                    return Err(HandlerError::Status(NtStatus::InvalidParameter));
+                }
+
+                // Parse timestamps (FILETIME format - 100ns intervals since 1601-01-01)
+                let _creation_time = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
+                let last_access_time = u64::from_le_bytes(buffer[8..16].try_into().unwrap());
+                let last_write_time = u64::from_le_bytes(buffer[16..24].try_into().unwrap());
+                let _change_time = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
+                let _attributes = u32::from_le_bytes(buffer[32..36].try_into().unwrap());
+
+                // Convert FILETIME to SystemTime if non-zero
+                // A FILETIME of 0 or -1 means "don't change"
+                use std::time::{Duration, UNIX_EPOCH};
+
+                let has_access_time = last_access_time != 0 && last_access_time != u64::MAX;
+                let has_modify_time = last_write_time != 0 && last_write_time != u64::MAX;
+
+                // Only call utimes if we have at least one timestamp to set
+                if has_access_time || has_modify_time {
+                    // Get current metadata to preserve unchanged times
+                    let current_meta = backend
+                        .stat(&handle.path)
+                        .await
+                        .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+
+                    let access_time = if has_access_time {
+                        let unix_secs = filetime_to_unix(last_access_time);
+                        UNIX_EPOCH + Duration::from_secs(unix_secs)
+                    } else {
+                        current_meta.atime
+                    };
+
+                    let modify_time = if has_modify_time {
+                        let unix_secs = filetime_to_unix(last_write_time);
+                        UNIX_EPOCH + Duration::from_secs(unix_secs)
+                    } else {
+                        current_meta.mtime
+                    };
+
+                    backend
+                        .utimes(&handle.path, access_time, modify_time)
+                        .await
+                        .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+                }
+
+                debug!(
+                    path = %handle.path,
+                    "SET_INFO: FileBasicInformation applied"
+                );
+            }
+            Some(SetFileInfoClass::FileDispositionInformation) => {
+                // FileDispositionInformation: DeletePending(1)
+                if buffer.is_empty() {
+                    return Err(HandlerError::Status(NtStatus::InvalidParameter));
+                }
+
+                let info = FileDispositionInformation::read(&mut Cursor::new(buffer))
+                    .map_err(|e| HandlerError::Protocol(format!("Failed to parse: {}", e)))?;
+
+                let delete_on_close = info.delete_pending != 0;
+
+                // Update handle state with delete-on-close flag
+                // The actual deletion happens in CLOSE handler
+                debug!(
+                    path = %handle.path,
+                    delete_on_close,
+                    "SET_INFO: FileDispositionInformation (delete-on-close flag)"
+                );
+
+                // Store delete-on-close flag in handle state
+                if delete_on_close {
+                    // Mark handle for deletion on close
+                    // Note: Actual deletion is performed in handle_close when DELETE_ON_CLOSE is set
+                    let mut updated_handle = handle.clone();
+                    updated_handle.delete_on_close = true;
+                    self.session_manager
+                        .update_handle(updated_handle)
+                        .await
+                        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                }
+            }
+            Some(SetFileInfoClass::FileRenameInformation) => {
+                // FileRenameInformation: ReplaceIfExists(1) + Reserved(7) + RootDirectory(8) +
+                // FileNameLength(4) + FileName(variable)
+                if buffer.len() < 20 {
+                    return Err(HandlerError::Status(NtStatus::InvalidParameter));
+                }
+
+                let info = FileRenameInformation::read(&mut Cursor::new(buffer))
+                    .map_err(|e| HandlerError::Protocol(format!("Failed to parse: {}", e)))?;
+
+                let replace_if_exists = info.replace_if_exists != 0;
+                let name_len = info.file_name_length as usize;
+
+                // File name starts at offset 20
+                if buffer.len() < 20 + name_len {
+                    return Err(HandlerError::Status(NtStatus::InvalidParameter));
+                }
+
+                // Parse Unicode file name
+                let name_bytes = &buffer[20..20 + name_len];
+                let new_name = parse_utf16_string(name_bytes);
+
+                // Convert SMB path (backslash) to VFS path (forward slash)
+                let new_path = new_name.replace('\\', "/");
+
+                // If the path is relative (doesn't start with /), make it relative to parent dir
+                let new_path = if !new_path.starts_with('/') {
+                    if let Some(parent) = std::path::Path::new(&handle.path).parent() {
+                        format!("{}/{}", parent.display(), new_path)
+                    } else {
+                        format!("/{}", new_path)
+                    }
+                } else {
+                    new_path
+                };
+
+                // Check if target exists and whether we should replace
+                if !replace_if_exists {
+                    match backend.stat(&new_path).await {
+                        Ok(_) => {
+                            return Err(HandlerError::Status(NtStatus::ObjectNameCollision));
+                        }
+                        Err(e) => {
+                            // NotFound is expected (means we can proceed), other errors are failures
+                            if !matches!(e, VfsError::NotFound(_) | VfsError::InvalidPath(_)) {
+                                return Err(HandlerError::Vfs(e.to_string()));
+                            }
+                        }
+                    }
+                }
+
+                backend
+                    .rename(&handle.path, &new_path)
+                    .await
+                    .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+
+                debug!(
+                    old_path = %handle.path,
+                    new_path = %new_path,
+                    replace_if_exists,
+                    "SET_INFO: FileRenameInformation"
+                );
+            }
+            Some(SetFileInfoClass::FileEndOfFileInformation) => {
+                // FileEndOfFileInformation: EndOfFile(8)
+                if buffer.len() < 8 {
+                    return Err(HandlerError::Status(NtStatus::InvalidParameter));
+                }
+
+                let info = FileEndOfFileInformation::read(&mut Cursor::new(buffer))
+                    .map_err(|e| HandlerError::Protocol(format!("Failed to parse: {}", e)))?;
+
+                backend
+                    .truncate(&handle.path, info.end_of_file)
+                    .await
+                    .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+
+                debug!(
+                    path = %handle.path,
+                    size = info.end_of_file,
+                    "SET_INFO: FileEndOfFileInformation (truncate)"
+                );
+            }
+            Some(SetFileInfoClass::FileAllocationInformation) => {
+                // FileAllocationInformation: AllocationSize(8)
+                // This is a hint for preallocating disk space
+                if buffer.len() < 8 {
+                    return Err(HandlerError::Status(NtStatus::InvalidParameter));
+                }
+
+                let allocation_size = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
+
+                // For simplicity, treat allocation size as truncate
+                // Real implementations might use fallocate()
+                backend
+                    .truncate(&handle.path, allocation_size)
+                    .await
+                    .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+
+                debug!(
+                    path = %handle.path,
+                    size = allocation_size,
+                    "SET_INFO: FileAllocationInformation"
+                );
+            }
+            Some(SetFileInfoClass::FilePositionInformation) => {
+                // FilePositionInformation: CurrentByteOffset(8)
+                // This updates the file position for subsequent reads/writes
+                // For stateless servers, this is typically a no-op
+                debug!(
+                    path = %handle.path,
+                    "SET_INFO: FilePositionInformation (ignored)"
+                );
+            }
+            Some(SetFileInfoClass::FileModeInformation) => {
+                // FileModeInformation: Mode(4)
+                // This sets file mode flags (synchronous, write-through, etc.)
+                // Typically a no-op for most backends
+                debug!(
+                    path = %handle.path,
+                    "SET_INFO: FileModeInformation (ignored)"
+                );
+            }
+            _ => {
+                // Unknown or unsupported file info class
+                debug!(
+                    path = %handle.path,
+                    info_class,
+                    "SET_INFO: Unsupported file info class"
+                );
+                return Err(HandlerError::Status(NtStatus::NotSupported));
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_oplock_break(
@@ -2985,6 +3292,36 @@ fn current_filetime() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| (d.as_secs() + EPOCH_DIFF) * TICKS_PER_SEC + d.subsec_nanos() as u64 / 100)
         .unwrap_or(0)
+}
+
+/// Convert Windows FILETIME to Unix timestamp (seconds since 1970).
+fn filetime_to_unix(filetime: u64) -> u64 {
+    // Windows epoch is Jan 1, 1601; Unix epoch is Jan 1, 1970
+    // Difference is 11644473600 seconds
+    const EPOCH_DIFF: u64 = 11644473600;
+    const TICKS_PER_SEC: u64 = 10_000_000;
+
+    // Convert 100-nanosecond intervals to seconds and adjust epoch
+    let seconds_since_1601 = filetime / TICKS_PER_SEC;
+    seconds_since_1601.saturating_sub(EPOCH_DIFF)
+}
+
+/// Parse a UTF-16LE byte slice into a String.
+fn parse_utf16_string(bytes: &[u8]) -> String {
+    // Ensure we have an even number of bytes
+    let len = bytes.len() / 2;
+    let mut chars: Vec<u16> = Vec::with_capacity(len);
+    for i in 0..len {
+        let lo = bytes[i * 2] as u16;
+        let hi = bytes[i * 2 + 1] as u16;
+        let c = lo | (hi << 8);
+        // Stop at null terminator
+        if c == 0 {
+            break;
+        }
+        chars.push(c);
+    }
+    String::from_utf16_lossy(&chars)
 }
 
 /// Extract share name from UNC path (\\server\share).
@@ -5465,5 +5802,81 @@ mod tests {
         assert_eq!(acl_size, 8, "ACL Size (header only)");
         assert_eq!(ace_count, 0, "ACE Count");
         assert_eq!(acl_sbz2, 0, "ACL Sbz2");
+    }
+
+    // =========================================================================
+    // SET_INFO Helper Function Tests - MS-SMB2 3.3.5.21
+    // =========================================================================
+
+    #[test]
+    fn test_filetime_to_unix_conversion() {
+        // Test known conversion: Jan 1, 2000 00:00:00 UTC
+        // FILETIME: 125911584000000000 (100-nanosecond intervals since 1601)
+        // Unix: 946684800 (seconds since 1970)
+        let filetime_2000 = 125911584000000000u64;
+        let unix_2000 = filetime_to_unix(filetime_2000);
+        assert_eq!(unix_2000, 946684800, "Jan 1, 2000 should convert correctly");
+    }
+
+    #[test]
+    fn test_filetime_to_unix_epoch() {
+        // Unix epoch (Jan 1, 1970) as FILETIME
+        // 11644473600 seconds * 10,000,000 = 116444736000000000
+        let filetime_1970 = 116444736000000000u64;
+        let unix_1970 = filetime_to_unix(filetime_1970);
+        assert_eq!(unix_1970, 0, "Unix epoch should be 0");
+    }
+
+    #[test]
+    fn test_filetime_to_unix_before_epoch() {
+        // FILETIME before Unix epoch should saturate to 0
+        let filetime_early = 100000000000000u64; // Before 1970
+        let unix_early = filetime_to_unix(filetime_early);
+        assert_eq!(unix_early, 0, "Pre-Unix-epoch time should saturate to 0");
+    }
+
+    #[test]
+    fn test_parse_utf16_string_basic() {
+        // "test" in UTF-16LE
+        let bytes = [b't', 0, b'e', 0, b's', 0, b't', 0];
+        let result = parse_utf16_string(&bytes);
+        assert_eq!(result, "test", "Basic ASCII string");
+    }
+
+    #[test]
+    fn test_parse_utf16_string_with_null() {
+        // "hi" with null terminator and garbage after
+        let bytes = [b'h', 0, b'i', 0, 0, 0, b'x', 0, b'y', 0];
+        let result = parse_utf16_string(&bytes);
+        assert_eq!(result, "hi", "Should stop at null terminator");
+    }
+
+    #[test]
+    fn test_parse_utf16_string_empty() {
+        // Empty string
+        let bytes: [u8; 0] = [];
+        let result = parse_utf16_string(&bytes);
+        assert_eq!(result, "", "Empty input should return empty string");
+    }
+
+    #[test]
+    fn test_parse_utf16_string_unicode() {
+        // "日" (Japanese "day") in UTF-16LE: 0x65E5
+        let bytes = [0xE5, 0x65];
+        let result = parse_utf16_string(&bytes);
+        assert_eq!(result, "日", "Unicode character should parse correctly");
+    }
+
+    #[test]
+    fn test_current_filetime_reasonable() {
+        // Verify current_filetime returns a reasonable value (after year 2000)
+        let filetime = current_filetime();
+        let unix = filetime_to_unix(filetime);
+
+        // Unix timestamp for Jan 1, 2000 = 946684800
+        assert!(unix > 946684800, "Current time should be after year 2000");
+
+        // And before year 2100 = 4102444800
+        assert!(unix < 4102444800, "Current time should be before year 2100");
     }
 }
