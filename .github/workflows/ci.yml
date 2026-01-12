@@ -99,8 +99,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y samba-testsuite
+      - name: Build release binary
+        run: cargo build --release
       - name: Run smbtorture tests
-        run: cargo test --test smbtorture_runner -- --ignored --nocapture
+        run: ./tests/scripts/smbtorture.sh all
 
   python-smb-test:
     name: Python SMB Tests (smbprotocol)

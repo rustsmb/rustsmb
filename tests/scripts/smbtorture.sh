@@ -1,13 +1,19 @@
 #!/bin/bash
-# Docker entrypoint script for smbtorture tests
+# smbtorture test runner for RustSMB
 #
 # Usage:
-#   ./docker-smbtorture.sh [suite|all]
+#   ./smbtorture.sh [suite|all]
 #
 # Examples:
-#   ./docker-smbtorture.sh              # Run all suites
-#   ./docker-smbtorture.sh all          # Run all suites
-#   ./docker-smbtorture.sh smb2.connect # Run specific suite
+#   ./smbtorture.sh              # Run all suites
+#   ./smbtorture.sh all          # Run all suites
+#   ./smbtorture.sh smb2.connect # Run specific suite
+#
+# Environment variables:
+#   RUSTSMB_BIN     - Path to RustSMB server binary (default: ./target/release/rustsmb)
+#   SMB_PORT        - Port to listen on (default: 445)
+#   SMB_SHARE       - Share name (default: test)
+#   SMB_SHARE_PATH  - Share directory path (default: /tmp/share)
 
 set -e
 
@@ -15,6 +21,7 @@ SUITE="${1:-all}"
 PORT="${SMB_PORT:-445}"
 SHARE="${SMB_SHARE:-test}"
 SHARE_PATH="${SMB_SHARE_PATH:-/tmp/share}"
+SERVER_BIN="${RUSTSMB_BIN:-./target/release/rustsmb}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -51,8 +58,9 @@ SUITES=(
 
 # Start the RustSMB server
 echo "Starting RustSMB server on port $PORT..."
+echo "Using binary: $SERVER_BIN"
 mkdir -p "$SHARE_PATH"
-/app/target/release/rustsmb --listen "127.0.0.1:$PORT" --share-path "$SHARE_PATH" &
+"$SERVER_BIN" --listen "127.0.0.1:$PORT" --share-path "$SHARE_PATH" &
 SERVER_PID=$!
 
 # Wait for server to start

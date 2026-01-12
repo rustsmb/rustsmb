@@ -45,13 +45,14 @@ RUN cargo build --release
 RUN mkdir -p /tmp/share
 
 # Copy test runner script
-COPY tests/scripts/docker-smbtorture.sh /usr/local/bin/run-smbtorture
+COPY tests/scripts/smbtorture.sh /usr/local/bin/run-smbtorture
 RUN chmod +x /usr/local/bin/run-smbtorture
 
 # Default environment
 ENV RUST_LOG=info
 ENV SMB_PORT=445
 ENV SMB_SHARE=test
+ENV RUSTSMB_BIN=/app/target/release/rustsmb
 
 # Run smbtorture tests
 ENTRYPOINT ["/usr/local/bin/run-smbtorture"]
