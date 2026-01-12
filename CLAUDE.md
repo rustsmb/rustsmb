@@ -536,7 +536,10 @@ Fix all failing smbtorture tests by implementing missing SMB2 functionality per 
   - Added `supports_multi_credit()` to Connection
   - Added `validate_credit_charge()` helper to ConnectionHandler
   - Call validation in READ, WRITE, IOCTL, QUERY_DIRECTORY, QUERY_INFO handlers
-- [ ] Phase 16B: Fix smb2.tcon (ShareFlags, Capabilities, MaximalAccess)
+- [x] Phase 16B: Fix smb2.tcon (ShareFlags, Capabilities, MaximalAccess per MS-SMB2 2.2.10)
+  - Compute MaximalAccess based on share read_only config
+  - Set ShareFlags based on share properties (DFS support)
+  - Set ShareCapabilities based on available features
 - [ ] Phase 16C: Fix smb2.read (MinimumCount validation)
 - [ ] Phase 16D: Fix smb2.getinfo (InfoType routing, more info classes)
 - [ ] Phase 16E: Fix smb2.setinfo (implement actual SET_INFO handler)

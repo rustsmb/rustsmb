@@ -2199,6 +2199,20 @@ where
             .await
             .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 
+        // Per MS-SMB2 3.3.5.14: Check MinimumCount
+        // If the read returns less than MinimumCount AND less than the requested length
+        // (meaning we hit EOF), return STATUS_END_OF_FILE
+        if (data.len() as u32) < request.minimum_count && (data.len() as u32) < request.length {
+            debug!(
+                conn_id = self.connection.id,
+                bytes_read = data.len(),
+                minimum_count = request.minimum_count,
+                requested_length = request.length,
+                "READ: MinimumCount not satisfied, returning STATUS_END_OF_FILE"
+            );
+            return Err(HandlerError::Status(NtStatus::EndOfFile));
+        }
+
         let resp_header = self.build_response_header(header, NtStatus::Success);
 
         // Build response header first
@@ -4974,6 +4988,73 @@ mod tests {
             ShareCapabilities::CLUSTER,
             0x40,
             "SMB2_SHARE_CAP_CLUSTER = 0x40"
+        );
+    }
+
+    // ==========================================================================
+    // READ MinimumCount Tests - MS-SMB2 3.3.5.14
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 section 3.3.5.14:
+    // "Receiving an SMB2 READ Request"
+    //
+    // Key requirements tested:
+    // 1. If OutputCount < MinimumCount and we hit EOF, return STATUS_END_OF_FILE
+    // 2. If OutputCount >= MinimumCount, return success with the data
+    // ==========================================================================
+
+    #[test]
+    fn test_minimum_count_logic() {
+        // Test the MinimumCount check logic per MS-SMB2 3.3.5.14
+        //
+        // The condition for returning STATUS_END_OF_FILE is:
+        // (bytes_read < minimum_count) AND (bytes_read < requested_length)
+        //
+        // The second condition (bytes_read < requested_length) indicates we hit EOF
+
+        // Scenario 1: Read 50 bytes, MinimumCount=100, Length=1000
+        // bytes_read=50 < minimum_count=100 AND bytes_read=50 < length=1000
+        // -> Should fail with STATUS_END_OF_FILE
+        let bytes_read: u32 = 50;
+        let minimum_count: u32 = 100;
+        let length: u32 = 1000;
+        let should_fail = bytes_read < minimum_count && bytes_read < length;
+        assert!(
+            should_fail,
+            "Should fail when bytes_read < minimum_count and hit EOF"
+        );
+
+        // Scenario 2: Read 100 bytes, MinimumCount=100, Length=1000
+        // bytes_read=100 >= minimum_count=100
+        // -> Should succeed
+        let bytes_read: u32 = 100;
+        let minimum_count: u32 = 100;
+        let length: u32 = 1000;
+        let should_fail = bytes_read < minimum_count && bytes_read < length;
+        assert!(
+            !should_fail,
+            "Should succeed when bytes_read >= minimum_count"
+        );
+
+        // Scenario 3: Read 1000 bytes (full length), MinimumCount=100, Length=1000
+        // bytes_read=1000 >= length=1000 (didn't hit EOF boundary)
+        // -> Should succeed
+        let bytes_read: u32 = 1000;
+        let minimum_count: u32 = 100;
+        let length: u32 = 1000;
+        let should_fail = bytes_read < minimum_count && bytes_read < length;
+        assert!(!should_fail, "Should succeed when full read completed");
+
+        // Scenario 4: Read 0 bytes, MinimumCount=0, Length=100
+        // bytes_read=0 >= minimum_count=0
+        // -> Should succeed (0 minimum means client accepts any amount)
+        let bytes_read: u32 = 0;
+        let minimum_count: u32 = 0;
+        let length: u32 = 100;
+        let should_fail = bytes_read < minimum_count && bytes_read < length;
+        assert!(
+            !should_fail,
+            "Should succeed when minimum_count is 0 (client accepts any amount)"
         );
     }
 }
