@@ -258,28 +258,12 @@ impl AuthProvider for SpnegoProvider {
 
             // If not SPNEGO, try raw NTLM (some clients skip SPNEGO)
             debug!("Token is not SPNEGO, trying raw mechanism");
+            context.raw_mechanism = true;
             let result = self.inner.authenticate(context, token).await?;
 
-            // Wrap response if needed
-            match result {
-                AuthResult::Continue { response_token } => {
-                    // Wrap in SPNEGO only if it's not already
-                    if response_token.len() >= 2 && response_token[0] == 0xa1 {
-                        Ok(AuthResult::Continue { response_token })
-                    } else {
-                        let resp = build_neg_token_resp(
-                            Some(NegState::AcceptIncomplete),
-                            Some(&self.mech_oid),
-                            Some(&response_token),
-                            None,
-                        );
-                        Ok(AuthResult::Continue {
-                            response_token: resp,
-                        })
-                    }
-                }
-                other => Ok(other),
-            }
+            // For raw mechanism, don't wrap in SPNEGO - return raw response
+            // Some clients (e.g., smbtorture) send raw NTLM and expect raw NTLM back
+            Ok(result)
         })
     }
 

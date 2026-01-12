@@ -229,6 +229,59 @@ where
         body: &[u8],
         full_message: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
+        // Validate session for commands that require it
+        // (all except Negotiate, SessionSetup, and Echo)
+        let requires_session = !matches!(
+            header.command,
+            Smb2Command::Negotiate | Smb2Command::SessionSetup | Smb2Command::Echo
+        );
+
+        if requires_session && header.session_id != 0 {
+            let session_exists = self
+                .session_manager
+                .get_session(header.session_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+
+            if !session_exists {
+                return Err(HandlerError::Status(NtStatus::UserSessionDeleted));
+            }
+        }
+
+        // Validate tree connection for commands that require it
+        // (file operations, but not session/tree management or control commands)
+        let requires_tree = matches!(
+            header.command,
+            Smb2Command::Create
+                | Smb2Command::Close
+                | Smb2Command::Flush
+                | Smb2Command::Read
+                | Smb2Command::Write
+                | Smb2Command::Lock
+                | Smb2Command::Ioctl
+                | Smb2Command::QueryDirectory
+                | Smb2Command::ChangeNotify
+                | Smb2Command::QueryInfo
+                | Smb2Command::SetInfo
+                | Smb2Command::OplockBreak
+        );
+
+        if requires_tree && header.tree_id != 0 {
+            let tree_exists = self
+                .session_manager
+                .get_tree(header.session_id, header.tree_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+
+            if !tree_exists {
+                return Err(HandlerError::Status(NtStatus::NetworkNameDeleted));
+            }
+        }
+
         match header.command {
             Smb2Command::Negotiate => self.handle_negotiate(header, body, full_message).await,
             Smb2Command::SessionSetup => {
@@ -909,6 +962,19 @@ where
             tree_id = header.tree_id,
             "TREE_DISCONNECT request"
         );
+
+        // Check if tree exists before deleting
+        let tree_exists = self
+            .session_manager
+            .get_tree(header.session_id, header.tree_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+
+        if !tree_exists {
+            return Err(HandlerError::Status(NtStatus::NetworkNameDeleted));
+        }
 
         let _ = self
             .session_manager
@@ -1617,18 +1683,33 @@ where
         let handle_id =
             (request.file_id_volatile as u128) << 64 | request.file_id_persistent as u128;
 
-        // Get handle first to check for lease
-        if let Ok(Some(handle)) = self.session_manager.get_handle(handle_id).await {
-            // Delete lease if present
-            if let Some(lease_key) = &handle.lease_key {
-                if let Err(e) = self
-                    .session_manager
-                    .state_store()
-                    .delete_lease(lease_key)
-                    .await
-                {
-                    debug!(error = %e, lease_key = %lease_key, "Failed to delete lease on close");
-                }
+        // Get handle first to check for lease and verify it exists
+        let handle = match self.session_manager.get_handle(handle_id).await {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                // Handle not found - already closed or never existed
+                return Err(HandlerError::Status(NtStatus::FileClosed));
+            }
+            Err(e) => {
+                debug!(error = %e, "Failed to get handle for close");
+                return Err(HandlerError::Status(NtStatus::FileClosed));
+            }
+        };
+
+        // Validate that the handle belongs to the tree in the request
+        if handle.tree_id != header.tree_id {
+            return Err(HandlerError::Status(NtStatus::NetworkNameDeleted));
+        }
+
+        // Delete lease if present
+        if let Some(lease_key) = &handle.lease_key {
+            if let Err(e) = self
+                .session_manager
+                .state_store()
+                .delete_lease(lease_key)
+                .await
+            {
+                debug!(error = %e, lease_key = %lease_key, "Failed to delete lease on close");
             }
         }
 
@@ -1693,6 +1774,11 @@ where
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
+
+        // Validate that the handle belongs to the tree in the request
+        if handle.tree_id != header.tree_id {
+            return Err(HandlerError::Status(NtStatus::NetworkNameDeleted));
+        }
 
         // Get tree and backend
         let tree = self
@@ -1769,6 +1855,11 @@ where
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
+
+        // Validate that the handle belongs to the tree in the request
+        if handle.tree_id != header.tree_id {
+            return Err(HandlerError::Status(NtStatus::NetworkNameDeleted));
+        }
 
         // Get tree and backend
         let tree = self
@@ -2075,6 +2166,11 @@ where
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
 
+        // Validate that the handle belongs to the tree in the request
+        if handle.tree_id != header.tree_id {
+            return Err(HandlerError::Status(NtStatus::NetworkNameDeleted));
+        }
+
         // Get backend
         let tree = self
             .session_manager
@@ -2094,8 +2190,22 @@ where
             .await
             .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 
-        // Build output buffer (simplified FileBothDirectoryInformation)
-        let output_buffer = build_directory_info(&entries);
+        debug!(
+            conn_id = self.connection.id,
+            path = %handle.path,
+            entry_count = entries.len(),
+            info_class = ?request.file_information_class,
+            "QUERY_DIRECTORY reading entries"
+        );
+
+        // Build output buffer using requested information class
+        let output_buffer = build_directory_info(&entries, request.file_information_class);
+
+        debug!(
+            conn_id = self.connection.id,
+            output_buffer_len = output_buffer.len(),
+            "QUERY_DIRECTORY built output buffer"
+        );
 
         let resp_header = self.build_response_header(header, NtStatus::Success);
         let response = QueryDirectoryResponse {
@@ -2145,6 +2255,11 @@ where
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
+
+        // Validate that the handle belongs to the tree in the request
+        if handle.tree_id != header.tree_id {
+            return Err(HandlerError::Status(NtStatus::NetworkNameDeleted));
+        }
 
         // Get backend
         let tree = self
@@ -2417,15 +2532,27 @@ fn decode_utf16le(bytes: &[u8]) -> String {
 }
 
 /// Build directory info buffer from entries.
-fn build_directory_info(entries: &[rustsmb_vfs::DirEntry]) -> Vec<u8> {
+fn build_directory_info(
+    entries: &[rustsmb_vfs::DirEntry],
+    info_class: rustsmb_protocol::query_directory::FileInformationClass,
+) -> Vec<u8> {
+    use rustsmb_protocol::query_directory::FileInformationClass;
+
     let mut buf = Vec::new();
 
     for (i, entry) in entries.iter().enumerate() {
         let name_bytes: Vec<u16> = entry.name.encode_utf16().collect();
         let name_len = name_bytes.len() * 2;
 
-        // FileBothDirectoryInformation structure
-        let entry_size = 94 + name_len; // Fixed fields + name
+        // Determine fixed size based on information class
+        let fixed_size = match info_class {
+            FileInformationClass::FileBothDirectoryInformation => 94,
+            FileInformationClass::FileIdBothDirectoryInformation => 104, // +2 reserved +8 file_id
+            FileInformationClass::FileIdFullDirectoryInformation => 88, // Similar to FileFull + file_id
+            _ => 94, // Default to FileBothDirectoryInformation
+        };
+
+        let entry_size = fixed_size + name_len;
         let next_offset = if i < entries.len() - 1 {
             // Align to 8 bytes
             (entry_size + 7) & !7
@@ -2448,8 +2575,17 @@ fn build_directory_info(entries: &[rustsmb_vfs::DirEntry]) -> Vec<u8> {
         buf.extend_from_slice(&(name_len as u32).to_le_bytes()); // FileNameLength
         buf.extend_from_slice(&0u32.to_le_bytes()); // EaSize
         buf.push(0); // ShortNameLength
-        buf.push(0); // Reserved
+        buf.push(0); // Reserved1
         buf.extend_from_slice(&[0u8; 24]); // ShortName (12 UTF-16 chars)
+
+        // Additional fields for FileIdBothDirectoryInformation
+        if matches!(
+            info_class,
+            FileInformationClass::FileIdBothDirectoryInformation
+        ) {
+            buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved2
+            buf.extend_from_slice(&(i as u64).to_le_bytes()); // FileId (use index as simple file ID)
+        }
 
         // FileName
         for c in name_bytes {

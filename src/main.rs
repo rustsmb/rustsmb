@@ -10,7 +10,7 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use rustsmb_auth::{NtlmAuthProvider, SpnegoProvider};
-use rustsmb_backend_memory::MemoryBackend;
+use rustsmb_backend_local::LocalBackend;
 use rustsmb_server::{ServerConfig, ShareConfig, SmbServer};
 use rustsmb_state_memory::MemoryStateStore;
 use rustsmb_vfs::StorageBackend;
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     // Create server
     let server = SmbServer::new(config, state, auth);
 
-    // Add a test share with memory backend
+    // Add a test share with local filesystem backend
     let share_config = ShareConfig {
         name: "test".to_string(),
         path: args.share_path.clone(),
@@ -91,8 +91,12 @@ async fn main() -> Result<()> {
         browseable: true,
     };
 
-    // Use memory backend for simplicity (LocalBackend requires Unix)
-    let backend: Arc<dyn StorageBackend + Send + Sync> = Arc::new(MemoryBackend::new());
+    // Use local filesystem backend with the provided share path
+    let backend: Arc<dyn StorageBackend + Send + Sync> = Arc::new(
+        LocalBackend::new(std::path::PathBuf::from(&args.share_path))
+            .await
+            .expect("Failed to create local backend"),
+    );
     server.shares().add_share("test", backend, share_config);
 
     info!("Share 'test' configured");

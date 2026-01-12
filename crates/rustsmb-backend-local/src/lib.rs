@@ -1017,7 +1017,7 @@ impl StorageBackend for LocalBackend {
                 let result = unsafe {
                     libc::listxattr(
                         path_cstr.as_ptr(),
-                        buffer.as_mut_ptr() as *mut i8,
+                        buffer.as_mut_ptr() as *mut libc::c_char,
                         buffer.len(),
                         0,
                     )
@@ -1063,7 +1063,7 @@ impl StorageBackend for LocalBackend {
                 let result = unsafe {
                     libc::listxattr(
                         path_cstr.as_ptr(),
-                        buffer.as_mut_ptr() as *mut i8,
+                        buffer.as_mut_ptr() as *mut libc::c_char,
                         buffer.len(),
                     )
                 };

@@ -103,6 +103,8 @@ pub struct AuthContext {
     pub anonymous_requested: bool,
     /// Pre-auth integrity hash (SMB 3.1.1).
     pub preauth_hash: Option<Vec<u8>>,
+    /// Whether client is using raw mechanism (not SPNEGO-wrapped).
+    pub raw_mechanism: bool,
 }
 
 /// Authentication state.

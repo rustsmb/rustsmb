@@ -209,12 +209,32 @@ impl NtlmAuthProvider {
 
         // Look up user
         let username_upper = msg.user_name.to_uppercase();
-        let (nt, user_info) = {
+        let user_data = {
             let users = self.users.read().unwrap();
-            users
-                .get(&username_upper)
-                .cloned()
-                .ok_or(AuthError::InvalidCredentials)?
+            users.get(&username_upper).cloned()
+        };
+
+        // If user not found, fall back to guest if allowed
+        // Note: We use guest (IS_GUEST) rather than anonymous (IS_NULL) because
+        // most SMB clients don't expect to be downgraded to anonymous when they
+        // send credentials. Guest sessions are more commonly accepted.
+        let (nt, user_info) = match user_data {
+            Some(data) => data,
+            None => {
+                if self.allow_anonymous {
+                    debug!(
+                        "User {} not found, falling back to guest session",
+                        msg.user_name
+                    );
+                    context.state = AuthState::Guest;
+                    return Ok(AuthResult::Success {
+                        user: UserInfo::guest(),
+                        session_key: vec![0; 16],
+                        response_token: None,
+                    });
+                }
+                return Err(AuthError::InvalidCredentials);
+            }
         };
 
         // Compute NTOWFv2 - MUST use the SAME domain the client used
