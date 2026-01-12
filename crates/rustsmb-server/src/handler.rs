@@ -1233,6 +1233,14 @@ where
             }
         }
 
+        // Check if file exists before opening (needed to determine create_action)
+        // Per MS-SMB2 2.2.14, create_action tells client what happened:
+        // - FILE_SUPERSEDED (0): An existing file was superseded
+        // - FILE_OPENED (1): An existing file was opened
+        // - FILE_CREATED (2): A new file was created
+        // - FILE_OVERWRITTEN (3): An existing file was overwritten
+        let file_existed = backend.stat(&filename).await.is_ok();
+
         // Pass SMB parameters directly to the backend - it handles the conversion
         let create_params = CreateParams {
             desired_access: request.desired_access,
@@ -1247,6 +1255,36 @@ where
             .await
             .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 
+        // Determine create_action based on disposition and whether file existed
+        // Per MS-SMB2 2.2.13 (CreateDisposition) and 2.2.14 (CreateAction):
+        let create_action: u32 = match request.create_disposition {
+            rustsmb_vfs::disposition::SUPERSEDE => {
+                if file_existed {
+                    0
+                } else {
+                    2
+                } // FILE_SUPERSEDED or FILE_CREATED
+            }
+            rustsmb_vfs::disposition::OPEN => 1, // FILE_OPENED (only succeeds if existed)
+            rustsmb_vfs::disposition::CREATE => 2, // FILE_CREATED (only succeeds if didn't exist)
+            rustsmb_vfs::disposition::OPEN_IF => {
+                if file_existed {
+                    1
+                } else {
+                    2
+                } // FILE_OPENED or FILE_CREATED
+            }
+            rustsmb_vfs::disposition::OVERWRITE => 3, // FILE_OVERWRITTEN (only succeeds if existed)
+            rustsmb_vfs::disposition::OVERWRITE_IF => {
+                if file_existed {
+                    3
+                } else {
+                    2
+                } // FILE_OVERWRITTEN or FILE_CREATED
+            }
+            _ => 1, // Default to FILE_OPENED
+        };
+
         // Generate handle IDs
         let handle_id = self
             .session_manager
@@ -1259,7 +1297,9 @@ where
         let mut is_persistent = false;
         let mut create_guid: Option<[u8; 16]> = None;
         let mut durable_timeout: u32 = 0;
-        let mut requested_oplock = OplockLevel::None;
+        // Use the requested oplock level from the CREATE request
+        // This can be overridden by lease contexts below
+        let mut requested_oplock = request.requested_oplock_level;
         let mut lease_key: Option<[u8; 16]> = None;
         let mut lease_state: u32 = 0;
 
@@ -1498,18 +1538,50 @@ where
             (152u32, ctx_data.len() as u32)
         };
 
+        // Determine file_attributes for response
+        // Per MS-SMB2: FILE_ATTRIBUTE_ARCHIVE (0x20) should be set for new files
+        // FILE_ATTRIBUTE_NORMAL (0x80) is only valid when NO other attributes are set
+        // For opened files, get actual attributes; for created, use requested or default
+        let response_file_attributes = if create_action == 2 {
+            // FILE_CREATED - use requested attributes, but ensure ARCHIVE is set
+            // Strip NORMAL (0x80) as it conflicts with having other attributes
+            let requested = request.file_attributes & !0x80; // Remove NORMAL if present
+            if requested == 0 {
+                0x20 // Just FILE_ATTRIBUTE_ARCHIVE for new files
+            } else {
+                requested | 0x20 // Add ARCHIVE to requested (excluding NORMAL)
+            }
+        } else {
+            // FILE_OPENED/OVERWRITTEN/SUPERSEDED - get actual file attributes
+            backend
+                .stat(&filename)
+                .await
+                .map(|m| {
+                    // Convert file type to SMB attributes
+                    let mut attrs = 0x20u32; // FILE_ATTRIBUTE_ARCHIVE
+                    if m.file_type == rustsmb_vfs::FileType::Directory {
+                        attrs |= 0x10; // FILE_ATTRIBUTE_DIRECTORY
+                    }
+                    if (m.mode & 0o200) == 0 {
+                        attrs |= 0x01; // FILE_ATTRIBUTE_READONLY
+                    }
+                    attrs
+                })
+                .unwrap_or(0x20) // Default to ARCHIVE if stat fails
+        };
+
         let response = CreateResponse {
             structure_size: 89,
             oplock_level: requested_oplock,
             flags: CreateResponseFlags(0),
-            create_action: 1, // Opened
+            create_action,
             creation_time: current_filetime(),
             last_access_time: current_filetime(),
             last_write_time: current_filetime(),
             change_time: current_filetime(),
             allocation_size: 0,
             end_of_file: 0,
-            file_attributes: 0x80, // Normal
+            file_attributes: response_file_attributes,
             reserved2: 0,
             file_id_persistent,
             file_id_volatile,
@@ -3749,5 +3821,316 @@ mod tests {
             !signing_keys.contains_key(&session_id),
             "No signing key should exist for unknown session"
         );
+    }
+
+    // ==========================================================================
+    // MS-SMB2 2.2.14 CREATE Response - create_action Tests
+    // ==========================================================================
+    //
+    // Per MS-SMB2 2.2.14, CreateAction indicates the action taken:
+    // - FILE_SUPERSEDED (0): An existing file was superseded
+    // - FILE_OPENED (1): An existing file was opened
+    // - FILE_CREATED (2): A new file was created
+    // - FILE_OVERWRITTEN (3): An existing file was overwritten
+    //
+    // The value depends on CreateDisposition (MS-SMB2 2.2.13) and whether
+    // the file existed before the operation.
+    // ==========================================================================
+
+    /// Helper to compute create_action based on disposition and file existence.
+    /// This mirrors the logic in handle_create.
+    fn compute_create_action(disposition: u32, file_existed: bool) -> u32 {
+        use rustsmb_vfs::disposition;
+
+        match disposition {
+            disposition::SUPERSEDE => {
+                if file_existed {
+                    0
+                } else {
+                    2
+                }
+            }
+            disposition::OPEN => 1,
+            disposition::CREATE => 2,
+            disposition::OPEN_IF => {
+                if file_existed {
+                    1
+                } else {
+                    2
+                }
+            }
+            disposition::OVERWRITE => 3,
+            disposition::OVERWRITE_IF => {
+                if file_existed {
+                    3
+                } else {
+                    2
+                }
+            }
+            _ => 1,
+        }
+    }
+
+    #[test]
+    fn test_create_action_supersede_existing_file() {
+        // MS-SMB2 2.2.13: FILE_SUPERSEDE - If exists, supersede; else create
+        // When file exists: create_action = FILE_SUPERSEDED (0)
+        let action = compute_create_action(rustsmb_vfs::disposition::SUPERSEDE, true);
+        assert_eq!(
+            action, 0,
+            "MS-SMB2: SUPERSEDE on existing file → FILE_SUPERSEDED (0)"
+        );
+    }
+
+    #[test]
+    fn test_create_action_supersede_new_file() {
+        // MS-SMB2 2.2.13: FILE_SUPERSEDE - If exists, supersede; else create
+        // When file doesn't exist: create_action = FILE_CREATED (2)
+        let action = compute_create_action(rustsmb_vfs::disposition::SUPERSEDE, false);
+        assert_eq!(
+            action, 2,
+            "MS-SMB2: SUPERSEDE on new file → FILE_CREATED (2)"
+        );
+    }
+
+    #[test]
+    fn test_create_action_open() {
+        // MS-SMB2 2.2.13: FILE_OPEN - If exists, open; else fail
+        // Always returns FILE_OPENED (1) since it only succeeds if file exists
+        let action = compute_create_action(rustsmb_vfs::disposition::OPEN, true);
+        assert_eq!(action, 1, "MS-SMB2: OPEN → FILE_OPENED (1)");
+    }
+
+    #[test]
+    fn test_create_action_create() {
+        // MS-SMB2 2.2.13: FILE_CREATE - If exists, fail; else create
+        // Always returns FILE_CREATED (2) since it only succeeds if file doesn't exist
+        let action = compute_create_action(rustsmb_vfs::disposition::CREATE, false);
+        assert_eq!(action, 2, "MS-SMB2: CREATE → FILE_CREATED (2)");
+    }
+
+    #[test]
+    fn test_create_action_open_if_existing() {
+        // MS-SMB2 2.2.13: FILE_OPEN_IF - If exists, open; else create
+        // When file exists: create_action = FILE_OPENED (1)
+        let action = compute_create_action(rustsmb_vfs::disposition::OPEN_IF, true);
+        assert_eq!(
+            action, 1,
+            "MS-SMB2: OPEN_IF on existing file → FILE_OPENED (1)"
+        );
+    }
+
+    #[test]
+    fn test_create_action_open_if_new() {
+        // MS-SMB2 2.2.13: FILE_OPEN_IF - If exists, open; else create
+        // When file doesn't exist: create_action = FILE_CREATED (2)
+        let action = compute_create_action(rustsmb_vfs::disposition::OPEN_IF, false);
+        assert_eq!(action, 2, "MS-SMB2: OPEN_IF on new file → FILE_CREATED (2)");
+    }
+
+    #[test]
+    fn test_create_action_overwrite() {
+        // MS-SMB2 2.2.13: FILE_OVERWRITE - If exists, overwrite; else fail
+        // Always returns FILE_OVERWRITTEN (3) since it only succeeds if file exists
+        let action = compute_create_action(rustsmb_vfs::disposition::OVERWRITE, true);
+        assert_eq!(action, 3, "MS-SMB2: OVERWRITE → FILE_OVERWRITTEN (3)");
+    }
+
+    #[test]
+    fn test_create_action_overwrite_if_existing() {
+        // MS-SMB2 2.2.13: FILE_OVERWRITE_IF - If exists, overwrite; else create
+        // When file exists: create_action = FILE_OVERWRITTEN (3)
+        let action = compute_create_action(rustsmb_vfs::disposition::OVERWRITE_IF, true);
+        assert_eq!(
+            action, 3,
+            "MS-SMB2: OVERWRITE_IF on existing file → FILE_OVERWRITTEN (3)"
+        );
+    }
+
+    #[test]
+    fn test_create_action_overwrite_if_new() {
+        // MS-SMB2 2.2.13: FILE_OVERWRITE_IF - If exists, overwrite; else create
+        // When file doesn't exist: create_action = FILE_CREATED (2)
+        let action = compute_create_action(rustsmb_vfs::disposition::OVERWRITE_IF, false);
+        assert_eq!(
+            action, 2,
+            "MS-SMB2: OVERWRITE_IF on new file → FILE_CREATED (2)"
+        );
+    }
+
+    // ==========================================================================
+    // MS-SMB2 2.2.14 CREATE Response - file_attributes Tests
+    // ==========================================================================
+    //
+    // Per MS-SMB2:
+    // - FILE_ATTRIBUTE_ARCHIVE (0x20) should be set for newly created files
+    // - FILE_ATTRIBUTE_NORMAL (0x80) is only valid when NO other attributes set
+    // - When NORMAL is combined with other attributes, NORMAL should be stripped
+    // ==========================================================================
+
+    /// File attribute constants for testing
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
+    const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+    /// Helper to compute response file_attributes for a created file.
+    /// This mirrors the logic in handle_create for create_action == 2.
+    fn compute_created_file_attributes(requested_attrs: u32) -> u32 {
+        let requested = requested_attrs & !FILE_ATTRIBUTE_NORMAL; // Remove NORMAL if present
+        if requested == 0 {
+            FILE_ATTRIBUTE_ARCHIVE // Just ARCHIVE for new files
+        } else {
+            requested | FILE_ATTRIBUTE_ARCHIVE // Add ARCHIVE to requested (excluding NORMAL)
+        }
+    }
+
+    #[test]
+    fn test_file_attributes_new_file_default() {
+        // Per MS-SMB2: Newly created files should have ARCHIVE attribute
+        // When no attributes requested, return just ARCHIVE
+        let attrs = compute_created_file_attributes(0);
+        assert_eq!(
+            attrs, FILE_ATTRIBUTE_ARCHIVE,
+            "MS-SMB2: New file with no requested attrs → FILE_ATTRIBUTE_ARCHIVE (0x20)"
+        );
+    }
+
+    #[test]
+    fn test_file_attributes_new_file_with_normal() {
+        // Per MS-SMB2: FILE_ATTRIBUTE_NORMAL (0x80) is only valid alone
+        // When client requests NORMAL, we should return ARCHIVE instead
+        let attrs = compute_created_file_attributes(FILE_ATTRIBUTE_NORMAL);
+        assert_eq!(
+            attrs, FILE_ATTRIBUTE_ARCHIVE,
+            "MS-SMB2: NORMAL alone should become ARCHIVE for new files"
+        );
+    }
+
+    #[test]
+    fn test_file_attributes_strips_normal_when_combined() {
+        // Per MS-SMB2: NORMAL (0x80) cannot be combined with other attributes
+        // If client sends NORMAL | HIDDEN, we strip NORMAL and add ARCHIVE
+        let requested = FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_HIDDEN;
+        let attrs = compute_created_file_attributes(requested);
+        assert_eq!(
+            attrs,
+            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE,
+            "MS-SMB2: NORMAL must be stripped when combined with other attrs"
+        );
+        assert_eq!(
+            attrs & FILE_ATTRIBUTE_NORMAL,
+            0,
+            "NORMAL attribute should not be present"
+        );
+    }
+
+    #[test]
+    fn test_file_attributes_preserves_requested() {
+        // Requested attributes (except NORMAL) should be preserved, with ARCHIVE added
+        let requested = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN;
+        let attrs = compute_created_file_attributes(requested);
+        assert_eq!(
+            attrs,
+            FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE,
+            "MS-SMB2: Requested attrs preserved with ARCHIVE added"
+        );
+    }
+
+    #[test]
+    fn test_file_attributes_archive_always_set_for_new_files() {
+        // ARCHIVE should always be set for newly created files
+        let attrs1 = compute_created_file_attributes(0);
+        let attrs2 = compute_created_file_attributes(FILE_ATTRIBUTE_READONLY);
+        let attrs3 = compute_created_file_attributes(FILE_ATTRIBUTE_NORMAL);
+
+        assert!(
+            (attrs1 & FILE_ATTRIBUTE_ARCHIVE) != 0,
+            "ARCHIVE must be set for new file (no attrs)"
+        );
+        assert!(
+            (attrs2 & FILE_ATTRIBUTE_ARCHIVE) != 0,
+            "ARCHIVE must be set for new file (READONLY)"
+        );
+        assert!(
+            (attrs3 & FILE_ATTRIBUTE_ARCHIVE) != 0,
+            "ARCHIVE must be set for new file (NORMAL)"
+        );
+    }
+
+    // ==========================================================================
+    // MS-SMB2 2.2.13/2.2.14 CREATE - oplock_level Tests
+    // ==========================================================================
+    //
+    // Per MS-SMB2 2.2.13, the CREATE request contains RequestedOplockLevel.
+    // Per MS-SMB2 2.2.14, the server should grant the requested oplock level
+    // (or a lower level if conflicts exist).
+    // ==========================================================================
+
+    #[test]
+    fn test_oplock_level_values() {
+        use rustsmb_protocol::create::OplockLevel;
+
+        // Verify oplock level constants per MS-SMB2
+        assert_eq!(OplockLevel::None.as_u8(), 0x00, "OPLOCK_LEVEL_NONE = 0x00");
+        assert_eq!(OplockLevel::LevelII.as_u8(), 0x01, "OPLOCK_LEVEL_II = 0x01");
+        assert_eq!(
+            OplockLevel::Exclusive.as_u8(),
+            0x08,
+            "OPLOCK_LEVEL_EXCLUSIVE = 0x08"
+        );
+        assert_eq!(
+            OplockLevel::Batch.as_u8(),
+            0x09,
+            "OPLOCK_LEVEL_BATCH = 0x09"
+        );
+        assert_eq!(
+            OplockLevel::Lease.as_u8(),
+            0xFF,
+            "OPLOCK_LEVEL_LEASE = 0xFF"
+        );
+    }
+
+    #[test]
+    fn test_oplock_level_from_u8() {
+        use rustsmb_protocol::create::OplockLevel;
+
+        // Verify round-trip conversion
+        assert_eq!(OplockLevel::from_u8(0x00), OplockLevel::None);
+        assert_eq!(OplockLevel::from_u8(0x01), OplockLevel::LevelII);
+        assert_eq!(OplockLevel::from_u8(0x08), OplockLevel::Exclusive);
+        assert_eq!(OplockLevel::from_u8(0x09), OplockLevel::Batch);
+        assert_eq!(OplockLevel::from_u8(0xFF), OplockLevel::Lease);
+    }
+
+    // ==========================================================================
+    // MS-SMB2 CREATE Response Constants Verification
+    // ==========================================================================
+
+    #[test]
+    fn test_create_action_constants() {
+        // Verify create_action values per MS-SMB2 2.2.14
+        const FILE_SUPERSEDED: u32 = 0;
+        const FILE_OPENED: u32 = 1;
+        const FILE_CREATED: u32 = 2;
+        const FILE_OVERWRITTEN: u32 = 3;
+
+        assert_eq!(FILE_SUPERSEDED, 0, "FILE_SUPERSEDED = 0x00000000");
+        assert_eq!(FILE_OPENED, 1, "FILE_OPENED = 0x00000001");
+        assert_eq!(FILE_CREATED, 2, "FILE_CREATED = 0x00000002");
+        assert_eq!(FILE_OVERWRITTEN, 3, "FILE_OVERWRITTEN = 0x00000003");
+    }
+
+    #[test]
+    fn test_disposition_constants() {
+        use rustsmb_vfs::disposition;
+
+        // Verify disposition values per MS-SMB2 2.2.13
+        assert_eq!(disposition::SUPERSEDE, 0, "FILE_SUPERSEDE = 0");
+        assert_eq!(disposition::OPEN, 1, "FILE_OPEN = 1");
+        assert_eq!(disposition::CREATE, 2, "FILE_CREATE = 2");
+        assert_eq!(disposition::OPEN_IF, 3, "FILE_OPEN_IF = 3");
+        assert_eq!(disposition::OVERWRITE, 4, "FILE_OVERWRITE = 4");
+        assert_eq!(disposition::OVERWRITE_IF, 5, "FILE_OVERWRITE_IF = 5");
     }
 }
