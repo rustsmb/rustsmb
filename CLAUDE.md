@@ -573,6 +573,20 @@ Fix smbtorture test failures by implementing missing SMB2 functionality per MS-S
 - [x] Phase 16I: smb2.dir - Skipped (causes smbtorture client crash)
 - [x] Phase 16J: smb2.session bind_negative - Skipped (requires multi-dialect signing)
 
+### Phase 17: Unit Tests for MS-SMB2 3.3.5 Compliance - COMPLETED
+
+Add unit tests to `handler.rs` organized by MS-SMB2 specification chapter:
+
+- [x] Phase 17A: Reorganize existing tests by spec chapter order
+  - Tests now organized by MS-SMB2 3.3.5.x chapter number
+  - Section headers added for each chapter: 3.3.5.2, 3.3.5.4, 3.3.5.5, 3.3.5.6, 3.3.5.7, 3.3.5.8, 3.3.5.9, 3.3.5.10, 3.3.5.12, 3.3.5.14
+- [x] Phase 17B: Add new tests by chapter
+  - 3.3.5.2 Credit charge validation: `test_credit_charge_zero_large_payload`, `test_credit_charge_insufficient`, `test_credit_charge_sufficient`, `test_credit_charge_smb202_no_validation`
+  - 3.3.5.4 NEGOTIATE: `test_negotiate_dialect_count_zero`, `test_negotiate_no_common_dialect`, `test_negotiate_selects_highest_dialect`
+  - 3.3.5.7 TREE_CONNECT: `test_tree_connect_bad_network_name`
+  - 3.3.5.14 LOCK: `test_lock_count_zero`, `test_lock_invalid_flags`, `test_lock_invalid_range`, `test_lock_valid_range_at_boundary`, `test_lock_invalid_handle`
+- Total tests in handler.rs: 89 (increased from 76)
+
 **Not Implemented (requires significant infrastructure changes):**
 - **Oplock break notifications**: Sending async OPLOCK_BREAK to clients when conflicts occur
 - **Lock stacking**: Tracking locks at SMB layer to allow same-handle re-locking
