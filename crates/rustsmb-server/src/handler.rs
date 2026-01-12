@@ -563,6 +563,32 @@ where
             return self.handle_session_binding(header, &request).await;
         }
 
+        // Per MS-SMB2 3.3.5.5.2: Reauthenticating an Existing Session
+        // If SessionId != 0 and session exists with Valid state, this is a reauthentication.
+        // We must retain the existing Session.SessionKey for signing responses.
+        //
+        // This is different from auth continuation (MORE_PROCESSING_REQUIRED phase) where
+        // we're still establishing a new session via auth_context.session_id.
+        let existing_session = if header.session_id != 0
+            && self.connection.has_session(header.session_id)
+            && self.auth_context.session_id.is_none()
+        {
+            // This is a reauth - look up existing session to retain its key
+            match self.session_manager.get_session(header.session_id).await {
+                Ok(Some(session)) => {
+                    debug!(
+                        conn_id = self.connection.id,
+                        session_id = header.session_id,
+                        "SESSION_SETUP: detected reauthentication, will retain existing session key"
+                    );
+                    Some(session)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // Per MS-SMB2: SessionId == 0 means this is a NEW session, not a continuation
         // We must reset auth_context to avoid reusing session_id from previous sessions
         if header.session_id == 0 {
@@ -598,7 +624,7 @@ where
                 session_key,
                 response_token,
             } => {
-                // Use existing session ID from Continue phase, or generate new one
+                // Determine session_id for the response
                 let session_id = if let Some(id) = self.auth_context.session_id {
                     id
                 } else {
@@ -607,6 +633,35 @@ where
                         .await
                         .map_err(|e| HandlerError::Internal(e.to_string()))?
                 };
+
+                // Per MS-SMB2 3.3.5.5.2: For reauthentication, retain the existing SessionKey.
+                // Check if this is a reauth by looking up if the session already exists.
+                // - For reauth: session exists with session_id (was set in Continue from header.session_id)
+                // - For new session: session doesn't exist yet (we create it below)
+                let existing_for_reauth = if existing_session.is_some() {
+                    existing_session.clone()
+                } else {
+                    // Check if session already exists (reauth second round)
+                    self.session_manager
+                        .get_session(session_id)
+                        .await
+                        .ok()
+                        .flatten()
+                };
+
+                let (effective_session_key, is_reauth) =
+                    if let Some(ref existing) = existing_for_reauth {
+                        // Reauth: use existing session_key
+                        debug!(
+                        conn_id = self.connection.id,
+                        session_id = existing.session_id,
+                        "Reauthentication: retaining existing session key per MS-SMB2 3.3.5.5.2"
+                    );
+                        (existing.session_key.clone(), true)
+                    } else {
+                        // New session: use the new session_key from auth
+                        (session_key.clone(), false)
+                    };
 
                 let dialect = self.connection.dialect.unwrap_or(SmbDialect::Smb202);
 
@@ -619,8 +674,8 @@ where
                 // 4. Derive signing key from complete preauth hash
                 // 5. Sign the response
 
-                // Step 1: Hash the request
-                if dialect == SmbDialect::Smb311 {
+                // Step 1: Hash the request (only for new sessions, not reauth)
+                if dialect == SmbDialect::Smb311 && !is_reauth {
                     debug!(
                         "Preauth: hashing SESSION_SETUP (Success) request ({} bytes), hash before: {:02x?}",
                         full_message.len(),
@@ -633,33 +688,42 @@ where
                     );
                 }
 
-                // Create session state (do this early to get session_id)
+                // Create or update session state
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
 
-                let session_state = SessionState {
-                    session_id,
-                    user_id: user.username.clone(),
-                    domain: user.domain.clone(),
-                    session_key: session_key.clone(),
-                    dialect,
-                    signing_required: self.connection.signing_required,
-                    encryption_required: self.connection.encryption_required,
-                    is_guest: user.is_guest,
-                    created_at: now,
-                    last_access: now,
-                    expires_at: now + 3600, // 1 hour
-                    bound_server_id: None,
-                };
+                if !is_reauth {
+                    // New session: create session state
+                    let session_state = SessionState {
+                        session_id,
+                        user_id: user.username.clone(),
+                        domain: user.domain.clone(),
+                        session_key: session_key.clone(),
+                        dialect,
+                        signing_required: self.connection.signing_required,
+                        encryption_required: self.connection.encryption_required,
+                        is_guest: user.is_guest,
+                        created_at: now,
+                        last_access: now,
+                        expires_at: now + 3600, // 1 hour
+                        bound_server_id: None,
+                    };
 
-                self.session_manager
-                    .create_session(session_state)
-                    .await
-                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                    self.session_manager
+                        .create_session(session_state)
+                        .await
+                        .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
-                self.connection.add_session(session_id);
+                    self.connection.add_session(session_id);
+                } else {
+                    // Reauth: update last_access time but keep existing session key
+                    debug!(
+                        conn_id = self.connection.id,
+                        session_id, "Reauthentication complete, session retained"
+                    );
+                }
 
                 // Per MS-SMB2 3.3.5.5.3: Session takeover when PreviousSessionId is set
                 // "If the PreviousSessionId field of the request is not equal to zero, the server
@@ -722,7 +786,8 @@ where
                     &result[..SMB2_HEADER_SIZE.min(result.len())]
                 );
 
-                if dialect == SmbDialect::Smb311 {
+                // For reauth, skip preauth hash update (already established)
+                if dialect == SmbDialect::Smb311 && !is_reauth {
                     debug!(
                         "Preauth: hashing SESSION_SETUP (Success) response ({} bytes), hash before: {:02x?}",
                         result.len(),
@@ -736,24 +801,59 @@ where
                 }
 
                 // Step 4: Derive signing key
-                let signing_key = match dialect {
-                    SmbDialect::Smb311 => {
+                // For reauth, use the existing signing key (retained per MS-SMB2 3.3.5.5.2)
+                let signing_key = if is_reauth {
+                    // Reauth: use existing signing key if available, or derive from retained session key
+                    if let Some(existing_key) = self.signing_keys.get(&session_id) {
                         debug!(
-                            "SMB 3.1.1 key derivation: session_key={:02x?} preauth_hash={:02x?}",
-                            &session_key[..session_key.len().min(16)],
-                            &self.preauth_hash.value()[..16]
+                            conn_id = self.connection.id,
+                            "Reauth: using existing signing key"
                         );
-                        SessionKeys::derive_smb311(&session_key, self.preauth_hash.value())
+                        existing_key.clone()
+                    } else {
+                        // Derive from retained session key
+                        debug!(
+                            conn_id = self.connection.id,
+                            "Reauth: deriving signing key from retained session key"
+                        );
+                        match dialect {
+                            SmbDialect::Smb311 => {
+                                SessionKeys::derive_smb311(
+                                    &effective_session_key,
+                                    self.preauth_hash.value(),
+                                )
+                                .signing_key
+                            }
+                            SmbDialect::Smb302 | SmbDialect::Smb300 => {
+                                SessionKeys::derive_smb3(&effective_session_key).signing_key
+                            }
+                            _ => effective_session_key.clone(),
+                        }
+                    }
+                } else {
+                    // New session: derive from new session key
+                    match dialect {
+                        SmbDialect::Smb311 => {
+                            debug!(
+                                "SMB 3.1.1 key derivation: session_key={:02x?} preauth_hash={:02x?}",
+                                &effective_session_key[..effective_session_key.len().min(16)],
+                                &self.preauth_hash.value()[..16]
+                            );
+                            SessionKeys::derive_smb311(
+                                &effective_session_key,
+                                self.preauth_hash.value(),
+                            )
                             .signing_key
+                        }
+                        SmbDialect::Smb302 | SmbDialect::Smb300 => {
+                            debug!(
+                                "SMB 3.0.x key derivation: session_key={:02x?}",
+                                &effective_session_key[..effective_session_key.len().min(16)]
+                            );
+                            SessionKeys::derive_smb3(&effective_session_key).signing_key
+                        }
+                        _ => effective_session_key.clone(),
                     }
-                    SmbDialect::Smb302 | SmbDialect::Smb300 => {
-                        debug!(
-                            "SMB 3.0.x key derivation: session_key={:02x?}",
-                            &session_key[..session_key.len().min(16)]
-                        );
-                        SessionKeys::derive_smb3(&session_key).signing_key
-                    }
-                    _ => session_key.clone(),
                 };
                 debug!(
                     "Derived signing_key={:02x?}",
@@ -776,9 +876,20 @@ where
                 // More rounds needed
                 let dialect = self.connection.dialect.unwrap_or(SmbDialect::Smb202);
 
-                // Generate session ID if this is the first round (session_id not yet assigned)
-                // Per MS-SMB2: the server MUST return a session_id even in interim responses
-                let session_id = if let Some(id) = self.auth_context.session_id {
+                // Determine session ID for interim response:
+                // - For reauth: use existing session_id from header
+                // - For new session: use auth_context.session_id or allocate new one
+                let session_id = if existing_session.is_some() {
+                    // Reauth: use the existing session ID from the request header
+                    debug!(
+                        conn_id = self.connection.id,
+                        session_id = header.session_id,
+                        "Reauth Continue: using existing session ID"
+                    );
+                    // Store in auth_context so Success branch knows it's a reauth
+                    self.auth_context.session_id = Some(header.session_id);
+                    header.session_id
+                } else if let Some(id) = self.auth_context.session_id {
                     id
                 } else {
                     let id = self
@@ -3479,6 +3590,308 @@ mod tests {
             allocated_session_id,
             "Success response should use the same allocated SessionId"
         );
+    }
+
+    // ==========================================================================
+    // MS-SMB2 3.3.5.5.2 - Reauthenticating an Existing Session
+    // ==========================================================================
+    //
+    // Per MS-SMB2 3.3.5.5.2:
+    // "If Session.State is Expired, the server MUST set Session.State to InProgress
+    // and Session.SecurityContext to NULL.
+    //
+    // Authentication is continued as specified in section 3.3.5.5.3. Note that
+    // the existing Session.SessionKey will be retained."
+    //
+    // Key requirements:
+    // 1. Reauth detection: SessionId != 0 and session exists in Connection.SessionTable
+    // 2. Session key retention: Existing SessionKey is kept, not replaced
+    // 3. Signing key retention: Responses are signed with the EXISTING signing key
+    // ==========================================================================
+
+    /// Mock auth provider that returns a configurable session key.
+    /// This allows testing that reauth retains the original session key.
+    struct MockReauthProvider {
+        /// Session key to return on success.
+        session_key: Vec<u8>,
+        /// Track call count.
+        call_count: AtomicU32,
+    }
+
+    impl MockReauthProvider {
+        fn new(session_key: Vec<u8>) -> Self {
+            Self {
+                session_key,
+                call_count: AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl AuthProvider for MockReauthProvider {
+        fn authenticate<'a>(
+            &'a self,
+            context: &'a mut AuthContext,
+            _token: &'a [u8],
+        ) -> rustsmb_auth::BoxFuture<'a, Result<AuthResult, AuthError>> {
+            Box::pin(async move {
+                let count = self.call_count.fetch_add(1, AtomicOrdering::SeqCst);
+
+                // Two-round auth: first returns Continue, second returns Success
+                if count % 2 == 0 {
+                    context.state = AuthState::ChallengeIssued;
+                    Ok(AuthResult::Continue {
+                        response_token: b"challenge".to_vec(),
+                    })
+                } else {
+                    context.state = AuthState::Complete;
+                    Ok(AuthResult::Success {
+                        user: UserInfo::authenticated("testuser", Some("TESTDOMAIN")),
+                        session_key: self.session_key.clone(),
+                        response_token: Some(b"final".to_vec()),
+                    })
+                }
+            })
+        }
+
+        fn get_user<'a>(
+            &'a self,
+            username: &'a str,
+            domain: Option<&'a str>,
+        ) -> rustsmb_auth::BoxFuture<'a, Result<Option<UserInfo>, AuthError>> {
+            Box::pin(async move { Ok(Some(UserInfo::authenticated(username, domain))) })
+        }
+
+        fn validate_session_key<'a>(
+            &'a self,
+            _session_id: u64,
+            _key: &'a [u8],
+        ) -> rustsmb_auth::BoxFuture<'a, Result<bool, AuthError>> {
+            Box::pin(async move { Ok(true) })
+        }
+
+        fn supported_mechanisms(&self) -> Vec<AuthMechanism> {
+            vec![AuthMechanism::Ntlm]
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.5.2 - Reauth detection
+    // -------------------------------------------------------------------------
+    // "If SessionId != 0 and session exists, process as reauthentication"
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_reauth_uses_existing_session_id() {
+        // Create shared state
+        let state_store = Arc::new(MemoryStateStore::new());
+        let session_manager = Arc::new(SessionManager::new(
+            state_store,
+            rustsmb_session::SessionManagerConfig::default(),
+        ));
+        let config = Arc::new(ServerConfig::default());
+        let shares = Arc::new(ShareManager::new());
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+
+        // Create handler with a known session key
+        let original_key = vec![0x11; 16];
+        let (_, server) = tokio::io::duplex(64 * 1024);
+        let mut handler = ConnectionHandler::new(
+            server,
+            peer_addr,
+            config.clone(),
+            session_manager.clone(),
+            Arc::new(MockReauthProvider::new(original_key.clone())),
+            shares.clone(),
+            "test-server-1".to_string(),
+        );
+
+        // Establish initial session (two rounds)
+        // Round 1: Continue
+        let request1 = build_session_setup_request(0, b"negotiate");
+        let header1 = Smb2Header::read(&mut Cursor::new(&request1[..64])).unwrap();
+        let response1 = handler
+            .handle_session_setup(&header1, &request1[64..], &request1)
+            .await
+            .unwrap();
+
+        let session_id = extract_session_id_from_response(&response1);
+        assert_eq!(
+            extract_status_from_response(&response1),
+            STATUS_MORE_PROCESSING_REQUIRED
+        );
+
+        // Round 2: Success
+        let request2 = build_session_setup_request(session_id, b"authenticate");
+        let header2 = Smb2Header::read(&mut Cursor::new(&request2[..64])).unwrap();
+        let response2 = handler
+            .handle_session_setup(&header2, &request2[64..], &request2)
+            .await
+            .unwrap();
+
+        assert_eq!(extract_status_from_response(&response2), STATUS_SUCCESS);
+        let established_session_id = extract_session_id_from_response(&response2);
+
+        // Verify session was created in state store
+        let session = session_manager
+            .get_session(established_session_id)
+            .await
+            .expect("get_session should not error")
+            .expect("session should exist");
+        assert_eq!(session.session_key, original_key);
+
+        // Now perform reauthentication with a DIFFERENT session key
+        let new_key = vec![0x22; 16];
+        let (_, server2) = tokio::io::duplex(64 * 1024);
+        let mut handler2 = ConnectionHandler::new(
+            server2,
+            peer_addr,
+            config,
+            session_manager.clone(),
+            Arc::new(MockReauthProvider::new(new_key.clone())),
+            shares,
+            "test-server-1".to_string(),
+        );
+
+        // Add the existing session to the new handler's connection
+        handler2.connection.add_session(established_session_id);
+
+        // Reauth Round 1: Send SESSION_SETUP with existing session_id
+        let reauth_req1 = build_session_setup_request(established_session_id, b"reauth_negotiate");
+        let reauth_header1 = Smb2Header::read(&mut Cursor::new(&reauth_req1[..64])).unwrap();
+        let reauth_resp1 = handler2
+            .handle_session_setup(&reauth_header1, &reauth_req1[64..], &reauth_req1)
+            .await
+            .unwrap();
+
+        // Verify same session_id is used
+        assert_eq!(
+            extract_session_id_from_response(&reauth_resp1),
+            established_session_id,
+            "Reauth must use existing session_id"
+        );
+        assert_eq!(
+            extract_status_from_response(&reauth_resp1),
+            STATUS_MORE_PROCESSING_REQUIRED
+        );
+
+        // Reauth Round 2: Complete authentication
+        let reauth_req2 =
+            build_session_setup_request(established_session_id, b"reauth_authenticate");
+        let reauth_header2 = Smb2Header::read(&mut Cursor::new(&reauth_req2[..64])).unwrap();
+        let reauth_resp2 = handler2
+            .handle_session_setup(&reauth_header2, &reauth_req2[64..], &reauth_req2)
+            .await
+            .unwrap();
+
+        assert_eq!(extract_status_from_response(&reauth_resp2), STATUS_SUCCESS);
+        assert_eq!(
+            extract_session_id_from_response(&reauth_resp2),
+            established_session_id,
+            "Reauth success must use same session_id"
+        );
+
+        // KEY TEST: Verify session key was RETAINED (not replaced with new_key)
+        // Per MS-SMB2 3.3.5.5.2: "existing Session.SessionKey will be retained"
+        let session_after_reauth = session_manager
+            .get_session(established_session_id)
+            .await
+            .expect("get_session should not error")
+            .expect("session should still exist");
+
+        assert_eq!(
+            session_after_reauth.session_key, original_key,
+            "MS-SMB2 3.3.5.5.2: Session key MUST be retained during reauth, not replaced"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.5.2 - New session vs reauth differentiation
+    // -------------------------------------------------------------------------
+    // When SessionId == 0, it's a new session (not reauth)
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_session_id_zero_creates_new_session_not_reauth() {
+        let state_store = Arc::new(MemoryStateStore::new());
+        let session_manager = Arc::new(SessionManager::new(
+            state_store,
+            rustsmb_session::SessionManagerConfig::default(),
+        ));
+        let config = Arc::new(ServerConfig::default());
+        let shares = Arc::new(ShareManager::new());
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+
+        // Create first session
+        let key1 = vec![0x11; 16];
+        let (_, server1) = tokio::io::duplex(64 * 1024);
+        let mut handler1 = ConnectionHandler::new(
+            server1,
+            peer_addr,
+            config.clone(),
+            session_manager.clone(),
+            Arc::new(MockReauthProvider::new(key1.clone())),
+            shares.clone(),
+            "test-server-1".to_string(),
+        );
+
+        // Establish session 1
+        let req1a = build_session_setup_request(0, b"negotiate1");
+        let hdr1a = Smb2Header::read(&mut Cursor::new(&req1a[..64])).unwrap();
+        let resp1a = handler1
+            .handle_session_setup(&hdr1a, &req1a[64..], &req1a)
+            .await
+            .unwrap();
+        let session_id1 = extract_session_id_from_response(&resp1a);
+
+        let req1b = build_session_setup_request(session_id1, b"auth1");
+        let hdr1b = Smb2Header::read(&mut Cursor::new(&req1b[..64])).unwrap();
+        let _ = handler1
+            .handle_session_setup(&hdr1b, &req1b[64..], &req1b)
+            .await
+            .unwrap();
+
+        // Create second session with SessionId = 0 (NOT reauth)
+        let key2 = vec![0x22; 16];
+        let (_, server2) = tokio::io::duplex(64 * 1024);
+        let mut handler2 = ConnectionHandler::new(
+            server2,
+            peer_addr,
+            config,
+            session_manager.clone(),
+            Arc::new(MockReauthProvider::new(key2.clone())),
+            shares,
+            "test-server-1".to_string(),
+        );
+
+        // New session with SessionId = 0
+        let req2a = build_session_setup_request(0, b"negotiate2");
+        let hdr2a = Smb2Header::read(&mut Cursor::new(&req2a[..64])).unwrap();
+        let resp2a = handler2
+            .handle_session_setup(&hdr2a, &req2a[64..], &req2a)
+            .await
+            .unwrap();
+        let session_id2 = extract_session_id_from_response(&resp2a);
+
+        let req2b = build_session_setup_request(session_id2, b"auth2");
+        let hdr2b = Smb2Header::read(&mut Cursor::new(&req2b[..64])).unwrap();
+        let _ = handler2
+            .handle_session_setup(&hdr2b, &req2b[64..], &req2b)
+            .await
+            .unwrap();
+
+        // Verify we got different session IDs (not reauth of first)
+        assert_ne!(
+            session_id1, session_id2,
+            "SessionId=0 should create new session, not reauth"
+        );
+
+        // Verify both sessions exist with their own keys
+        let s1 = session_manager.get_session(session_id1).await.unwrap();
+        let s2 = session_manager.get_session(session_id2).await.unwrap();
+
+        assert!(s1.is_some() && s2.is_some());
+        assert_eq!(s1.unwrap().session_key, key1);
+        assert_eq!(s2.unwrap().session_key, key2);
     }
 
     // ==========================================================================
