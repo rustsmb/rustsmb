@@ -21,11 +21,11 @@ sudo apt-get install samba-testsuite
 # Or build from source (macOS/Linux)
 ./tests/scripts/install_smbtorture.sh
 
-# Run via shell script (builds server and runs tests)
+# Run via shell script (starts server and runs tests)
 ./tests/scripts/smbtorture.sh all
 
 # Or run against an external server
-./tests/scripts/run_smbtorture.sh localhost test testuser testpass
+./tests/scripts/smbtorture.sh all --external localhost:445 --user testuser --pass testpass
 ```
 
 ### Running Python Tests
