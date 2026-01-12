@@ -542,8 +542,20 @@ Fix all failing smbtorture tests by implementing missing SMB2 functionality per 
   - Set ShareCapabilities based on available features
 - [x] Phase 16C: Fix smb2.read (MinimumCount validation per MS-SMB2 3.3.5.14)
   - Return STATUS_END_OF_FILE when read returns less than MinimumCount at EOF
-- [ ] Phase 16D: Fix smb2.getinfo (InfoType routing, more info classes)
-- [ ] Phase 16E: Fix smb2.setinfo (implement actual SET_INFO handler)
+- [x] Phase 16D: Fix smb2.getinfo (InfoType routing per MS-SMB2 3.3.5.20)
+  - Route QUERY_INFO by InfoType (File, FileSystem, Security, Quota)
+  - Add `build_fs_info()` for filesystem info classes (1, 3, 4, 5, 7)
+  - Add `build_security_info()` for security descriptor responses
+  - Validate output buffer size per spec
+- [x] Phase 16E: Fix smb2.setinfo (implement SET_INFO handler per MS-SMB2 3.3.5.21)
+  - Route SET_INFO by InfoType (File, FileSystem, Security)
+  - Implement FileBasicInformation (4): set timestamps via utimes
+  - Implement FileDispositionInformation (13): delete-on-close flag
+  - Implement FileRenameInformation (10): rename files with UTF-16 path parsing
+  - Implement FileEndOfFileInformation (20): truncate/extend files
+  - Implement FileAllocationInformation (19): set allocation size
+  - Add `delete_on_close` field to HandleState
+  - Add `filetime_to_unix()` and `parse_utf16_string()` helpers
 - [ ] Phase 16F: Fix smb2.create (create contexts, CreateAction values)
 - [ ] Phase 16G: Fix smb2.lock (lock conflict detection)
 - [ ] Phase 16H: Fix smb2.oplock (oplock break notifications)
