@@ -39,6 +39,7 @@
 pub mod config;
 pub mod coordination;
 pub mod handler;
+pub mod helpers;
 pub mod server;
 pub mod shares;
 
