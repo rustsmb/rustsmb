@@ -21,10 +21,10 @@ sudo apt-get install samba-testsuite
 # Or build from source (macOS/Linux)
 ./tests/scripts/install_smbtorture.sh
 
-# Run via cargo test
-cargo test --test smbtorture_runner -- --ignored --nocapture
+# Run via shell script (builds server and runs tests)
+./tests/scripts/smbtorture.sh all
 
-# Or run the bash script directly (requires running server)
+# Or run against an external server
 ./tests/scripts/run_smbtorture.sh localhost test testuser testpass
 ```
 
@@ -116,7 +116,7 @@ smbtorture provides the most comprehensive protocol-level testing. Here are the 
 
 ```bash
 # Run specific suite
-SMBTORTURE_SUITE=smb2.lease cargo test --test smbtorture_runner -- --ignored --nocapture
+./tests/scripts/smbtorture.sh smb2.lease
 
 # Or directly with smbtorture
 smbtorture //localhost/test -Utestuser%testpass smb2.lease

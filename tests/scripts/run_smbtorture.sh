@@ -8,8 +8,8 @@
 #   ./tests/scripts/run_smbtorture.sh localhost test testuser testpass
 #   ./tests/scripts/run_smbtorture.sh 192.168.1.10 share admin secret
 #
-# Or run via cargo test:
-#   cargo test --test smbtorture_runner -- --ignored --nocapture
+# Or run tests/scripts/smbtorture.sh which starts its own server:
+#   ./tests/scripts/smbtorture.sh all
 
 set -e
 

@@ -505,8 +505,8 @@ Do not commit code that fails any of these checks.
 ### Phase 15: SMB Specification Testing - COMPLETED
 - [x] docs/smb-protocol-testing.md: Comprehensive testing documentation
 - [x] Phase 15A: smbtorture integration
-  - tests/smbtorture_runner.rs: Rust-based test runner
-  - tests/scripts/run_smbtorture.sh: Bash script for all SMB2 test suites
+  - tests/scripts/smbtorture.sh: Shell script test runner (used by CI)
+  - tests/scripts/run_smbtorture.sh: Bash script for running against external server
   - CI job for smbtorture tests
 - [x] Phase 15B: Python smbprotocol tests
   - tests/python/: Python test environment
