@@ -89,20 +89,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-      - name: Install samba-testsuite
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y samba-testsuite
-      - name: Build release binary
-        run: cargo build --release
+      - name: Build smbtorture Docker image
+        run: docker build -f tests/Dockerfile.smbtorture -t rustsmb-smbtorture .
       - name: Run smbtorture tests
-        run: ./tests/scripts/smbtorture.sh all
+        run: docker run --rm rustsmb-smbtorture all
 
   python-smb-test:
     name: Python SMB Tests (smbprotocol)
