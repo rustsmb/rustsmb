@@ -32,8 +32,6 @@ pub enum NtStatus {
     NoSuchFile = 0xC000000F,
     /// Invalid handle.
     InvalidHandle = 0xC0000008,
-    /// File is closed.
-    FileClosed = 0xC0000128,
     /// End of file was reached.
     EndOfFile = 0xC0000011,
     /// Access is denied.
@@ -60,8 +58,6 @@ pub enum NtStatus {
     NotSupported = 0xC00000BB,
     /// The network name cannot be found.
     BadNetworkName = 0xC00000CC,
-    /// The network name was deleted.
-    NetworkNameDeleted = 0xC00000C9,
     /// The request was not accepted.
     RequestNotAccepted = 0xC00000D0,
     /// An internal error occurred.
@@ -140,7 +136,6 @@ impl NtStatus {
             0xC000000D => Self::InvalidParameter,
             0xC000000F => Self::NoSuchFile,
             0xC0000008 => Self::InvalidHandle,
-            0xC0000128 => Self::FileClosed,
             0xC0000011 => Self::EndOfFile,
             0xC0000022 => Self::AccessDenied,
             0xC0000023 => Self::BufferTooSmall,
@@ -154,7 +149,6 @@ impl NtStatus {
             0xC000007F => Self::DiskFull,
             0xC00000BB => Self::NotSupported,
             0xC00000CC => Self::BadNetworkName,
-            0xC00000C9 => Self::NetworkNameDeleted,
             0xC00000D0 => Self::RequestNotAccepted,
             0xC00000E5 => Self::InternalError,
             0xC0000203 => Self::UserSessionDeleted,

@@ -10,13 +10,14 @@
 //! Note: Requires smbclient/smbtorture to be installed.
 #![cfg(unix)]
 
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use rustsmb_auth::{NtlmAuthProvider, SpnegoProvider};
+use rustsmb_auth::AnonymousAuthProvider;
 use rustsmb_backend_local::LocalBackend;
 use rustsmb_server::{ServerConfig, ShareConfig, SmbServer};
 use rustsmb_state_memory::MemoryStateStore;
@@ -32,11 +33,18 @@ fn has_smbtorture() -> bool {
         .unwrap_or(false)
 }
 
-/// Default SMB port for testing (smbtorture requires standard port).
-const SMB_PORT: u16 = 445;
+/// Find an available port for testing.
+fn find_available_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("Failed to bind to random port")
+        .local_addr()
+        .expect("Failed to get local address")
+        .port()
+}
 
 /// Test server context that manages lifecycle.
 struct TestServer {
+    port: u16,
     shutdown_tx: Option<oneshot::Sender<()>>,
     #[allow(dead_code)]
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -48,9 +56,10 @@ impl TestServer {
     /// Create a new test server with local filesystem backend.
     async fn new() -> Self {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let port = find_available_port();
 
         let config = ServerConfig {
-            listen_addr: format!("127.0.0.1:{}", SMB_PORT).parse().unwrap(),
+            listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
             require_signing: false,
             enable_signing: false,
             enable_encryption: false,
@@ -60,10 +69,9 @@ impl TestServer {
         let state: Arc<dyn rustsmb_state::StateStore + Send + Sync> =
             Arc::new(MemoryStateStore::new());
 
-        // Use SPNEGO wrapping NTLM with anonymous access enabled
-        let ntlm_provider = NtlmAuthProvider::new("RUSTSMB", "WORKGROUP").with_anonymous();
+        // Use AnonymousAuthProvider for simplicity (allows guest access)
         let auth: Arc<dyn rustsmb_auth::AuthProvider + Send + Sync> =
-            Arc::new(SpnegoProvider::ntlm(Arc::new(ntlm_provider)));
+            Arc::new(AnonymousAuthProvider::allow_both().with_guest_fallback());
 
         let server = SmbServer::new(config, state, auth);
 
@@ -107,6 +115,7 @@ impl TestServer {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         Self {
+            port,
             shutdown_tx: Some(shutdown_tx),
             handle: Some(handle),
             temp_dir,
@@ -115,8 +124,7 @@ impl TestServer {
 
     /// Get the server URL for smbtorture.
     fn url(&self) -> String {
-        // smbtorture uses standard SMB URL format; port 445 is implicit
-        "//127.0.0.1/test".to_string()
+        format!("//127.0.0.1:{}/test", self.port)
     }
 
     /// Run a smbtorture test suite.

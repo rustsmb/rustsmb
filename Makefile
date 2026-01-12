@@ -1,4 +1,4 @@
-.PHONY: all build check test clippy fmt clean doc bench install smbtorture-test smbtorture-build
+.PHONY: all build check test clippy fmt clean doc bench install
 
 # Default target
 all: check test
@@ -91,22 +91,6 @@ audit:
 coverage:
 	cargo tarpaulin --workspace --out Html
 
-# Build smbtorture test Docker image
-smbtorture-build:
-	docker build -f tests/Dockerfile.smbtorture -t rustsmb-smbtorture .
-
-# Run smbtorture tests in Docker (builds image if needed)
-smbtorture-test: smbtorture-build
-	docker run --rm rustsmb-smbtorture
-
-# Run specific smbtorture suite (e.g., make smbtorture-suite SUITE=smb2.connect)
-smbtorture-suite: smbtorture-build
-	docker run --rm rustsmb-smbtorture $(SUITE)
-
-# Run smbtorture with debug output
-smbtorture-debug: smbtorture-build
-	docker run --rm -e RUST_LOG=debug rustsmb-smbtorture $(SUITE)
-
 # Help
 help:
 	@echo "RustSMB Makefile targets:"
@@ -134,8 +118,4 @@ help:
 	@echo "  outdated     - Show outdated dependencies"
 	@echo "  audit        - Security audit"
 	@echo "  coverage     - Generate coverage report"
-	@echo "  smbtorture-build - Build smbtorture Docker image"
-	@echo "  smbtorture-test  - Run smbtorture tests in Docker"
-	@echo "  smbtorture-suite - Run specific suite (SUITE=smb2.connect)"
-	@echo "  smbtorture-debug - Run with debug logging"
 	@echo "  help         - Show this help"

@@ -130,7 +130,6 @@ rustsmb-auth = { workspace = true }
 rustsmb-state = { workspace = true }
 rustsmb-state-memory = { workspace = true }
 rustsmb-vfs = { workspace = true }
-rustsmb-backend-local = { workspace = true }
 rustsmb-backend-memory = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
