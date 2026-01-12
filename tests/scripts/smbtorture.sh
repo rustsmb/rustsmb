@@ -144,7 +144,8 @@ wait_for_port() {
 
     echo -n "Waiting for $host:$port... "
     for i in $(seq 1 $max_attempts); do
-        if nc -z "$host" "$port" 2>/dev/null; then
+        # Use bash's built-in /dev/tcp (more portable than nc)
+        if (echo >/dev/tcp/"$host"/"$port") 2>/dev/null; then
             echo "ready"
             return 0
         fi

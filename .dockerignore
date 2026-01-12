@@ -3,6 +3,7 @@ target/
 
 # Git
 .git/
+.gitignore
 
 # Editor
 .idea/
@@ -14,5 +15,19 @@ target/
 .DS_Store
 Thumbs.db
 
-# Docker build cache
-.dockerignore
+# Documentation (not needed for build)
+docs/
+*.md
+!README.md
+
+# Tests (not needed for server build)
+tests/
+benches/
+
+# CI/CD
+.github/
+
+# Development files
+.claude/
+*.log
+test-results/
