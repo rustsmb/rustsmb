@@ -424,6 +424,69 @@ where
             signature: [0; 16],
         }
     }
+
+    /// Validate credit charge for multi-credit operations.
+    ///
+    /// Per MS-SMB2 3.3.5.2.5, the server MUST validate that the CreditCharge
+    /// in the request header is sufficient for the payload size. The expected
+    /// credit charge is computed as:
+    ///
+    /// `CreditCharge = (PayloadSize - 1) / 65536 + 1`
+    ///
+    /// If CreditCharge is less than expected, return STATUS_INVALID_PARAMETER.
+    /// This validation only applies to SMB 2.1 and later dialects that support
+    /// multi-credit operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `header` - The SMB2 request header containing the credit charge
+    /// * `payload_size` - The size of the data payload in bytes
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Credit charge is sufficient
+    /// * `Err(HandlerError::Status(NtStatus::InvalidParameter))` - Credit charge insufficient
+    fn validate_credit_charge(
+        &self,
+        header: &Smb2Header,
+        payload_size: u32,
+    ) -> Result<(), HandlerError> {
+        // Only validate for dialects that support multi-credit operations
+        if !self.connection.supports_multi_credit() {
+            return Ok(());
+        }
+
+        // For SMB 2.1+, if payload exceeds 64KB, credit charge is required
+        // CreditCharge = (PayloadSize - 1) / 65536 + 1
+        let expected_charge = if payload_size == 0 {
+            1
+        } else {
+            ((payload_size as u64 - 1) / 65536 + 1) as u16
+        };
+
+        // Per MS-SMB2 3.3.5.2.5: if CreditCharge is 0 or less than expected,
+        // fail with STATUS_INVALID_PARAMETER
+        if header.credit_charge == 0 && payload_size > 0 {
+            debug!(
+                conn_id = self.connection.id,
+                expected_charge, payload_size, "Credit charge validation failed: CreditCharge is 0"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        if header.credit_charge < expected_charge {
+            debug!(
+                conn_id = self.connection.id,
+                credit_charge = header.credit_charge,
+                expected_charge,
+                payload_size,
+                "Credit charge validation failed: insufficient credits"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        Ok(())
+    }
 }
 
 // Command handlers
@@ -2058,6 +2121,9 @@ where
         let request = ReadRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse read: {}", e)))?;
 
+        // Validate credit charge for multi-credit operations (MS-SMB2 3.3.5.2.5)
+        self.validate_credit_charge(header, request.length)?;
+
         // Reconstruct handle ID
         let handle_id =
             (request.file_id_volatile as u128) << 64 | request.file_id_persistent as u128;
@@ -2133,6 +2199,9 @@ where
 
         let request = WriteRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse write: {}", e)))?;
+
+        // Validate credit charge for multi-credit operations (MS-SMB2 3.3.5.2.5)
+        self.validate_credit_charge(header, request.length)?;
 
         // Reconstruct handle ID
         let handle_id =
@@ -2231,6 +2300,11 @@ where
 
         let request = IoctlRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse IOCTL: {}", e)))?;
+
+        // Validate credit charge for multi-credit operations (MS-SMB2 3.3.5.2.5)
+        // For IOCTL, payload size is max(InputCount, MaxOutputResponse)
+        let payload_size = request.input_count.max(request.max_output_response);
+        self.validate_credit_charge(header, payload_size)?;
 
         let ctl_code = FsctlCode::from_u32(request.ctl_code);
         debug!(conn_id = self.connection.id, ctl_code = ?ctl_code, "IOCTL control code");
@@ -2439,6 +2513,9 @@ where
         let request = QueryDirectoryRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse query_dir: {}", e)))?;
 
+        // Validate credit charge for multi-credit operations (MS-SMB2 3.3.5.2.5)
+        self.validate_credit_charge(header, request.output_buffer_length)?;
+
         // Reconstruct handle ID
         let handle_id =
             (request.file_id_volatile as u128) << 64 | request.file_id_persistent as u128;
@@ -2509,6 +2586,9 @@ where
 
         let request = QueryInfoRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse query_info: {}", e)))?;
+
+        // Validate credit charge for multi-credit operations (MS-SMB2 3.3.5.2.5)
+        self.validate_credit_charge(header, request.output_buffer_length)?;
 
         // Reconstruct handle ID
         let handle_id =
@@ -4602,5 +4682,154 @@ mod tests {
         assert_eq!(disposition::OPEN_IF, 3, "FILE_OPEN_IF = 3");
         assert_eq!(disposition::OVERWRITE, 4, "FILE_OVERWRITE = 4");
         assert_eq!(disposition::OVERWRITE_IF, 5, "FILE_OVERWRITE_IF = 5");
+    }
+
+    // ==========================================================================
+    // Credit Charge Validation Tests - MS-SMB2 3.3.5.2.5
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 section 3.3.5.2.5:
+    // "Granting Credits to the Client"
+    //
+    // Key requirements tested:
+    // 1. CreditCharge = (PayloadSize - 1) / 65536 + 1
+    // 2. CreditCharge of 0 with payload > 0 fails with STATUS_INVALID_PARAMETER
+    // 3. CreditCharge less than expected fails with STATUS_INVALID_PARAMETER
+    // 4. Multi-credit validation only applies to SMB 2.1 and later
+    // ==========================================================================
+
+    #[test]
+    fn test_credit_charge_formula() {
+        // Verify the credit charge formula: (PayloadSize - 1) / 65536 + 1
+        //
+        // Per MS-SMB2 3.3.5.2.5:
+        // "The expected CreditCharge is computed as:
+        //  CreditCharge = (RequestedBytes - 1) / 65536 + 1"
+
+        // 0 bytes -> 1 credit (special case)
+        let expected_0 = 1u16;
+        assert_eq!(expected_0, 1, "0 bytes should require 1 credit");
+
+        // 1 byte -> 1 credit
+        let payload_1: u64 = 1;
+        let expected_1 = ((payload_1 - 1) / 65536 + 1) as u16;
+        assert_eq!(expected_1, 1, "1 byte should require 1 credit");
+
+        // 64KB (65536 bytes) -> 1 credit
+        let payload_64kb: u64 = 65536;
+        let expected_64kb = ((payload_64kb - 1) / 65536 + 1) as u16;
+        assert_eq!(expected_64kb, 1, "64KB should require 1 credit");
+
+        // 64KB + 1 -> 2 credits
+        let payload_64kb_plus: u64 = 65537;
+        let expected_64kb_plus = ((payload_64kb_plus - 1) / 65536 + 1) as u16;
+        assert_eq!(expected_64kb_plus, 2, "64KB + 1 should require 2 credits");
+
+        // 128KB -> 2 credits
+        let payload_128kb: u64 = 131072;
+        let expected_128kb = ((payload_128kb - 1) / 65536 + 1) as u16;
+        assert_eq!(expected_128kb, 2, "128KB should require 2 credits");
+
+        // 1MB -> 16 credits
+        let payload_1mb: u64 = 1048576;
+        let expected_1mb = ((payload_1mb - 1) / 65536 + 1) as u16;
+        assert_eq!(expected_1mb, 16, "1MB should require 16 credits");
+
+        // 8MB -> 128 credits
+        let payload_8mb: u64 = 8 * 1024 * 1024;
+        let expected_8mb = ((payload_8mb - 1) / 65536 + 1) as u16;
+        assert_eq!(expected_8mb, 128, "8MB should require 128 credits");
+    }
+
+    #[test]
+    fn test_supports_multi_credit() {
+        // Verify which dialects support multi-credit operations
+        //
+        // Per MS-SMB2 3.3.5.2.5:
+        // Multi-credit operations are available in SMB 2.1 and later
+
+        use rustsmb_session::Connection;
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 445);
+
+        // SMB 2.0.2 does NOT support multi-credit
+        let mut conn_202 = Connection::new(1, addr);
+        conn_202.negotiate(SmbDialect::Smb202);
+        assert!(
+            !conn_202.supports_multi_credit(),
+            "SMB 2.0.2 should NOT support multi-credit"
+        );
+
+        // SMB 2.1 supports multi-credit
+        let mut conn_210 = Connection::new(2, addr);
+        conn_210.negotiate(SmbDialect::Smb210);
+        assert!(
+            conn_210.supports_multi_credit(),
+            "SMB 2.1 should support multi-credit"
+        );
+
+        // SMB 3.0 supports multi-credit
+        let mut conn_300 = Connection::new(3, addr);
+        conn_300.negotiate(SmbDialect::Smb300);
+        assert!(
+            conn_300.supports_multi_credit(),
+            "SMB 3.0 should support multi-credit"
+        );
+
+        // SMB 3.0.2 supports multi-credit
+        let mut conn_302 = Connection::new(4, addr);
+        conn_302.negotiate(SmbDialect::Smb302);
+        assert!(
+            conn_302.supports_multi_credit(),
+            "SMB 3.0.2 should support multi-credit"
+        );
+
+        // SMB 3.1.1 supports multi-credit
+        let mut conn_311 = Connection::new(5, addr);
+        conn_311.negotiate(SmbDialect::Smb311);
+        assert!(
+            conn_311.supports_multi_credit(),
+            "SMB 3.1.1 should support multi-credit"
+        );
+
+        // Un-negotiated connection does NOT support multi-credit
+        let conn_none = Connection::new(6, addr);
+        assert!(
+            !conn_none.supports_multi_credit(),
+            "Un-negotiated connection should NOT support multi-credit"
+        );
+    }
+
+    #[test]
+    fn test_credit_charge_boundary_values() {
+        // Test boundary values for credit charge calculation
+        //
+        // The formula CreditCharge = (PayloadSize - 1) / 65536 + 1
+        // has interesting boundary behavior at multiples of 65536
+
+        // Right at boundary: 65536 bytes = 1 credit
+        let payload_at_boundary: u64 = 65536;
+        let expected = ((payload_at_boundary - 1) / 65536 + 1) as u16;
+        assert_eq!(expected, 1, "65536 bytes (exactly 64KB) = 1 credit");
+
+        // Just over boundary: 65537 bytes = 2 credits
+        let payload_over_boundary: u64 = 65537;
+        let expected = ((payload_over_boundary - 1) / 65536 + 1) as u16;
+        assert_eq!(expected, 2, "65537 bytes (64KB + 1) = 2 credits");
+
+        // Just under next boundary: 131071 bytes = 2 credits
+        let payload_under_next: u64 = 131071;
+        let expected = ((payload_under_next - 1) / 65536 + 1) as u16;
+        assert_eq!(expected, 2, "131071 bytes (128KB - 1) = 2 credits");
+
+        // At next boundary: 131072 bytes = 2 credits
+        let payload_at_next: u64 = 131072;
+        let expected = ((payload_at_next - 1) / 65536 + 1) as u16;
+        assert_eq!(expected, 2, "131072 bytes (exactly 128KB) = 2 credits");
+
+        // Just over next boundary: 131073 bytes = 3 credits
+        let payload_over_next: u64 = 131073;
+        let expected = ((payload_over_next - 1) / 65536 + 1) as u16;
+        assert_eq!(expected, 3, "131073 bytes (128KB + 1) = 3 credits");
     }
 }

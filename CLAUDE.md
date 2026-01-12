@@ -529,3 +529,19 @@ Do not commit code that fails any of these checks.
   - tests/ms-protocol/run_tests.sh: Test runner
   - tests/ms-protocol/FileServer.ptfconfig: Configuration file
 - [x] CI workflow updated with spec test jobs
+
+### Phase 16: Fix smbtorture Test Failures - IN PROGRESS
+Fix all failing smbtorture tests by implementing missing SMB2 functionality per MS-SMB2 spec.
+- [x] Phase 16A: Fix smb2.credits (credit charge validation per MS-SMB2 3.3.5.2.5)
+  - Added `supports_multi_credit()` to Connection
+  - Added `validate_credit_charge()` helper to ConnectionHandler
+  - Call validation in READ, WRITE, IOCTL, QUERY_DIRECTORY, QUERY_INFO handlers
+- [ ] Phase 16B: Fix smb2.tcon (ShareFlags, Capabilities, MaximalAccess)
+- [ ] Phase 16C: Fix smb2.read (MinimumCount validation)
+- [ ] Phase 16D: Fix smb2.getinfo (InfoType routing, more info classes)
+- [ ] Phase 16E: Fix smb2.setinfo (implement actual SET_INFO handler)
+- [ ] Phase 16F: Fix smb2.create (create contexts, CreateAction values)
+- [ ] Phase 16G: Fix smb2.lock (lock conflict detection)
+- [ ] Phase 16H: Fix smb2.oplock (oplock break notifications)
+- [ ] Phase 16I: Fix smb2.dir (QUERY_DIRECTORY issues)
+- [ ] Phase 16J: Fix smb2.session bind_negative tests

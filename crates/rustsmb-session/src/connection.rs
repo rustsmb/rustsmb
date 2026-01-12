@@ -132,6 +132,19 @@ impl Connection {
         self.dialect.is_some()
     }
 
+    /// Check if connection supports multi-credit operations.
+    ///
+    /// Multi-credit operations are available in SMB 2.1 and later.
+    /// Per MS-SMB2 3.3.5.2.5, credit charge validation only applies when
+    /// the connection supports multi-credit operations.
+    #[inline]
+    pub fn supports_multi_credit(&self) -> bool {
+        matches!(
+            self.dialect,
+            Some(SmbDialect::Smb210 | SmbDialect::Smb300 | SmbDialect::Smb302 | SmbDialect::Smb311)
+        )
+    }
+
     /// Get client GUID as hex string (for lease tracking).
     #[inline]
     pub fn client_guid_string(&self) -> String {
