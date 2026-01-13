@@ -1015,6 +1015,35 @@ closed</li>
 <p><strong>Note:</strong> Cross-server lease breaks are NOT implemented.
 Cross-server conflicts continue using reduced grant strategy from Phase
 14.</p>
+<h3 id="phase-19-tree-id-validation---completed">Phase 19: Tree ID
+Validation - COMPLETED</h3>
+<p>Implement proper Tree ID validation per MS-SMB2 section
+3.3.5.2.11.</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />Phase 19A: Fix
+pre-dispatch validation</label>
+<ul>
+<li>Add TreeDisconnect and Ioctl to requires_tree command list</li>
+<li>Remove tree_id != 0 check (tree_id = 0 is NOT valid for
+tree-requiring commands)</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 19B: Add tree ID
+matching for handle operations</label>
+<ul>
+<li>Add <code>validate_handle_tree_id()</code> helper function</li>
+<li>Apply validation in CLOSE, READ, WRITE, LOCK, QUERY_DIRECTORY,
+QUERY_INFO, SET_INFO handlers</li>
+<li>Reject with STATUS_INVALID_PARAMETER when header.tree_id !=
+handle.tree_id</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 19C: Add unit tests
+for MS-SMB2 3.3.5.2.11</label>
+<ul>
+<li>test_write_with_tree_id_zero_returns_network_name_deleted</li>
+<li>test_write_with_nonexistent_tree_id_returns_network_name_deleted</li>
+<li>test_ioctl_with_nonexistent_tree_id_returns_network_name_deleted</li>
+</ul></li>
+</ul>
 <h2 id="smbtorture-test-analysis">smbtorture Test Analysis</h2>
 <h3 id="test-results-summary-january-2026">Test Results Summary (January
 2026)</h3>
@@ -1044,8 +1073,8 @@ Cross-server conflicts continue using reduced grant strategy from Phase
 </tr>
 <tr>
 <td>smb2.tcon</td>
-<td><strong>FAIL</strong></td>
-<td>Allows write with wrong Tree ID</td>
+<td><strong>PASS</strong></td>
+<td>-</td>
 </tr>
 <tr>
 <td>smb2.create</td>
@@ -1127,8 +1156,8 @@ Cross-server conflicts continue using reduced grant strategy from Phase
 <tr>
 <td>Tree ID validation</td>
 <td>✅</td>
-<td>❌</td>
-<td>P1</td>
+<td>✅</td>
+<td>-</td>
 </tr>
 <tr>
 <td>Read past EOF → STATUS_END_OF_FILE</td>
@@ -1184,9 +1213,9 @@ Cross-server conflicts continue using reduced grant strategy from Phase
 <p><strong>P0 - Critical (blocks many tests):</strong> - <del>Implement
 oplock/lease break notifications</del> DONE in Phase 18 (same-server
 only)</p>
-<p><strong>P1 - Security/Compliance:</strong> - Tree ID validation
-(reject operations with wrong TID) - Read past EOF should return
-STATUS_END_OF_FILE - Read on directory should return
+<p><strong>P1 - Security/Compliance:</strong> - <del>Tree ID validation
+(reject operations with wrong TID)</del> DONE in Phase 19 - Read past
+EOF should return STATUS_END_OF_FILE - Read on directory should return
 STATUS_INVALID_DEVICE_REQUEST</p>
 <p><strong>P2 - Lock semantics:</strong> - Lock stacking (allow same
 handle to re-lock same range) - Correct error codes (LOCK_NOT_GRANTED

@@ -681,7 +681,7 @@ Implement proper Tree ID validation per MS-SMB2 section 3.3.5.2.11.
 - ~~Implement oplock/lease break notifications~~ DONE in Phase 18 (same-server only)
 
 **P1 - Security/Compliance:**
-- Tree ID validation (reject operations with wrong TID)
+- ~~Tree ID validation (reject operations with wrong TID)~~ DONE in Phase 19
 - Read past EOF should return STATUS_END_OF_FILE
 - Read on directory should return STATUS_INVALID_DEVICE_REQUEST
 
