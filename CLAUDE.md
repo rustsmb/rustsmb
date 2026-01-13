@@ -780,6 +780,29 @@ Fix smb2.durable-open smbtorture test failures per MS-SMB2 specification.
 - file-position: File position persistence
 - alloc-size, read-only: Allocation size and read-only attribute handling
 
+### Phase 25: Durable Reconnect State Restoration - COMPLETED
+
+Improve durable handle reconnection per MS-SMB2 specification.
+
+- [x] Phase 25A: Fix lease state restoration (MS-SMB2 3.3.5.9.7 Step 15)
+  - Fetch actual lease state from StateStore instead of hardcoded READ_CACHING
+  - Restore correct epoch value in lease response
+- [x] Phase 25B: Re-register lease with LeaseBreakRegistry after reconnect
+  - After reconnect, lease is associated with new connection
+  - Enables break notifications to reach reconnected client
+- [x] Phase 25C: Update WRITE handler to track file_offset for durable handles
+  - Only durable/persistent handles track position (avoids Redis overhead)
+  - Position updated after successful write
+- [x] Phase 25D: Add unit tests for Phase 25 changes
+  - test_lease_state_values (MS-SMB2 2.2.13.2.8)
+  - test_delete_on_close_preserved_in_handle_state
+  - test_file_offset_tracking_for_durable_handles
+  - test_durable_vs_non_durable_file_offset
+
+**Results**: 10/22 smb2.durable-open tests still pass (same as Phase 24).
+Phase 25 improvements are structural/compliance fixes that didn't change test outcomes.
+Remaining failures require more complex oplock/lease break handling during reconnect.
+
 ## smbtorture Test Analysis
 
 ### Test Results Summary (January 2026)
