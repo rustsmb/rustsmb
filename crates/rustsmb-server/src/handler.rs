@@ -15,6 +15,7 @@ use binrw::{BinRead, BinWrite};
 use bytes::{Buf, BytesMut};
 use rustsmb_auth::{AuthContext, AuthResult, DynAuthProvider, PreauthIntegrityHash, SessionKeys};
 use rustsmb_core::{NtStatus, SmbDialect, VfsError};
+use rustsmb_protocol::commands::fileid_body_offset;
 use rustsmb_protocol::commands::oplock_break::{
     LeaseBreakAcknowledgment, LeaseBreakFlags, LeaseBreakNotification, LeaseBreakResponse,
     LeaseState, OplockBreakAcknowledgment, OplockBreakNotification, OplockBreakResponse,
@@ -612,37 +613,18 @@ where
             | Smb2Command::QueryDirectory => {
                 // Check if we need to substitute FileId
                 if let Some((persistent, volatile)) = file_id_override {
-                    // FileId offset in body depends on command type per MS-SMB2:
-                    // - CLOSE (2.2.15): offset 8
-                    // - FLUSH (2.2.17): offset 8
-                    // - LOCK (2.2.26): offset 8
-                    // - QUERY_DIRECTORY (2.2.33): offset 8
-                    // - READ (2.2.19): offset 16
-                    // - WRITE (2.2.21): offset 16
-                    // - SET_INFO (2.2.39): offset 16
-                    // - QUERY_INFO (2.2.37): offset 24 (after AdditionalInformation + Flags)
-                    let file_id_body_offset = match header.command {
-                        Smb2Command::Close
-                        | Smb2Command::Flush
-                        | Smb2Command::Lock
-                        | Smb2Command::QueryDirectory => 8,
-                        Smb2Command::QueryInfo => 24,
-                        _ => 16, // READ, WRITE, SET_INFO
-                    };
+                    // Use centralized FileId offset from rustsmb-protocol
+                    // See docs/postmortem/2026-01-compound-request-bugs.md for why this is critical
+                    let offset = fileid_body_offset(header.command)
+                        .expect("command requires FileId but none defined");
 
                     // Check if the request uses the sentinel FileId
-                    let min_body_len = file_id_body_offset + 16;
+                    let min_body_len = offset + 16;
                     if body.len() >= min_body_len {
-                        let req_persistent = u64::from_le_bytes(
-                            body[file_id_body_offset..file_id_body_offset + 8]
-                                .try_into()
-                                .unwrap(),
-                        );
-                        let req_volatile = u64::from_le_bytes(
-                            body[file_id_body_offset + 8..file_id_body_offset + 16]
-                                .try_into()
-                                .unwrap(),
-                        );
+                        let req_persistent =
+                            u64::from_le_bytes(body[offset..offset + 8].try_into().unwrap());
+                        let req_volatile =
+                            u64::from_le_bytes(body[offset + 8..offset + 16].try_into().unwrap());
                         // Per MS-SMB2 3.3.5.2.7.2 and footnote <214>:
                         // Windows-based servers use the FileId from the previous response
                         // for related operations. The sentinel value (0xFFFFFFFFFFFFFFFF)
@@ -659,7 +641,7 @@ where
                         if use_ctx_persistent || use_ctx_volatile {
                             // Substitute the FileId fields for related operations
                             let mut modified_message = full_message.to_vec();
-                            let file_id_offset = SMB2_HEADER_SIZE + file_id_body_offset;
+                            let file_id_offset = SMB2_HEADER_SIZE + offset;
                             if modified_message.len() >= file_id_offset + 16 {
                                 let final_persistent = if use_ctx_persistent {
                                     persistent

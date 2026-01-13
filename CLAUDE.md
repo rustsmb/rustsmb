@@ -18,6 +18,7 @@ All project documentation is maintained in the `docs/` directory:
 | [docs/state-store-design.md](./docs/state-store-design.md) | State store design with separate coordinator service and Redis leases/locks |
 | [docs/oplock-lease-design.md](./docs/oplock-lease-design.md) | SMB oplock and lease design, conflict detection, multi-server handling |
 | [docs/smb-protocol-testing.md](./docs/smb-protocol-testing.md) | SMB protocol testing with smbtorture, MS Protocol Test Suites, and smbprotocol |
+| [docs/postmortem/](./docs/postmortem/) | Incident postmortems and lessons learned |
 
 ### Documentation Update Policy
 
@@ -362,6 +363,35 @@ Do not commit code that fails any of these checks.
 - Use constant-time comparison for signatures
 - Encrypt session keys in state store
 
+## Lessons Learned
+
+### Protocol Implementation Best Practices
+
+1. **Verify byte offsets per command type**: SMB2 command structures have different layouts. Always consult the specific MS-SMB2 section (2.2.x) for each command before implementing byte-level operations.
+
+2. **Add trace logging during development**: Include trace! statements showing actual values at critical decision points. Can be disabled in production via log level.
+
+3. **Reference spec section numbers in code**: Document which MS-SMB2 section defines the behavior being implemented.
+
+4. **Read entire spec section including footnotes**: MS-SMB2 footnotes often contain critical implementation details (e.g., footnote <214> on FileId substitution).
+
+5. **Test byte-level operations explicitly**: Unit tests should verify exact field positions in serialized structures, not just high-level behavior.
+
+### FileId Body Offsets by Command
+
+| Command | Body Offset | MS-SMB2 Section |
+|---------|-------------|-----------------|
+| CLOSE | 8 | 2.2.15 |
+| FLUSH | 8 | 2.2.17 |
+| LOCK | 8 | 2.2.26 |
+| QUERY_DIRECTORY | 8 | 2.2.33 |
+| READ | 16 | 2.2.19 |
+| WRITE | 16 | 2.2.21 |
+| SET_INFO | 16 | 2.2.39 |
+| QUERY_INFO | 24 | 2.2.37 |
+
+See [docs/postmortem/2026-01-compound-request-bugs.md](./docs/postmortem/2026-01-compound-request-bugs.md) for full incident details.
+
 ## Implementation Status
 
 ### Phase 1: Project Setup & Documentation - COMPLETED
@@ -682,6 +712,19 @@ Implement compound SMB2 request handling per MS-SMB2 section 3.3.5.2.7.
   - test_compound_context_error_propagation
 
 **Note:** Uses existing infrastructure from rustsmb-session::compound module (parse_compound_offsets, CompoundContext, etc.) that was previously not wired up to the handler.
+
+### Phase 22: Postmortem & Protocol Safety - COMPLETED
+
+Document lessons learned from Phase 21 compound bugs and implement safety improvements.
+
+- [x] Phase 22A: Write postmortem document (docs/postmortem/2026-01-compound-request-bugs.md)
+- [x] Phase 22B: Add Lessons Learned section to CLAUDE.md
+- [x] Phase 22C: Add FileId offset constants to rustsmb-protocol
+  - Add `fileid_body_offset()` helper function
+  - Document MS-SMB2 section for each offset
+- [x] Phase 22D: Add unit tests for FileId positions
+  - Tests verify byte offsets in serialized command buffers
+- [x] Phase 22E: Update handler.rs to use protocol constants
 
 ## smbtorture Test Analysis
 
