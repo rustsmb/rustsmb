@@ -23,6 +23,10 @@ use rustsmb_protocol::commands::oplock_break::{
 };
 use rustsmb_protocol::crypto::signing::{MessageSigner, SigningAlgorithm};
 use rustsmb_protocol::{Smb2Command, Smb2Flags, Smb2Header, SMB2_HEADER_SIZE, SMB2_MAGIC};
+use rustsmb_session::compound::{
+    compound_padding, parse_compound_offsets, CompoundContext, CompoundResult,
+    FileId as CompoundFileId,
+};
 use rustsmb_session::{Connection, SessionManager};
 use rustsmb_state::{HandleState, LeaseEntry, SessionState, TreeState};
 use rustsmb_vfs::{CreateParams, FileHandle, FileLock, LockType};
@@ -290,10 +294,30 @@ where
             return Err(HandlerError::Protocol("Invalid SMB2 magic".into()));
         }
 
-        // Parse header
+        // Parse header to check for compound request
         let header = Smb2Header::read(&mut Cursor::new(message))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse header: {}", e)))?;
 
+        // Check for compound request (MS-SMB2 3.3.5.2.7)
+        if header.next_command != 0 {
+            debug!(
+                conn_id = self.connection.id,
+                next_command = header.next_command,
+                "Processing compound request"
+            );
+            return self.process_compound_request(message).await;
+        }
+
+        // Single request - process normally
+        self.process_single_message(&header, message).await
+    }
+
+    /// Process a single (non-compound) SMB message.
+    async fn process_single_message(
+        &mut self,
+        header: &Smb2Header,
+        message: &[u8],
+    ) -> Result<Vec<u8>, HandlerError> {
         trace!(
             conn_id = self.connection.id,
             command = ?header.command,
@@ -321,7 +345,411 @@ where
 
         // Dispatch to command handler
         let body = &message[SMB2_HEADER_SIZE..];
-        self.dispatch_command(&header, body, message).await
+        self.dispatch_command(header, body, message).await
+    }
+
+    /// Process a compound SMB request (MS-SMB2 3.3.5.2.7).
+    ///
+    /// Compound requests contain multiple SMB2 commands in a single NetBIOS frame,
+    /// linked by the `next_command` field in each header.
+    async fn process_compound_request(&mut self, message: &[u8]) -> Result<Vec<u8>, HandlerError> {
+        // Parse command offsets from the compound message
+        let offsets = parse_compound_offsets(message);
+        if offsets.len() < 2 {
+            // Not really a compound - single command (shouldn't happen, but handle gracefully)
+            let header = Smb2Header::read(&mut Cursor::new(message))
+                .map_err(|e| HandlerError::Protocol(format!("Failed to parse header: {}", e)))?;
+            return self.process_single_message(&header, message).await;
+        }
+
+        debug!(
+            conn_id = self.connection.id,
+            command_count = offsets.len(),
+            "Processing compound request"
+        );
+
+        // Update connection activity
+        self.connection.touch();
+
+        // Determine if this is a related or unrelated compound request
+        // by checking SMB2_FLAGS_RELATED_OPERATIONS on the second command
+        let second_header = Smb2Header::read(&mut Cursor::new(&message[offsets[1]..]))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to parse second header: {}", e)))?;
+        let is_related = second_header.flags.is_related();
+
+        trace!(
+            conn_id = self.connection.id,
+            is_related,
+            "Compound request type"
+        );
+
+        // Create context for tracking state across commands
+        let mut ctx = if is_related {
+            CompoundContext::related(offsets.len())
+        } else {
+            CompoundContext::unrelated(offsets.len())
+        };
+
+        let mut responses: Vec<Vec<u8>> = Vec::with_capacity(offsets.len());
+        let mut last_error: Option<NtStatus> = None;
+
+        // Process each command in the compound
+        for (i, &offset) in offsets.iter().enumerate() {
+            // Calculate the length of this command
+            let cmd_end = if i + 1 < offsets.len() {
+                offsets[i + 1]
+            } else {
+                message.len()
+            };
+            let cmd_data = &message[offset..cmd_end];
+
+            // Parse the header for this command
+            let header = match Smb2Header::read(&mut Cursor::new(cmd_data)) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        conn_id = self.connection.id,
+                        command_index = i,
+                        error = %e,
+                        "Failed to parse compound command header"
+                    );
+                    // Build error response using context's session/tree IDs
+                    // Create a minimal header for error response
+                    let err_header = Smb2Header {
+                        structure_size: 64,
+                        credit_charge: 1,
+                        status: 0,
+                        command: Smb2Command::Negotiate, // Placeholder
+                        credits: 0,
+                        flags: Smb2Flags(0),
+                        next_command: 0,
+                        message_id: 0,
+                        async_id: 0,
+                        tree_id: ctx.tree_id.unwrap_or(0),
+                        session_id: ctx.session_id.unwrap_or(0),
+                        signature: [0; 16],
+                    };
+                    let err_resp = self.build_error_response_with_ids(
+                        &err_header,
+                        NtStatus::InvalidParameter,
+                        ctx.session_id.unwrap_or(0),
+                        ctx.tree_id.unwrap_or(0),
+                    )?;
+                    let signed_err_resp = self.maybe_sign_response(err_resp)?;
+                    responses.push(signed_err_resp);
+                    last_error = Some(NtStatus::InvalidParameter);
+                    ctx.advance(CompoundResult::failure(NtStatus::InvalidParameter.code()));
+                    continue;
+                }
+            };
+
+            // Resolve session/tree IDs for related requests
+            let effective_header = if is_related && i > 0 {
+                self.resolve_related_header(&header, &ctx)?
+            } else {
+                header.clone()
+            };
+
+            // For related requests after the first, propagate errors from previous commands
+            if is_related && i > 0 && last_error.is_some() {
+                let status = last_error.unwrap();
+                trace!(
+                    conn_id = self.connection.id,
+                    command_index = i,
+                    status = ?status,
+                    "Propagating error to related command"
+                );
+                let err_resp = self.build_error_response_with_ids(
+                    &effective_header,
+                    status,
+                    effective_header.session_id,
+                    effective_header.tree_id,
+                )?;
+                let signed_err_resp = self.maybe_sign_response(err_resp)?;
+                responses.push(signed_err_resp);
+                ctx.advance(CompoundResult::failure(status.code()));
+                continue;
+            }
+
+            // Consume credits
+            if effective_header.command != Smb2Command::Negotiate {
+                let charge = effective_header.credit_charge.max(1);
+                let _ = self.connection.consume_credits(charge);
+            }
+
+            // Process the command
+            let body = &cmd_data[SMB2_HEADER_SIZE..];
+            let result = self
+                .dispatch_command_compound(&effective_header, body, cmd_data, &ctx)
+                .await;
+
+            match result {
+                Ok((response, file_id)) => {
+                    // Capture session/tree from first command
+                    if i == 0 {
+                        ctx.set_session_id(effective_header.session_id);
+                        ctx.set_tree_id(effective_header.tree_id);
+                    }
+
+                    // Record result and advance context
+                    if let Some((persistent, volatile)) = file_id {
+                        ctx.advance(CompoundResult::success_with_file(CompoundFileId::new(
+                            persistent as u128,
+                            volatile as u128,
+                        )));
+                    } else {
+                        ctx.advance(CompoundResult::success());
+                    }
+
+                    // Sign response before adding to compound
+                    let signed_response = self.maybe_sign_response(response)?;
+                    responses.push(signed_response);
+                }
+                Err(e) => {
+                    let status = e.status();
+                    warn!(
+                        conn_id = self.connection.id,
+                        command_index = i,
+                        error = %e,
+                        "Error processing compound command"
+                    );
+
+                    // Use effective_header with resolved session/tree IDs
+                    let err_resp = self.build_error_response_with_ids(
+                        &effective_header,
+                        status,
+                        effective_header.session_id,
+                        effective_header.tree_id,
+                    )?;
+                    // Sign error response before adding to compound
+                    let signed_err_resp = self.maybe_sign_response(err_resp)?;
+                    responses.push(signed_err_resp);
+                    last_error = Some(status);
+                    ctx.advance(CompoundResult::failure(status.code()));
+                }
+            }
+        }
+
+        // Combine all responses into a single compound response
+        self.combine_compound_responses(responses, is_related)
+    }
+
+    /// Resolve header values for a related compound request.
+    ///
+    /// Per MS-SMB2 3.3.5.2.7.2, sentinel values (0xFFFFFFFF...) mean
+    /// "use the value from the previous command".
+    fn resolve_related_header(
+        &self,
+        header: &Smb2Header,
+        ctx: &CompoundContext,
+    ) -> Result<Smb2Header, HandlerError> {
+        let mut resolved = header.clone();
+
+        // Resolve session ID
+        if let Some(session_id) = ctx.resolve_session_id(header.session_id) {
+            resolved.session_id = session_id;
+        } else {
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Resolve tree ID
+        if let Some(tree_id) = ctx.resolve_tree_id(header.tree_id) {
+            resolved.tree_id = tree_id;
+        } else {
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        Ok(resolved)
+    }
+
+    /// Dispatch a command in a compound request, returning file ID if this is a CREATE.
+    async fn dispatch_command_compound(
+        &mut self,
+        header: &Smb2Header,
+        body: &[u8],
+        full_message: &[u8],
+        ctx: &CompoundContext,
+    ) -> Result<(Vec<u8>, Option<(u64, u64)>), HandlerError> {
+        // For file operations in related compounds, we may need to substitute FileId
+        let file_id_override = if ctx.related && !ctx.is_first() {
+            ctx.file_id
+                .map(|fid| (fid.persistent as u64, fid.volatile as u64))
+        } else {
+            None
+        };
+
+        // Dispatch to the appropriate handler
+        let response = match header.command {
+            // CREATE returns a file ID that subsequent related commands can use
+            Smb2Command::Create => {
+                let resp = self.dispatch_command(header, body, full_message).await?;
+                // Extract file ID from CREATE response for compound context
+                // FileId is at offset 64 in CREATE response (after 64-byte header)
+                if resp.len() >= SMB2_HEADER_SIZE + 64 + 16 {
+                    let persistent = u64::from_le_bytes(
+                        resp[SMB2_HEADER_SIZE + 64..SMB2_HEADER_SIZE + 72]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let volatile = u64::from_le_bytes(
+                        resp[SMB2_HEADER_SIZE + 72..SMB2_HEADER_SIZE + 80]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    return Ok((resp, Some((persistent, volatile))));
+                }
+                resp
+            }
+
+            // File operations that may use FileId from previous CREATE
+            Smb2Command::Read
+            | Smb2Command::Write
+            | Smb2Command::Close
+            | Smb2Command::Flush
+            | Smb2Command::Lock
+            | Smb2Command::QueryInfo
+            | Smb2Command::SetInfo
+            | Smb2Command::QueryDirectory => {
+                // Check if we need to substitute FileId
+                if let Some((persistent, volatile)) = file_id_override {
+                    // FileId offset in body depends on command type
+                    // CLOSE, FLUSH, LOCK: offset 8 (after StructureSize, Flags, Reserved)
+                    // READ, WRITE, QUERY_INFO, SET_INFO, QUERY_DIRECTORY: offset 16
+                    let file_id_body_offset = match header.command {
+                        Smb2Command::Close | Smb2Command::Flush | Smb2Command::Lock => 8,
+                        _ => 16,
+                    };
+
+                    // Check if the request uses the sentinel FileId
+                    let min_body_len = file_id_body_offset + 16;
+                    if body.len() >= min_body_len {
+                        let req_persistent = u64::from_le_bytes(
+                            body[file_id_body_offset..file_id_body_offset + 8]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let req_volatile = u64::from_le_bytes(
+                            body[file_id_body_offset + 8..file_id_body_offset + 16]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        if req_persistent == u64::MAX && req_volatile == u64::MAX {
+                            // Substitute the FileId from previous CREATE
+                            let mut modified_message = full_message.to_vec();
+                            let file_id_offset = SMB2_HEADER_SIZE + file_id_body_offset;
+                            if modified_message.len() >= file_id_offset + 16 {
+                                modified_message[file_id_offset..file_id_offset + 8]
+                                    .copy_from_slice(&persistent.to_le_bytes());
+                                modified_message[file_id_offset + 8..file_id_offset + 16]
+                                    .copy_from_slice(&volatile.to_le_bytes());
+                                let modified_body = &modified_message[SMB2_HEADER_SIZE..];
+                                return Ok((
+                                    self.dispatch_command(header, modified_body, &modified_message)
+                                        .await?,
+                                    None,
+                                ));
+                            }
+                        }
+                    }
+                }
+                self.dispatch_command(header, body, full_message).await?
+            }
+
+            // Other commands - dispatch normally
+            _ => self.dispatch_command(header, body, full_message).await?,
+        };
+
+        Ok((response, None))
+    }
+
+    /// Combine individual responses into a compound response.
+    ///
+    /// Per MS-SMB2 3.3.4.1.3:
+    /// - Responses are concatenated with 8-byte alignment
+    /// - NextCommand field points to the next response
+    /// - SMB2_FLAGS_RELATED_OPERATIONS is set on responses after the first (if related)
+    fn combine_compound_responses(
+        &self,
+        responses: Vec<Vec<u8>>,
+        is_related: bool,
+    ) -> Result<Vec<u8>, HandlerError> {
+        if responses.is_empty() {
+            return Err(HandlerError::Internal("No responses to combine".into()));
+        }
+
+        if responses.len() == 1 {
+            return Ok(responses.into_iter().next().unwrap());
+        }
+
+        let mut result = Vec::new();
+        let response_count = responses.len();
+
+        for (i, mut response) in responses.into_iter().enumerate() {
+            let is_last = i == response_count - 1;
+
+            // Ensure response is at least header size
+            if response.len() < SMB2_HEADER_SIZE {
+                warn!(
+                    conn_id = self.connection.id,
+                    response_index = i,
+                    response_len = response.len(),
+                    "Response too small for compound"
+                );
+                continue;
+            }
+
+            // Set SMB2_FLAGS_RELATED_OPERATIONS on all but first response (if related)
+            let mut header_modified = false;
+            if is_related && i > 0 {
+                let flags =
+                    u32::from_le_bytes([response[16], response[17], response[18], response[19]]);
+                let new_flags = flags | Smb2Flags::RELATED_OPERATIONS;
+                response[16..20].copy_from_slice(&new_flags.to_le_bytes());
+                header_modified = true;
+            }
+
+            // Calculate padding for 8-byte alignment (except for last response)
+            let padding = if is_last {
+                0
+            } else {
+                compound_padding(response.len())
+            };
+
+            // Set NextCommand field to point to next response
+            if !is_last {
+                let next_offset = (response.len() + padding) as u32;
+                response[20..24].copy_from_slice(&next_offset.to_le_bytes());
+                header_modified = true;
+            } else {
+                // Clear NextCommand for last response (usually already 0)
+                let current_next =
+                    u32::from_le_bytes([response[20], response[21], response[22], response[23]]);
+                if current_next != 0 {
+                    response[20..24].copy_from_slice(&0u32.to_le_bytes());
+                    header_modified = true;
+                }
+            }
+
+            // Re-sign the response if we modified the header
+            if header_modified {
+                self.re_sign_response(&mut response)?;
+            }
+
+            // Append response and padding
+            result.extend_from_slice(&response);
+            if padding > 0 {
+                result.extend(std::iter::repeat(0u8).take(padding));
+            }
+        }
+
+        trace!(
+            conn_id = self.connection.id,
+            response_count,
+            total_len = result.len(),
+            "Combined compound responses"
+        );
+
+        Ok(result)
     }
 
     /// Dispatch to the appropriate command handler.
@@ -613,6 +1041,25 @@ where
         let req_header = Smb2Header::read(&mut Cursor::new(request))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse header: {}", e)))?;
 
+        self.build_error_response_with_ids(
+            &req_header,
+            status,
+            req_header.session_id,
+            req_header.tree_id,
+        )
+    }
+
+    /// Build an error response with explicit session and tree IDs.
+    ///
+    /// This is used in compound request processing where the request may have
+    /// sentinel values (0xFFFFFFFF...) that need to be resolved.
+    fn build_error_response_with_ids(
+        &self,
+        req_header: &Smb2Header,
+        status: NtStatus,
+        session_id: u64,
+        tree_id: u32,
+    ) -> Result<Vec<u8>, HandlerError> {
         let resp_header = Smb2Header {
             structure_size: 64,
             credit_charge: req_header.credit_charge,
@@ -623,8 +1070,8 @@ where
             next_command: 0,
             message_id: req_header.message_id,
             async_id: 0,
-            tree_id: req_header.tree_id,
-            session_id: req_header.session_id,
+            tree_id,
+            session_id,
             signature: [0; 16],
         };
 
@@ -4200,6 +4647,56 @@ where
         Ok(())
     }
 
+    /// Re-sign a response after header modification (e.g., in compound responses).
+    ///
+    /// This is needed when we modify header fields (flags, NextCommand) after
+    /// the initial signature was computed. The existing signature is invalidated
+    /// by the header changes, so we need to recompute it.
+    fn re_sign_response(&self, response: &mut [u8]) -> Result<(), HandlerError> {
+        if response.len() < SMB2_HEADER_SIZE {
+            return Ok(());
+        }
+
+        // Extract session_id from response header
+        let session_id = u64::from_le_bytes([
+            response[40],
+            response[41],
+            response[42],
+            response[43],
+            response[44],
+            response[45],
+            response[46],
+            response[47],
+        ]);
+
+        // Check if we have a signing key for this session
+        if let Some(signing_key) = self.signing_keys.get(&session_id) {
+            // Check if response is signed (SIGNED flag)
+            let flags =
+                u32::from_le_bytes([response[16], response[17], response[18], response[19]]);
+
+            if (flags & Smb2Flags::SIGNED) != 0 {
+                // Get dialect from connection
+                let dialect = self.connection.dialect.unwrap_or(SmbDialect::Smb302);
+
+                // Zero the signature field before recomputing
+                response[48..64].copy_from_slice(&[0u8; 16]);
+
+                // Compute and write new signature
+                let signature = Self::compute_signature(signing_key, dialect, response)?;
+                response[48..64].copy_from_slice(&signature);
+
+                trace!(
+                    conn_id = self.connection.id,
+                    session_id,
+                    "Re-signed response after header modification"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Sign a response message if we have a signing key for the session.
     ///
     /// This is called from the main loop after the command handler returns
@@ -4398,16 +4895,17 @@ mod tests {
     //
     // Tests are organized by MS-SMB2 specification chapter:
     //
-    // 3.3.5.2  - Receiving Any Message (signature, credit, session verification)
-    // 3.3.5.4  - NEGOTIATE
-    // 3.3.5.5  - SESSION_SETUP
-    // 3.3.5.6  - LOGOFF
-    // 3.3.5.7  - TREE_CONNECT
-    // 3.3.5.8  - TREE_DISCONNECT
-    // 3.3.5.9  - CREATE
-    // 3.3.5.10 - CLOSE
-    // 3.3.5.12 - READ
-    // 3.3.5.14 - LOCK
+    // 3.3.5.2   - Receiving Any Message (signature, credit, session verification)
+    // 3.3.5.2.7 - Handling Compounded Requests
+    // 3.3.5.4   - NEGOTIATE
+    // 3.3.5.5   - SESSION_SETUP
+    // 3.3.5.6   - LOGOFF
+    // 3.3.5.7   - TREE_CONNECT
+    // 3.3.5.8   - TREE_DISCONNECT
+    // 3.3.5.9   - CREATE
+    // 3.3.5.10  - CLOSE
+    // 3.3.5.12  - READ
+    // 3.3.5.14  - LOCK
     //
     // ==========================================================================
 
@@ -4460,6 +4958,160 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
             .collect()
+    }
+
+    // ==========================================================================
+    // 3.3.5.2.7 - Handling Compounded Requests
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 section 3.3.5.2.7:
+    // "Handling Compounded Requests"
+    //
+    // Key requirements tested:
+    // - Compound requests are detected via NextCommand field
+    // - Related operations share session/tree/file context
+    // - Sentinel values (0xFFFFFFFF...) are substituted correctly
+    // - Responses are properly combined with 8-byte alignment
+    // - Errors propagate to subsequent related commands
+    // ==========================================================================
+
+    #[test]
+    fn test_parse_compound_offsets_single_command() {
+        // A single command has NextCommand = 0
+        let mut msg = vec![0u8; 100];
+        msg[0..4].copy_from_slice(&SMB2_MAGIC);
+        // NextCommand at offset 20 is already 0
+
+        let offsets = parse_compound_offsets(&msg);
+        assert_eq!(offsets, vec![0]);
+    }
+
+    #[test]
+    fn test_parse_compound_offsets_two_commands() {
+        // Two commands: first has NextCommand = 64, second has NextCommand = 0
+        let mut msg = vec![0u8; 128];
+        msg[0..4].copy_from_slice(&SMB2_MAGIC);
+        msg[20..24].copy_from_slice(&64u32.to_le_bytes()); // NextCommand = 64
+
+        msg[64..68].copy_from_slice(&SMB2_MAGIC);
+        // NextCommand at offset 64+20 = 84 is already 0
+
+        let offsets = parse_compound_offsets(&msg);
+        assert_eq!(offsets, vec![0, 64]);
+    }
+
+    #[test]
+    fn test_parse_compound_offsets_three_commands() {
+        // Three commands chained together
+        let mut msg = vec![0u8; 256];
+
+        // First command at offset 0, NextCommand = 80
+        msg[0..4].copy_from_slice(&SMB2_MAGIC);
+        msg[20..24].copy_from_slice(&80u32.to_le_bytes());
+
+        // Second command at offset 80, NextCommand = 88
+        msg[80..84].copy_from_slice(&SMB2_MAGIC);
+        msg[100..104].copy_from_slice(&88u32.to_le_bytes()); // 80 + 20 = 100
+
+        // Third command at offset 168, NextCommand = 0
+        msg[168..172].copy_from_slice(&SMB2_MAGIC);
+        // NextCommand at 168+20=188 is already 0
+
+        let offsets = parse_compound_offsets(&msg);
+        assert_eq!(offsets, vec![0, 80, 168]);
+    }
+
+    #[test]
+    fn test_compound_padding_alignment() {
+        // Test 8-byte alignment padding
+        assert_eq!(compound_padding(0), 0); // Already aligned
+        assert_eq!(compound_padding(8), 0); // Already aligned
+        assert_eq!(compound_padding(16), 0); // Already aligned
+        assert_eq!(compound_padding(64), 0); // Header size, aligned
+
+        assert_eq!(compound_padding(1), 7); // Need 7 bytes padding
+        assert_eq!(compound_padding(7), 1); // Need 1 byte padding
+        assert_eq!(compound_padding(65), 7); // 65 -> 72, need 7
+        assert_eq!(compound_padding(66), 6); // 66 -> 72, need 6
+    }
+
+    #[test]
+    fn test_compound_context_related_session_resolution() {
+        // Test session ID resolution for related requests
+        let mut ctx = CompoundContext::related(3);
+        ctx.set_session_id(12345);
+
+        // First command uses its own session ID
+        assert_eq!(ctx.resolve_session_id(999), Some(999));
+
+        ctx.advance(CompoundResult::success());
+
+        // Subsequent commands with sentinel use inherited session
+        assert_eq!(ctx.resolve_session_id(u64::MAX), Some(12345));
+
+        // Subsequent commands with explicit ID still use their own
+        assert_eq!(ctx.resolve_session_id(555), Some(555));
+    }
+
+    #[test]
+    fn test_compound_context_related_tree_resolution() {
+        // Test tree ID resolution for related requests
+        let mut ctx = CompoundContext::related(2);
+        ctx.set_tree_id(100);
+        ctx.advance(CompoundResult::success());
+
+        // Sentinel value resolves to inherited tree ID
+        assert_eq!(ctx.resolve_tree_id(u32::MAX), Some(100));
+
+        // Explicit value is used as-is
+        assert_eq!(ctx.resolve_tree_id(200), Some(200));
+    }
+
+    #[test]
+    fn test_compound_context_file_id_resolution() {
+        // Test file ID resolution for related requests
+        let mut ctx = CompoundContext::related(2);
+
+        // First command (CREATE) produces a file ID
+        let create_file_id = CompoundFileId::new(0x1111, 0x2222);
+        ctx.advance(CompoundResult::success_with_file(create_file_id));
+
+        // Second command with sentinel uses CREATE's file ID
+        let sentinel = CompoundFileId::new(
+            CompoundFileId::RELATED_SENTINEL,
+            CompoundFileId::RELATED_SENTINEL,
+        );
+        let resolved = ctx.resolve_file_id(sentinel);
+        assert!(resolved.is_some());
+        let resolved = resolved.unwrap();
+        assert_eq!(resolved.persistent, 0x1111);
+        assert_eq!(resolved.volatile, 0x2222);
+    }
+
+    #[test]
+    fn test_compound_context_error_propagation() {
+        // Test that errors are detected for propagation
+        let mut ctx = CompoundContext::related(3);
+
+        ctx.advance(CompoundResult::success());
+        assert!(!ctx.has_previous_failure());
+
+        ctx.advance(CompoundResult::failure(0xC0000022)); // ACCESS_DENIED
+        assert!(ctx.has_previous_failure());
+        assert_eq!(ctx.last_failure_status(), Some(0xC0000022));
+    }
+
+    #[test]
+    fn test_compound_context_unrelated_no_resolution() {
+        // Unrelated compound requests don't resolve sentinel values
+        let mut ctx = CompoundContext::unrelated(2);
+        ctx.set_session_id(12345);
+        ctx.advance(CompoundResult::success());
+
+        // Even with sentinel, unrelated requests should use the request value
+        // (the caller should NOT send sentinel for unrelated requests, but if they
+        // do, we still use it - it will fail validation elsewhere)
+        assert_eq!(ctx.resolve_session_id(u64::MAX), Some(u64::MAX));
     }
 
     // ==========================================================================

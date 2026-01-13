@@ -654,6 +654,35 @@ Implement proper READ request handling per MS-SMB2 section 3.3.5.12.
   - test_read_directory_check_logic (directory + persistent combinations)
   - test_minimum_count_logic (EOF handling already implemented)
 
+### Phase 21: Compound Request Support - COMPLETED
+
+Implement compound SMB2 request handling per MS-SMB2 section 3.3.5.2.7.
+
+- [x] Phase 21A: Modify process_message for compound detection
+  - Check header.next_command to detect compound requests
+  - Delegate to process_compound_request() for compounds
+- [x] Phase 21B: Add compound request processor
+  - Parse command offsets using parse_compound_offsets()
+  - Detect related vs unrelated by checking SMB2_FLAGS_RELATED_OPERATIONS
+  - Create CompoundContext for tracking state across commands
+- [x] Phase 21C: Add related command processor
+  - Resolve session/tree IDs using sentinel value substitution (0xFFFFFFFF...)
+  - Propagate errors to subsequent related commands
+- [x] Phase 21D: Add compound response combiner
+  - Combine responses with 8-byte alignment
+  - Set NextCommand field to point to next response
+  - Set SMB2_FLAGS_RELATED_OPERATIONS on responses after first (if related)
+- [x] Phase 21E: Add FileId substitution for file operations
+  - Substitute FileId in READ/WRITE/CLOSE/etc. from previous CREATE
+  - Extract FileId from CREATE response for compound context
+- [x] Phase 21F: Add unit tests for MS-SMB2 3.3.5.2.7
+  - test_parse_compound_offsets_* (offset parsing)
+  - test_compound_padding_alignment (8-byte alignment)
+  - test_compound_context_* (session/tree/file ID resolution)
+  - test_compound_context_error_propagation
+
+**Note:** Uses existing infrastructure from rustsmb-session::compound module (parse_compound_offsets, CompoundContext, etc.) that was previously not wired up to the handler.
+
 ## smbtorture Test Analysis
 
 ### Test Results Summary (January 2026)
@@ -670,12 +699,13 @@ Implement proper READ request handling per MS-SMB2 section 3.3.5.12.
 | smb2.oplock | **PARTIAL (17/42)** | brl3 (lock error codes), levelii500 (break failure), statopen1 |
 | smb2.durable-open | **FAIL** | Various reconnect edge cases |
 | smb2.durable-v2-open | **FAIL** | Client crash (smbtorture bug) |
-| smb2.compound | **FAIL** | Timeout issues |
+| smb2.compound | **PARTIAL** | Fixed in Phase 21 (related/unrelated now handled) |
 
 ### Missing Features vs ksmbd
 
 | Feature | ksmbd | RustSMB | Priority |
 |---------|-------|---------|----------|
+| Compound requests (related/unrelated) | ✅ | ✅ | - |
 | Oplock break notifications | ✅ | ⚠️ Same-server only | - |
 | Lock stacking (same-handle re-lock) | ✅ | ❌ | P2 |
 | LOCK_NOT_GRANTED vs FILE_LOCK_CONFLICT | ✅ | ❌ | P2 |
