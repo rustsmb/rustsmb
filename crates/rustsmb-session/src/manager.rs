@@ -115,17 +115,34 @@ impl SessionManager {
     }
 
     /// Delete a session and all associated resources.
+    ///
+    /// Per MS-SMB2 3.3.7.1, durable and persistent handles are preserved
+    /// for reconnection. Only non-durable handles are deleted.
     pub async fn delete_session(&self, session_id: u64) -> Result<(), StateError> {
         debug!("Deleting session: {}", session_id);
 
-        // Delete all handles for this session
+        // Process handles for this session
         let handles = self.state_store.get_handles_by_session(session_id).await?;
-        for handle in handles {
-            // Delete lease if present (before deleting handle)
-            if let Some(lease_key) = &handle.lease_key {
-                let _ = self.state_store.delete_lease(lease_key).await;
+        for mut handle in handles {
+            // Per MS-SMB2 3.3.7.1, preserve durable/persistent handles for reconnect
+            if handle.should_preserve_for_reconnect() {
+                debug!(
+                    "Preserving durable handle for reconnect: persistent_id={}, path={}",
+                    handle.persistent_id, handle.path
+                );
+                // Prepare handle for reconnection (clears session_id, sets deadline)
+                // Default timeout: 60 seconds (60000 ms)
+                handle.prepare_for_reconnect(60_000);
+                // Update handle in state store with cleared session
+                let _ = self.state_store.update_handle(&handle).await;
+            } else {
+                // Delete non-durable handle
+                // Delete lease if present (before deleting handle)
+                if let Some(lease_key) = &handle.lease_key {
+                    let _ = self.state_store.delete_lease(lease_key).await;
+                }
+                self.state_store.delete_handle(handle.persistent_id).await?;
             }
-            self.state_store.delete_handle(handle.persistent_id).await?;
         }
 
         // Delete all trees for this session

@@ -302,6 +302,34 @@ impl HandleState {
         // Convert ms to seconds for deadline
         self.reconnect_deadline = Some(now + (timeout_ms as u64 / 1000));
     }
+
+    /// Check if this handle should be preserved for reconnect per MS-SMB2 3.3.7.1.
+    ///
+    /// A handle is preserved if any of these conditions is true:
+    /// - Open.IsPersistent is TRUE
+    /// - Open.IsDurable is TRUE (durability was already validated at grant time
+    ///   to require Batch oplock or lease with HANDLE_CACHING)
+    pub fn should_preserve_for_reconnect(&self) -> bool {
+        self.is_persistent || self.is_durable
+    }
+
+    /// Prepare handle for preservation by clearing connection state.
+    /// Per MS-SMB2 3.3.7.1, set session/tree to NULL (0).
+    pub fn prepare_for_reconnect(&mut self, default_timeout_ms: u32) {
+        // Set connection state to "disconnected"
+        self.session_id = 0;
+        self.tree_id = 0;
+
+        // Set reconnect deadline if not already set
+        if self.reconnect_deadline.is_none() {
+            let timeout = if self.durable_timeout > 0 {
+                self.durable_timeout
+            } else {
+                default_timeout_ms
+            };
+            self.set_durable_timeout(timeout);
+        }
+    }
 }
 
 /// Byte-range lock state for persistence.
@@ -364,5 +392,130 @@ mod tests {
         let parsed: SessionState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.session_id, 12345);
         assert_eq!(parsed.user_id, "testuser");
+    }
+
+    // MS-SMB2 3.3.7.1: Durable Handle Preservation Tests
+
+    /// Per MS-SMB2 3.3.7.1, handles with is_durable=true should be preserved for reconnect
+    #[test]
+    fn test_should_preserve_for_reconnect_durable_handle() {
+        let handle = HandleState {
+            is_durable: true,
+            is_persistent: false,
+            ..Default::default()
+        };
+        assert!(handle.should_preserve_for_reconnect());
+    }
+
+    /// Per MS-SMB2 3.3.7.1, handles with is_persistent=true should be preserved for reconnect
+    #[test]
+    fn test_should_preserve_for_reconnect_persistent_handle() {
+        let handle = HandleState {
+            is_durable: false,
+            is_persistent: true,
+            ..Default::default()
+        };
+        assert!(handle.should_preserve_for_reconnect());
+    }
+
+    /// Non-durable, non-persistent handles should NOT be preserved
+    #[test]
+    fn test_should_not_preserve_regular_handle() {
+        let handle = HandleState {
+            is_durable: false,
+            is_persistent: false,
+            ..Default::default()
+        };
+        assert!(!handle.should_preserve_for_reconnect());
+    }
+
+    /// Per MS-SMB2 3.3.7.1, prepare_for_reconnect should clear session_id and tree_id
+    #[test]
+    fn test_prepare_for_reconnect_clears_session_and_tree() {
+        let mut handle = HandleState {
+            session_id: 12345,
+            tree_id: 1,
+            is_durable: true,
+            ..Default::default()
+        };
+        handle.prepare_for_reconnect(60_000);
+
+        assert_eq!(handle.session_id, 0);
+        assert_eq!(handle.tree_id, 0);
+    }
+
+    /// Per MS-SMB2 3.3.7.1, prepare_for_reconnect should set reconnect deadline
+    #[test]
+    fn test_prepare_for_reconnect_sets_deadline() {
+        let mut handle = HandleState {
+            is_durable: true,
+            reconnect_deadline: None,
+            ..Default::default()
+        };
+        handle.prepare_for_reconnect(60_000); // 60 second timeout
+
+        assert!(handle.reconnect_deadline.is_some());
+        assert_eq!(handle.durable_timeout, 60_000);
+    }
+
+    /// Per MS-SMB2 3.3.7.1, if handle already has timeout, use that
+    #[test]
+    fn test_prepare_for_reconnect_preserves_existing_timeout() {
+        let mut handle = HandleState {
+            is_durable: true,
+            durable_timeout: 120_000, // 2 minute timeout
+            reconnect_deadline: None,
+            ..Default::default()
+        };
+        handle.prepare_for_reconnect(60_000); // Default 60s, but should use 120s
+
+        assert_eq!(handle.durable_timeout, 120_000);
+        assert!(handle.reconnect_deadline.is_some());
+    }
+
+    /// Per MS-SMB2 3.3.5.9.7, can_reconnect should return false if deadline passed
+    #[test]
+    fn test_can_reconnect_fails_after_deadline() {
+        let handle = HandleState {
+            is_durable: true,
+            reconnect_deadline: Some(1), // Unix epoch + 1 second (long past)
+            ..Default::default()
+        };
+        assert!(!handle.can_reconnect());
+    }
+
+    /// Per MS-SMB2 3.3.5.9.7, can_reconnect should return true if deadline not passed
+    #[test]
+    fn test_can_reconnect_succeeds_before_deadline() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600; // 1 hour from now
+
+        let handle = HandleState {
+            is_durable: true,
+            reconnect_deadline: Some(future),
+            ..Default::default()
+        };
+        assert!(handle.can_reconnect());
+    }
+
+    /// Non-durable handles cannot be reconnected regardless of deadline
+    #[test]
+    fn test_can_reconnect_fails_for_non_durable() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+
+        let handle = HandleState {
+            is_durable: false,
+            is_persistent: false,
+            reconnect_deadline: Some(future),
+            ..Default::default()
+        };
+        assert!(!handle.can_reconnect());
     }
 }

@@ -145,6 +145,33 @@ where
                 .unregister_connection_leases(&self.server_id, *session_id);
             self.lease_registry
                 .unregister_connection_oplocks(&self.server_id, *session_id);
+
+            // Per MS-SMB2 3.3.7.1: Prepare durable handles for reconnect when
+            // connection is lost. Set session_id to 0 so they can be reconnected.
+            if let Ok(handles) = self
+                .session_manager
+                .state_store()
+                .get_handles_by_session(*session_id)
+                .await
+            {
+                for mut handle in handles {
+                    if handle.should_preserve_for_reconnect() {
+                        debug!(
+                            conn_id = self.connection.id,
+                            session_id,
+                            persistent_id = handle.persistent_id,
+                            path = %handle.path,
+                            "Preparing durable handle for reconnect on connection close"
+                        );
+                        handle.prepare_for_reconnect(60_000); // 60 second default timeout
+                        let _ = self
+                            .session_manager
+                            .state_store()
+                            .update_handle(&handle)
+                            .await;
+                    }
+                }
+            }
         }
 
         // Note: Sessions are NOT deleted on connection close.
@@ -3162,6 +3189,19 @@ where
             return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
         }
 
+        // Per MS-SMB2 3.3.5.9.7: Reconnect is only valid when the handle is in
+        // disconnected state (session_id == 0 after connection loss).
+        // If session_id is still set, the handle is still open and we should reject.
+        if handle.session_id != 0 {
+            warn!(
+                conn_id = self.connection.id,
+                persistent_id,
+                current_session_id = handle.session_id,
+                "Durable handle reconnect failed: handle still open on another session"
+            );
+            return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+        }
+
         // Check if handle can still be reconnected (within timeout)
         if !handle.can_reconnect() {
             warn!(
@@ -3255,6 +3295,19 @@ where
         let file_id_persistent = handle.persistent_id as u64;
         let file_id_volatile = (handle.persistent_id >> 64) as u64;
 
+        // Compute file_attributes from actual file metadata (not cached attributes)
+        // Per MS-SMB2: FILE_ATTRIBUTE_ARCHIVE (0x20) should be set for regular files
+        let response_file_attributes = {
+            let mut attrs = 0x20u32; // FILE_ATTRIBUTE_ARCHIVE
+            if file_metadata.file_type == rustsmb_vfs::FileType::Directory {
+                attrs |= 0x10; // FILE_ATTRIBUTE_DIRECTORY
+            }
+            if (file_metadata.mode & 0o200) == 0 {
+                attrs |= 0x01; // FILE_ATTRIBUTE_READONLY
+            }
+            attrs
+        };
+
         // Build response contexts
         let mut ctx_builder = CreateContextBuilder::new();
         if handle.is_persistent {
@@ -3291,7 +3344,7 @@ where
             change_time: current_filetime(),
             allocation_size: file_metadata.size,
             end_of_file: file_metadata.size,
-            file_attributes: handle.file_attributes,
+            file_attributes: response_file_attributes,
             reserved2: 0,
             file_id_persistent,
             file_id_volatile,
