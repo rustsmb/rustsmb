@@ -73,6 +73,10 @@ href="./docs/smb-protocol-testing.md">docs/smb-protocol-testing.md</a></td>
 <td>SMB protocol testing with smbtorture, MS Protocol Test Suites, and
 smbprotocol</td>
 </tr>
+<tr>
+<td><a href="./docs/postmortem/">docs/postmortem/</a></td>
+<td>Incident postmortems and lessons learned</td>
+</tr>
 </tbody>
 </table>
 <h3 id="documentation-update-policy">Documentation Update Policy</h3>
@@ -532,6 +536,82 @@ Documentation</a></p>
 <li>Use constant-time comparison for signatures</li>
 <li>Encrypt session keys in state store</li>
 </ul>
+<h2 id="lessons-learned">Lessons Learned</h2>
+<h3 id="protocol-implementation-best-practices">Protocol Implementation
+Best Practices</h3>
+<ol type="1">
+<li><p><strong>Verify byte offsets per command type</strong>: SMB2
+command structures have different layouts. Always consult the specific
+MS-SMB2 section (2.2.x) for each command before implementing byte-level
+operations.</p></li>
+<li><p><strong>Add trace logging during development</strong>: Include
+trace! statements showing actual values at critical decision points. Can
+be disabled in production via log level.</p></li>
+<li><p><strong>Reference spec section numbers in code</strong>: Document
+which MS-SMB2 section defines the behavior being implemented.</p></li>
+<li><p><strong>Read entire spec section including footnotes</strong>:
+MS-SMB2 footnotes often contain critical implementation details (e.g.,
+footnote &lt;214&gt; on FileId substitution).</p></li>
+<li><p><strong>Test byte-level operations explicitly</strong>: Unit
+tests should verify exact field positions in serialized structures, not
+just high-level behavior.</p></li>
+</ol>
+<h3 id="fileid-body-offsets-by-command">FileId Body Offsets by
+Command</h3>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Body Offset</th>
+<th>MS-SMB2 Section</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CLOSE</td>
+<td>8</td>
+<td>2.2.15</td>
+</tr>
+<tr>
+<td>FLUSH</td>
+<td>8</td>
+<td>2.2.17</td>
+</tr>
+<tr>
+<td>LOCK</td>
+<td>8</td>
+<td>2.2.26</td>
+</tr>
+<tr>
+<td>QUERY_DIRECTORY</td>
+<td>8</td>
+<td>2.2.33</td>
+</tr>
+<tr>
+<td>READ</td>
+<td>16</td>
+<td>2.2.19</td>
+</tr>
+<tr>
+<td>WRITE</td>
+<td>16</td>
+<td>2.2.21</td>
+</tr>
+<tr>
+<td>SET_INFO</td>
+<td>16</td>
+<td>2.2.39</td>
+</tr>
+<tr>
+<td>QUERY_INFO</td>
+<td>24</td>
+<td>2.2.37</td>
+</tr>
+</tbody>
+</table>
+<p>See <a
+href="./docs/postmortem/2026-01-compound-request-bugs.md">docs/postmortem/2026-01-compound-request-bugs.md</a>
+for full incident details.</p>
 <h2 id="implementation-status">Implementation Status</h2>
 <h3 id="phase-1-project-setup-documentation---completed">Phase 1:
 Project Setup &amp; Documentation - COMPLETED</h3>
@@ -1044,6 +1124,129 @@ for MS-SMB2 3.3.5.2.11</label>
 <li>test_ioctl_with_nonexistent_tree_id_returns_network_name_deleted</li>
 </ul></li>
 </ul>
+<h3 id="phase-20-read-command-compliance---completed">Phase 20: READ
+Command Compliance - COMPLETED</h3>
+<p>Implement proper READ request handling per MS-SMB2 section
+3.3.5.12.</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />Phase 20A: Add
+NtStatus::InvalidDeviceRequest (0xC0000010)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 20B: Add
+is_directory field to HandleState</label>
+<ul>
+<li>Track whether handle is for a directory vs file</li>
+<li>Set from file metadata during CREATE</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 20C: Add directory
+check in handle_read</label>
+<ul>
+<li>Per spec: “If Open.IsPersistent is FALSE and Open.IsDirectory is
+TRUE, the server SHOULD fail the request with
+STATUS_INVALID_DEVICE_REQUEST”</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 20D: Add unit tests
+for MS-SMB2 3.3.5.12</label>
+<ul>
+<li>test_read_directory_check_logic (directory + persistent
+combinations)</li>
+<li>test_minimum_count_logic (EOF handling already implemented)</li>
+</ul></li>
+</ul>
+<h3 id="phase-21-compound-request-support---completed">Phase 21:
+Compound Request Support - COMPLETED</h3>
+<p>Implement compound SMB2 request handling per MS-SMB2 section
+3.3.5.2.7.</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />Phase 21A: Modify
+process_message for compound detection</label>
+<ul>
+<li>Check header.next_command to detect compound requests</li>
+<li>Delegate to process_compound_request() for compounds</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 21B: Add compound
+request processor</label>
+<ul>
+<li>Parse command offsets using parse_compound_offsets()</li>
+<li>Detect related vs unrelated by checking
+SMB2_FLAGS_RELATED_OPERATIONS</li>
+<li>Create CompoundContext for tracking state across commands</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 21C: Add related
+command processor</label>
+<ul>
+<li>Resolve session/tree IDs using sentinel value substitution
+(0xFFFFFFFF…)</li>
+<li>Propagate errors to subsequent related commands</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 21D: Add compound
+response combiner</label>
+<ul>
+<li>Combine responses with 8-byte alignment</li>
+<li>Set NextCommand field to point to next response</li>
+<li>Set SMB2_FLAGS_RELATED_OPERATIONS on responses after first (if
+related)</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 21E: Add FileId
+substitution for file operations</label>
+<ul>
+<li>Substitute FileId in READ/WRITE/CLOSE/etc. from previous CREATE</li>
+<li>Extract FileId from CREATE response for compound context</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 21F: Add unit tests
+for MS-SMB2 3.3.5.2.7</label>
+<ul>
+<li>test_parse_compound_offsets_* (offset parsing)</li>
+<li>test_compound_padding_alignment (8-byte alignment)</li>
+<li>test_compound_context_* (session/tree/file ID resolution)</li>
+<li>test_compound_context_error_propagation</li>
+</ul></li>
+</ul>
+<p><strong>Note:</strong> Uses existing infrastructure from
+rustsmb-session::compound module (parse_compound_offsets,
+CompoundContext, etc.) that was previously not wired up to the
+handler.</p>
+<h3 id="phase-22-postmortem-protocol-safety---completed">Phase 22:
+Postmortem &amp; Protocol Safety - COMPLETED</h3>
+<p>Document lessons learned from Phase 21 compound bugs and implement
+safety improvements.</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />Phase 22A: Write
+postmortem document
+(docs/postmortem/2026-01-compound-request-bugs.md)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 22B: Add Lessons
+Learned section to CLAUDE.md</label></li>
+<li><label><input type="checkbox" checked="" />Phase 22C: Add FileId
+offset constants to rustsmb-protocol</label>
+<ul>
+<li>Add <code>fileid_body_offset()</code> helper function</li>
+<li>Document MS-SMB2 section for each offset</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 22D: Add unit tests
+for FileId positions</label>
+<ul>
+<li>Tests verify byte offsets in serialized command buffers</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 22E: Update
+handler.rs to use protocol constants</label></li>
+</ul>
+<h3 id="phase-23-fix-smb2.read-test-compliance---completed">Phase 23:
+Fix smb2.read Test Compliance - COMPLETED</h3>
+<p>Fix smb2.read smbtorture test failures per MS-SMB2 3.3.5.12.</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />Phase 23A: Add access
+rights validation (FILE_READ_DATA or FILE_EXECUTE)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 23B: Fix EOF
+handling (return STATUS_END_OF_FILE when read returns 0
+bytes)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 23C: Update file
+position after READ operations</label></li>
+<li><label><input type="checkbox" checked="" />Phase 23D: Fix
+FileAllInformation structure (position at offset 80 per MS-FSCC
+2.4.18)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 23E: Update
+handle_query_info to pass position to build_file_info</label></li>
+</ul>
+<p>All smb2.read tests now pass: eof, position, dir, access.</p>
 <h2 id="smbtorture-test-analysis">smbtorture Test Analysis</h2>
 <h3 id="test-results-summary-january-2026">Test Results Summary (January
 2026)</h3>
@@ -1083,8 +1286,8 @@ for MS-SMB2 3.3.5.2.11</label>
 </tr>
 <tr>
 <td>smb2.read</td>
-<td><strong>FAIL</strong></td>
-<td>eof status, position tracking, dir read status</td>
+<td><strong>PASS</strong></td>
+<td>All tests pass (eof, position, dir, access) - Fixed in Phase 23</td>
 </tr>
 <tr>
 <td>smb2.lock</td>
@@ -1113,8 +1316,9 @@ for MS-SMB2 3.3.5.2.11</label>
 </tr>
 <tr>
 <td>smb2.compound</td>
-<td><strong>FAIL</strong></td>
-<td>Timeout issues</td>
+<td><strong>PARTIAL</strong></td>
+<td>related1, compound-break, create-write-close pass; others need
+IOCTL</td>
 </tr>
 </tbody>
 </table>
@@ -1129,6 +1333,12 @@ for MS-SMB2 3.3.5.2.11</label>
 </tr>
 </thead>
 <tbody>
+<tr>
+<td>Compound requests (related/unrelated)</td>
+<td>✅</td>
+<td>✅</td>
+<td>-</td>
+</tr>
 <tr>
 <td>Oplock break notifications</td>
 <td>✅</td>
@@ -1162,20 +1372,20 @@ for MS-SMB2 3.3.5.2.11</label>
 <tr>
 <td>Read past EOF → STATUS_END_OF_FILE</td>
 <td>✅</td>
-<td>❌</td>
-<td>P1</td>
+<td>✅</td>
+<td>-</td>
 </tr>
 <tr>
 <td>Read directory → STATUS_INVALID_DEVICE_REQUEST</td>
 <td>✅</td>
-<td>❌</td>
-<td>P1</td>
+<td>✅</td>
+<td>-</td>
 </tr>
 <tr>
 <td>File position tracking</td>
 <td>✅</td>
-<td>❌</td>
-<td>P3</td>
+<td>✅</td>
+<td>-</td>
 </tr>
 <tr>
 <td>Attributes-only opens (no oplock break)</td>
@@ -1214,9 +1424,10 @@ for MS-SMB2 3.3.5.2.11</label>
 oplock/lease break notifications</del> DONE in Phase 18 (same-server
 only)</p>
 <p><strong>P1 - Security/Compliance:</strong> - <del>Tree ID validation
-(reject operations with wrong TID)</del> DONE in Phase 19 - Read past
-EOF should return STATUS_END_OF_FILE - Read on directory should return
-STATUS_INVALID_DEVICE_REQUEST</p>
+(reject operations with wrong TID)</del> DONE in Phase 19 - <del>Read
+past EOF should return STATUS_END_OF_FILE</del> DONE (already
+implemented, verified in Phase 20) - <del>Read on directory should
+return STATUS_INVALID_DEVICE_REQUEST</del> DONE in Phase 20</p>
 <p><strong>P2 - Lock semantics:</strong> - Lock stacking (allow same
 handle to re-lock same range) - Correct error codes (LOCK_NOT_GRANTED
 first, FILE_LOCK_CONFLICT after) - Cross-handle/cross-session lock

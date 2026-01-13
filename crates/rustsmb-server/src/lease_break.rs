@@ -356,7 +356,7 @@ impl LeaseBreakRegistry {
         &self,
         share_name: &str,
         file_path: &str,
-    ) -> Vec<(u128, u8, String)> {
+    ) -> Vec<(u128, u8, String, u64)> {
         self.oplock_connections
             .iter()
             .filter(|entry| {
@@ -367,9 +367,69 @@ impl LeaseBreakRegistry {
                     *entry.key(),
                     entry.value().oplock_level,
                     entry.value().server_id.clone(),
+                    entry.value().session_id,
                 )
             })
             .collect()
+    }
+
+    /// Initiate an oplock break without waiting for acknowledgment.
+    ///
+    /// This method just sends the break event to the connection's channel and returns
+    /// immediately. Used for pre-sharing violation oplock breaks where we can't block
+    /// the connection loop waiting for an ACK (since the ACK can only arrive after
+    /// we process the break notification, which requires the loop to continue).
+    ///
+    /// Returns true if the break event was sent successfully.
+    pub async fn initiate_oplock_break_nowait(&self, handle_id: u128, new_level: u8) -> bool {
+        // Get the connection entry for this oplock
+        let entry = match self.oplock_connections.get(&handle_id) {
+            Some(e) => e,
+            None => {
+                debug!(handle_id = %handle_id, "Oplock not found for nowait break");
+                return false;
+            }
+        };
+
+        let current_level = entry.oplock_level;
+        let break_id = self.next_break_id.fetch_add(1, Ordering::Relaxed);
+
+        // Extract file IDs from handle_id
+        let persistent_id = handle_id as u64;
+        let volatile_id = (handle_id >> 64) as u64;
+
+        // Determine if ACK is required
+        let ack_required = current_level == 0x09 || current_level == 0x08;
+
+        let event = OplockBreakEvent {
+            persistent_id,
+            volatile_id,
+            current_level,
+            new_level,
+            ack_required,
+            break_id,
+        };
+
+        debug!(
+            handle_id = %handle_id,
+            current_level = current_level,
+            new_level = new_level,
+            ack_required = ack_required,
+            break_id = break_id,
+            "Initiating oplock break (nowait)"
+        );
+
+        // Send the break event to the connection (non-blocking)
+        if let Err(e) = entry.break_tx.try_send(event) {
+            debug!(
+                handle_id = %handle_id,
+                error = %e,
+                "Failed to send oplock break event (nowait)"
+            );
+            return false;
+        }
+
+        true
     }
 
     /// Initiate an oplock break, returns a future that completes when break is done.

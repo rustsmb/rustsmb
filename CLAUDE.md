@@ -367,15 +367,17 @@ Do not commit code that fails any of these checks.
 
 ### Protocol Implementation Best Practices
 
-1. **Verify byte offsets per command type**: SMB2 command structures have different layouts. Always consult the specific MS-SMB2 section (2.2.x) for each command before implementing byte-level operations.
+1. **Read the MS-SMB2 spec before implementing**: All SMB protocol implementations MUST follow the MS-SMB2 specification. Before writing any code, read the relevant spec section (e.g., 2.2.x for message formats, 3.3.5.x for server processing rules). The spec is the source of truth - do not guess or assume protocol behavior.
 
-2. **Add trace logging during development**: Include trace! statements showing actual values at critical decision points. Can be disabled in production via log level.
+2. **Verify byte offsets per command type**: SMB2 command structures have different layouts. Always consult the specific MS-SMB2 section (2.2.x) for each command before implementing byte-level operations.
 
-3. **Reference spec section numbers in code**: Document which MS-SMB2 section defines the behavior being implemented.
+3. **Add trace logging during development**: Include trace! statements showing actual values at critical decision points. Can be disabled in production via log level.
 
-4. **Read entire spec section including footnotes**: MS-SMB2 footnotes often contain critical implementation details (e.g., footnote <214> on FileId substitution).
+4. **Reference spec section numbers in code**: Document which MS-SMB2 section defines the behavior being implemented.
 
-5. **Test byte-level operations explicitly**: Unit tests should verify exact field positions in serialized structures, not just high-level behavior.
+5. **Read entire spec section including footnotes**: MS-SMB2 footnotes often contain critical implementation details (e.g., footnote <214> on FileId substitution).
+
+6. **Test byte-level operations explicitly**: Unit tests should verify exact field positions in serialized structures, not just high-level behavior.
 
 ### FileId Body Offsets by Command
 
@@ -738,6 +740,22 @@ Fix smb2.read smbtorture test failures per MS-SMB2 3.3.5.12.
 
 All smb2.read tests now pass: eof, position, dir, access.
 
+### Phase 24: Fix smb2.durable-open Test Failures - PARTIALLY COMPLETE
+
+Fix smb2.durable-open smbtorture test failures.
+
+- [x] Phase 24A: Fix SMB2_CREATE_DURABLE_HANDLE_RESPONSE format
+  - DHnQ response must include 8 bytes of Reserved data (per MS-SMB2 2.2.14.2.3)
+  - Previously sent empty data, causing NT_STATUS_INVALID_NETWORK_RESPONSE
+- [x] Phase 24B: Fix OplockLevel parsing for sparse enum values
+  - binrw `repr = u8` doesn't work for non-contiguous values (0, 1, 8, 9, 255)
+  - Added `#[br(map = |x: u8| OplockLevel::from_u8(x))]` directive
+- [x] Phase 24C: Fix CreateContextBuilder empty data handling
+  - Fixed capacity overflow when data_offset was 0
+
+**Results**: 7 tests now pass (open-oplock, open-lease, reopen3, lock-oplock, lock-lease, stat-open).
+Remaining failures are due to durable handles being cleaned up on disconnect (reconnect tests).
+
 ## smbtorture Test Analysis
 
 ### Test Results Summary (January 2026)
@@ -752,7 +770,7 @@ All smb2.read tests now pass: eof, position, dir, access.
 | smb2.lock | **FAIL** | Lock stacking, error codes, cross-handle conflicts |
 | smb2.lease | **PASS** | - |
 | smb2.oplock | **PARTIAL (17/42)** | brl3 (lock error codes), levelii500 (break failure), statopen1 |
-| smb2.durable-open | **FAIL** | Various reconnect edge cases |
+| smb2.durable-open | **PARTIAL (7/22)** | open-oplock, open-lease, lock-oplock/lease, stat-open pass; reconnect tests fail |
 | smb2.durable-v2-open | **FAIL** | Client crash (smbtorture bug) |
 | smb2.compound | **PARTIAL** | related1, compound-break, create-write-close pass; others need IOCTL |
 

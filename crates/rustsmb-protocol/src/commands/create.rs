@@ -31,6 +31,8 @@ pub struct CreateRequest {
     pub security_flags: u8,
 
     /// Requested oplock level.
+    #[br(map = |x: u8| OplockLevel::from_u8(x))]
+    #[bw(map = |x: &OplockLevel| x.as_u8())]
     pub requested_oplock_level: OplockLevel,
 
     /// Impersonation level (u32 for validation, valid values 0-3).
@@ -104,6 +106,8 @@ pub struct CreateResponse {
     pub structure_size: u16,
 
     /// Oplock level granted.
+    #[br(map = |x: u8| OplockLevel::from_u8(x))]
+    #[bw(map = |x: &OplockLevel| x.as_u8())]
     pub oplock_level: OplockLevel,
 
     /// Flags.
@@ -888,10 +892,15 @@ impl CreateContextBuilder {
     }
 
     /// Add durable handle response.
+    ///
+    /// Per MS-SMB2 2.2.14.2.3, SMB2_CREATE_DURABLE_HANDLE_RESPONSE contains:
+    /// - Reserved (8 bytes): MUST be set to 0
     pub fn add_durable_handle_response(mut self) -> Self {
-        // Empty data for durable handle response
-        self.contexts
-            .push((create_context_name::DURABLE_HANDLE_REQUEST.to_vec(), vec![]));
+        // Reserved field is 8 bytes of zeros per MS-SMB2 2.2.14.2.3
+        self.contexts.push((
+            create_context_name::DURABLE_HANDLE_REQUEST.to_vec(),
+            vec![0u8; 8],
+        ));
         self
     }
 
@@ -981,13 +990,22 @@ impl CreateContextBuilder {
             // Calculate sizes and offsets
             let name_offset = 16u16; // Right after header
             let name_len = name.len() as u16;
-            // Data offset is always calculated, even if data is empty
-            // This matches Windows client expectations (data_offset points past name+padding)
-            let data_offset = ((16 + name.len() + 7) & !7) as u16; // 8-byte aligned
             let data_len = data.len() as u32;
+            // Per MS-SMB2 2.2.13.2: If DataLength is zero, DataOffset SHOULD be set to 0
+            let data_offset = if data.is_empty() {
+                0u16
+            } else {
+                ((16 + name.len() + 7) & !7) as u16 // 8-byte aligned
+            };
 
             // Calculate total size of this context (8-byte aligned)
-            let context_size = ((data_offset as usize + data.len() + 7) & !7) as u32;
+            // Per MS-SMB2 2.2.13.2: Context structure is header (16) + name + padding + data
+            // When data is empty, we just have header + name
+            let context_size = if data.is_empty() {
+                ((16 + name.len() + 7) & !7) as u32
+            } else {
+                ((data_offset as usize + data.len() + 7) & !7) as u32
+            };
 
             let header = CreateContextHeader {
                 next: if is_last { 0 } else { context_size },
@@ -998,19 +1016,22 @@ impl CreateContextBuilder {
                 data_length: data_len,
             };
 
+            let start_len = result.len();
             result.extend_from_slice(&header.to_bytes());
             result.extend_from_slice(name);
 
-            // Pad to data_offset
-            let pad_to_data = data_offset as usize - 16 - name.len();
-            result.extend(std::iter::repeat(0u8).take(pad_to_data));
-
-            result.extend_from_slice(data);
+            // Only add data padding and data if there is data
+            if !data.is_empty() {
+                // Pad to data_offset
+                let pad_to_data = data_offset as usize - 16 - name.len();
+                result.extend(std::iter::repeat(0u8).take(pad_to_data));
+                result.extend_from_slice(data);
+            }
 
             // Pad to 8-byte alignment for next context
             if !is_last {
-                let pad_to_align =
-                    context_size as usize - (16 + name.len() + pad_to_data + data.len());
+                let current_len = result.len() - start_len;
+                let pad_to_align = context_size as usize - current_len;
                 result.extend(std::iter::repeat(0u8).take(pad_to_align));
             }
         }
