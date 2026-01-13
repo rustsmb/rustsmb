@@ -612,12 +612,22 @@ where
             | Smb2Command::QueryDirectory => {
                 // Check if we need to substitute FileId
                 if let Some((persistent, volatile)) = file_id_override {
-                    // FileId offset in body depends on command type
-                    // CLOSE, FLUSH, LOCK: offset 8 (after StructureSize, Flags, Reserved)
-                    // READ, WRITE, QUERY_INFO, SET_INFO, QUERY_DIRECTORY: offset 16
+                    // FileId offset in body depends on command type per MS-SMB2:
+                    // - CLOSE (2.2.15): offset 8
+                    // - FLUSH (2.2.17): offset 8
+                    // - LOCK (2.2.26): offset 8
+                    // - QUERY_DIRECTORY (2.2.33): offset 8
+                    // - READ (2.2.19): offset 16
+                    // - WRITE (2.2.21): offset 16
+                    // - SET_INFO (2.2.39): offset 16
+                    // - QUERY_INFO (2.2.37): offset 24 (after AdditionalInformation + Flags)
                     let file_id_body_offset = match header.command {
-                        Smb2Command::Close | Smb2Command::Flush | Smb2Command::Lock => 8,
-                        _ => 16,
+                        Smb2Command::Close
+                        | Smb2Command::Flush
+                        | Smb2Command::Lock
+                        | Smb2Command::QueryDirectory => 8,
+                        Smb2Command::QueryInfo => 24,
+                        _ => 16, // READ, WRITE, SET_INFO
                     };
 
                     // Check if the request uses the sentinel FileId
@@ -633,15 +643,38 @@ where
                                 .try_into()
                                 .unwrap(),
                         );
-                        if req_persistent == u64::MAX && req_volatile == u64::MAX {
-                            // Substitute the FileId from previous CREATE
+                        // Per MS-SMB2 3.3.5.2.7.2 and footnote <214>:
+                        // Windows-based servers use the FileId from the previous response
+                        // for related operations. The sentinel value (0xFFFFFFFFFFFFFFFF)
+                        // is a client convention, but we should use the previous FileId
+                        // regardless for related compound requests.
+                        //
+                        // Check if either field uses sentinel OR if this is a related
+                        // compound and request uses a different/invalid FileId.
+                        let use_ctx_persistent = req_persistent == u64::MAX
+                            || (ctx.related && req_persistent != persistent);
+                        let use_ctx_volatile =
+                            req_volatile == u64::MAX || (ctx.related && req_volatile != volatile);
+
+                        if use_ctx_persistent || use_ctx_volatile {
+                            // Substitute the FileId fields for related operations
                             let mut modified_message = full_message.to_vec();
                             let file_id_offset = SMB2_HEADER_SIZE + file_id_body_offset;
                             if modified_message.len() >= file_id_offset + 16 {
+                                let final_persistent = if use_ctx_persistent {
+                                    persistent
+                                } else {
+                                    req_persistent
+                                };
+                                let final_volatile = if use_ctx_volatile {
+                                    volatile
+                                } else {
+                                    req_volatile
+                                };
                                 modified_message[file_id_offset..file_id_offset + 8]
-                                    .copy_from_slice(&persistent.to_le_bytes());
+                                    .copy_from_slice(&final_persistent.to_le_bytes());
                                 modified_message[file_id_offset + 8..file_id_offset + 16]
-                                    .copy_from_slice(&volatile.to_le_bytes());
+                                    .copy_from_slice(&final_volatile.to_le_bytes());
                                 let modified_body = &modified_message[SMB2_HEADER_SIZE..];
                                 return Ok((
                                     self.dispatch_command(header, modified_body, &modified_message)
@@ -683,6 +716,7 @@ where
 
         let mut result = Vec::new();
         let response_count = responses.len();
+        let responses_lengths: Vec<usize> = responses.iter().map(|r| r.len()).collect();
 
         for (i, mut response) in responses.into_iter().enumerate() {
             let is_last = i == response_count - 1;
@@ -698,9 +732,11 @@ where
                 continue;
             }
 
-            // Set SMB2_FLAGS_RELATED_OPERATIONS on all but first response (if related)
+            // Set SMB2_FLAGS_RELATED_OPERATIONS on ALL responses for related compounds
+            // Per MS-SMB2 3.3.4.1.3: "the server MUST set SMB2_FLAGS_RELATED_OPERATIONS
+            // in the Flags field of each response"
             let mut header_modified = false;
-            if is_related && i > 0 {
+            if is_related {
                 let flags =
                     u32::from_le_bytes([response[16], response[17], response[18], response[19]]);
                 let new_flags = flags | Smb2Flags::RELATED_OPERATIONS;
@@ -742,12 +778,37 @@ where
             }
         }
 
-        trace!(
+        debug!(
             conn_id = self.connection.id,
             response_count,
             total_len = result.len(),
             "Combined compound responses"
         );
+
+        // Log each response's position and size for debugging
+        let mut offset = 0;
+        for (i, resp_len) in responses_lengths.iter().enumerate() {
+            let padding = if i < responses_lengths.len() - 1 {
+                compound_padding(*resp_len)
+            } else {
+                0
+            };
+            let next_cmd = if i < responses_lengths.len() - 1 {
+                resp_len + padding
+            } else {
+                0
+            };
+            trace!(
+                conn_id = self.connection.id,
+                response_index = i,
+                offset,
+                response_len = resp_len,
+                padding,
+                next_command = next_cmd,
+                "Compound response detail"
+            );
+            offset += resp_len + padding;
+        }
 
         Ok(result)
     }
