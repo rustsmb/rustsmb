@@ -28,6 +28,9 @@ binrw = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 rand = { workspace = true }
+dashmap = "6.0"
+hex = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

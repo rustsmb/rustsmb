@@ -40,11 +40,16 @@ pub mod config;
 pub mod coordination;
 pub mod handler;
 pub mod helpers;
+pub mod lease_break;
 pub mod server;
 pub mod shares;
 
 pub use config::{CacheLayerConfig, ConfigError, CoordinationConfig, ServerConfig, SessionConfig};
 pub use coordination::{CoordinationError, ServerCoordination};
 pub use handler::{ConnectionHandler, HandlerError};
+pub use lease_break::{
+    calculate_break_state, LeaseBreakError, LeaseBreakEvent, LeaseBreakRegistry, LeaseBreakResult,
+    LeaseConnectionEntry, PendingBreak,
+};
 pub use server::{ServerError, SmbServer};
 pub use shares::{Share, ShareConfig, ShareManager};

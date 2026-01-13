@@ -4,6 +4,7 @@
 
 use crate::coordination::ServerCoordination;
 use crate::handler::ConnectionHandler;
+use crate::lease_break::LeaseBreakRegistry;
 use crate::{ServerConfig, ShareManager};
 use rustsmb_auth::DynAuthProvider;
 use rustsmb_session::SessionManager;
@@ -39,6 +40,8 @@ pub struct SmbServer {
     connection_semaphore: Arc<Semaphore>,
     /// Coordination layer (optional, for multi-server deployments).
     coordination: Option<Arc<ServerCoordination>>,
+    /// Lease break registry for managing oplock/lease break notifications.
+    lease_registry: Arc<LeaseBreakRegistry>,
 }
 
 impl SmbServer {
@@ -51,6 +54,7 @@ impl SmbServer {
         let connection_semaphore = Arc::new(Semaphore::new(config.max_connections));
         let config = Arc::new(config);
         let session_manager = Arc::new(SessionManager::with_defaults(state_store));
+        let lease_registry = Arc::new(LeaseBreakRegistry::new());
 
         Self {
             config,
@@ -61,6 +65,7 @@ impl SmbServer {
             active_connections: Arc::new(AtomicUsize::new(0)),
             connection_semaphore,
             coordination: None,
+            lease_registry,
         }
     }
 
@@ -91,6 +96,7 @@ impl SmbServer {
         let session_manager = Arc::new(SessionManager::with_defaults(state_store));
 
         let config = Arc::new(config);
+        let lease_registry = Arc::new(LeaseBreakRegistry::new());
 
         Self {
             config,
@@ -101,6 +107,7 @@ impl SmbServer {
             active_connections: Arc::new(AtomicUsize::new(0)),
             connection_semaphore,
             coordination: Some(coordination),
+            lease_registry,
         }
     }
 
@@ -112,6 +119,7 @@ impl SmbServer {
     ) -> Self {
         let connection_semaphore = Arc::new(Semaphore::new(config.max_connections));
         let config = Arc::new(config);
+        let lease_registry = Arc::new(LeaseBreakRegistry::new());
 
         Self {
             config,
@@ -122,6 +130,7 @@ impl SmbServer {
             active_connections: Arc::new(AtomicUsize::new(0)),
             connection_semaphore,
             coordination: None,
+            lease_registry,
         }
     }
 
@@ -247,6 +256,7 @@ impl SmbServer {
                                 active_connections: self.active_connections.clone(),
                                 _permit: permit,
                                 server_id,
+                                lease_registry: self.lease_registry.clone(),
                             };
 
                             if let Some(ref acceptor) = tls_acceptor {
@@ -308,6 +318,7 @@ impl SmbServer {
             ctx.auth_provider,
             ctx.shares,
             ctx.server_id,
+            ctx.lease_registry,
         );
 
         if let Err(e) = handler.run().await {
@@ -382,6 +393,7 @@ struct HandlerContext {
     active_connections: Arc<AtomicUsize>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     server_id: String,
+    lease_registry: Arc<LeaseBreakRegistry>,
 }
 
 /// Server error types.

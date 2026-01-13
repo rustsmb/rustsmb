@@ -473,7 +473,7 @@ Do not commit code that fails any of these checks.
 - [x] Phase 11B: Basic lease handling in CREATE flow (grant requested lease state)
 - [x] Phase 11C: Persistent handles validation (SMB 3.0+ requirement)
 - [x] Phase 11B (Advanced): Lease conflict detection with reduced grant (Phase 14)
-- [ ] Phase 11B (Advanced): Same-server oplock break notifications to clients
+- [x] Phase 11B (Advanced): Same-server oplock break notifications to clients (Phase 18)
 
 ### Phase 12: Hyperscale State Store - COMPLETED
 - [x] docs/state-store-design.md: Design document for hyperscale state store
@@ -588,8 +588,93 @@ Add unit tests to `handler.rs` organized by MS-SMB2 specification chapter:
 - Total tests in handler.rs: 89 (increased from 76)
 
 **Not Implemented (requires significant infrastructure changes):**
-- **Oplock break notifications**: Sending async OPLOCK_BREAK to clients when conflicts occur
 - **Lock stacking**: Tracking locks at SMB layer to allow same-handle re-locking
 - **Lock conflict detection**: Proper conflict detection between different handles
 - **Multi-channel session binding**: Signing key derivation across different dialect connections
-- **Lease break notifications**: Async notification when lease conflicts occur across servers
+- **Cross-server lease break notifications**: Async notification when lease conflicts occur across servers (same-server breaks implemented in Phase 18)
+
+### Phase 18: Oplock/Lease Break Notifications - COMPLETED
+
+Implement same-server oplock/lease break notifications per MS-SMB2 sections 2.2.23-2.2.25 and 3.3.4.6-3.3.4.7.
+
+- [x] Phase 18A: Core Infrastructure
+  - Create `lease_break.rs` module with LeaseBreakRegistry
+  - Add `breaking`, `break_to_state` fields to LeaseEntry
+  - Unit tests organized by MS-SMB2 spec chapters (3.3.4.7, 3.3.5.22, 3.3.6.5)
+- [x] Phase 18B: Connection Handler Integration
+  - Add mpsc channel for break notifications to ConnectionHandler
+  - Share LeaseBreakRegistry across connections via server.rs
+  - Implement `send_lease_break_notification()` per MS-SMB2 3.3.4.7
+  - Cleanup: unregister leases on connection close
+- [x] Phase 18C: CREATE Handler Changes
+  - Partition conflicts by server_id (same-server vs cross-server)
+  - Trigger breaks for same-server conflicts, wait for ack
+  - Update lease state in StateStore after break completes
+  - Continue reduced grant for cross-server conflicts
+  - Register new leases with break registry
+- [x] Phase 18D: OPLOCK_BREAK Handler
+  - Parse lease/oplock acknowledgment by structure_size (24=oplock, 36=lease)
+  - Validate state is subset of break-to state per MS-SMB2 3.3.5.22.2
+  - Return LeaseBreakResponse/OplockBreakResponse
+  - Integrate with LeaseBreakRegistry for pending break completion
+- [x] Phase 18E: CLOSE Handler Integration
+  - Unregister leases from LeaseBreakRegistry when handles are closed
+  - Connection cleanup already unregisters all leases on disconnect
+
+**Note:** Cross-server lease breaks are NOT implemented. Cross-server conflicts continue using reduced grant strategy from Phase 14.
+
+## smbtorture Test Analysis
+
+### Test Results Summary (January 2026)
+
+| Suite | Status | Key Issues |
+|-------|--------|------------|
+| smb2.connect | **PASS** | - |
+| smb2.session | **FAIL** | reauth5/6, bind_negative_* (multi-dialect signing) |
+| smb2.tcon | **FAIL** | Allows write with wrong Tree ID |
+| smb2.create | **FAIL** | gentest, blob, aclfile, acldir, nulldacl |
+| smb2.read | **FAIL** | eof status, position tracking, dir read status |
+| smb2.lock | **FAIL** | Lock stacking, error codes, cross-handle conflicts |
+| smb2.lease | **PASS** | - |
+| smb2.oplock | **PARTIAL (17/42)** | brl3 (lock error codes), levelii500 (break failure), statopen1 |
+| smb2.durable-open | **FAIL** | Various reconnect edge cases |
+| smb2.durable-v2-open | **FAIL** | Client crash (smbtorture bug) |
+| smb2.compound | **FAIL** | Timeout issues |
+
+### Missing Features vs ksmbd
+
+| Feature | ksmbd | RustSMB | Priority |
+|---------|-------|---------|----------|
+| Oplock break notifications | ✅ | ⚠️ Same-server only | - |
+| Lock stacking (same-handle re-lock) | ✅ | ❌ | P2 |
+| LOCK_NOT_GRANTED vs FILE_LOCK_CONFLICT | ✅ | ❌ | P2 |
+| Cross-handle lock conflicts | ✅ | ❌ | P2 |
+| Tree ID validation | ✅ | ❌ | P1 |
+| Read past EOF → STATUS_END_OF_FILE | ✅ | ❌ | P1 |
+| Read directory → STATUS_INVALID_DEVICE_REQUEST | ✅ | ❌ | P1 |
+| File position tracking | ✅ | ❌ | P3 |
+| Attributes-only opens (no oplock break) | ✅ | ❌ | P3 |
+| SMB2_CAP_MULTI_CHANNEL | ⚠️ Experimental | ❌ | P3 |
+| SMB Direct (RDMA) | ✅ | ❌ | - |
+| POSIX extensions | ✅ | ❌ | - |
+| Durable handles v1/v2 | ⚠️ (kernel 6.9+) | ✅ | - |
+
+### Priority Fixes
+
+**P0 - Critical (blocks many tests):**
+- ~~Implement oplock/lease break notifications~~ DONE in Phase 18 (same-server only)
+
+**P1 - Security/Compliance:**
+- Tree ID validation (reject operations with wrong TID)
+- Read past EOF should return STATUS_END_OF_FILE
+- Read on directory should return STATUS_INVALID_DEVICE_REQUEST
+
+**P2 - Lock semantics:**
+- Lock stacking (allow same handle to re-lock same range)
+- Correct error codes (LOCK_NOT_GRANTED first, FILE_LOCK_CONFLICT after)
+- Cross-handle/cross-session lock conflict detection
+
+**P3 - Nice to have:**
+- File position tracking in FileAllInformation
+- Attributes-only opens without sharing violations
+- Multi-channel capability advertisement

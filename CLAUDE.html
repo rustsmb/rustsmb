@@ -61,6 +61,18 @@ href="./docs/state-store-design.md">docs/state-store-design.md</a></td>
 <td>State store design with separate coordinator service and Redis
 leases/locks</td>
 </tr>
+<tr>
+<td><a
+href="./docs/oplock-lease-design.md">docs/oplock-lease-design.md</a></td>
+<td>SMB oplock and lease design, conflict detection, multi-server
+handling</td>
+</tr>
+<tr>
+<td><a
+href="./docs/smb-protocol-testing.md">docs/smb-protocol-testing.md</a></td>
+<td>SMB protocol testing with smbtorture, MS Protocol Test Suites, and
+smbprotocol</td>
+</tr>
 </tbody>
 </table>
 <h3 id="documentation-update-policy">Documentation Update Policy</h3>
@@ -366,7 +378,15 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="
 <span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> test      <span class="co"># Run all tests</span></span>
 <span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> clippy    <span class="co"># Run clippy</span></span>
 <span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> fmt       <span class="co"># Format code</span></span>
-<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> ci        <span class="co"># Run fmt-check + clippy + test (full CI)</span></span></code></pre></div>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> ci        <span class="co"># Run fmt-check + clippy + test (full CI)</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="co"># Run smbtorture tests (requires Docker)</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> build <span class="at">-f</span> tests/Dockerfile.smbtorture <span class="dt">\</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>  <span class="at">--build-context</span> scripts=tests/scripts <span class="dt">\</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>  <span class="at">-t</span> rustsmb-smbtorture .</span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">--rm</span> rustsmb-smbtorture              <span class="co"># Run all test suites</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">--rm</span> rustsmb-smbtorture smb2.session <span class="co"># Run specific suite</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">--rm</span> <span class="at">-e</span> RUST_LOG=debug rustsmb-smbtorture smb2.connect  <span class="co"># With debug output</span></span></code></pre></div>
 <h2 id="development-workflow">Development Workflow</h2>
 <p><strong>IMPORTANT: After completing each task, always
 run:</strong></p>
@@ -381,13 +401,15 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href=
 All tests pass</p>
 <p>Do not commit code that fails any of these checks.</p>
 <h2 id="protocol-references">Protocol References</h2>
-<ul>
-<li><a
+<p><strong>Primary Reference (all implementations and tests must be
+based on this):</strong> - <a
+href="./docs/MS-SMB2-250728.md">docs/MS-SMB2-250728.md</a> - Local copy
+of MS-SMB2 specification (July 2025)</p>
+<p><strong>Additional References:</strong> - <a
 href="https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/">MS-SMB2
-Specification</a></li>
-<li><a href="https://docs.kernel.org/filesystems/smb/ksmbd.html">Linux
-ksmbd Documentation</a></li>
-</ul>
+Specification (online)</a> - <a
+href="https://docs.kernel.org/filesystems/smb/ksmbd.html">Linux ksmbd
+Documentation</a></p>
 <h2 id="smb2-commands-19-total">SMB2 Commands (19 total)</h2>
 <table>
 <thead>
@@ -732,10 +754,11 @@ request/response contexts (LeaseV1, LeaseV2) parsing</label></li>
 handling in CREATE flow (grant requested lease state)</label></li>
 <li><label><input type="checkbox" checked="" />Phase 11C: Persistent
 handles validation (SMB 3.0+ requirement)</label></li>
-<li><label><input type="checkbox" />Phase 11B (Advanced): Full
-LeaseManager state machine with conflict detection</label></li>
-<li><label><input type="checkbox" />Phase 11B (Advanced): Oplock break
-notifications to clients</label></li>
+<li><label><input type="checkbox" checked="" />Phase 11B (Advanced):
+Lease conflict detection with reduced grant (Phase 14)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 11B (Advanced):
+Same-server oplock break notifications to clients (Phase
+18)</label></li>
 </ul>
 <h3 id="phase-12-hyperscale-state-store---completed">Phase 12:
 Hyperscale State Store - COMPLETED</h3>
@@ -759,35 +782,419 @@ coordination (SMB lease conflict detection)</label></li>
 <li><label><input type="checkbox" checked="" />Phase 12F: Server
 integration (ServerCoordination layer, with_coordination())</label></li>
 </ul>
-<h3 id="phase-13-coordinator-service-refactoring---in-progress">Phase
-13: Coordinator Service Refactoring - IN PROGRESS</h3>
+<h3 id="phase-13-coordinator-service-refactoring---completed">Phase 13:
+Coordinator Service Refactoring - COMPLETED</h3>
 <ul class="task-list">
 <li><label><input type="checkbox" checked="" />Phase 13A: Update
 documentation (CLAUDE.md, docs/state-store-design.md)</label></li>
-<li><label><input type="checkbox" />Phase 13B: Create
+<li><label><input type="checkbox" checked="" />Phase 13B: Create
 rustsmb-coordinator-proto crate (gRPC definitions)</label></li>
-<li><label><input type="checkbox" />Phase 13B: Create
+<li><label><input type="checkbox" checked="" />Phase 13B: Create
 rustsmb-coordinator-client crate (gRPC client)</label></li>
-<li><label><input type="checkbox" />Phase 13C: Move lease methods to
-StateStore trait</label></li>
-<li><label><input type="checkbox" />Phase 13C: Move lock methods to
-StateStore trait</label></li>
-<li><label><input type="checkbox" />Phase 13C: Implement lease/lock in
-RedisStateStore with WATCH</label></li>
-<li><label><input type="checkbox" />Phase 13D: Simplify
+<li><label><input type="checkbox" checked="" />Phase 13C: Move lease
+methods to StateStore trait</label></li>
+<li><label><input type="checkbox" checked="" />Phase 13C: Move lock
+methods to StateStore trait</label></li>
+<li><label><input type="checkbox" checked="" />Phase 13C: Implement
+lease/lock in RedisStateStore with WATCH</label></li>
+<li><label><input type="checkbox" checked="" />Phase 13D: Simplify
 CoordinationBackend trait (remove lease/lock, keep membership +
 epoch)</label></li>
-<li><label><input type="checkbox" />Phase 13E: Create
+<li><label><input type="checkbox" checked="" />Phase 13E: Create
 rustsmb-coordinator binary (standalone service with Raft)</label></li>
-<li><label><input type="checkbox" />Phase 13E: Implement gRPC service
-handlers</label></li>
-<li><label><input type="checkbox" />Phase 13E: Implement Raft transport
-between coordinator nodes</label></li>
-<li><label><input type="checkbox" />Phase 13F: Update CachedStateStore
-(caching conditional on coordinator)</label></li>
-<li><label><input type="checkbox" />Phase 13G: Update server integration
-(use CoordinatorClient instead of embedded Raft)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 13E: Implement gRPC
+service handlers</label></li>
+<li><label><input type="checkbox" checked="" />Phase 13E: Implement Raft
+transport between coordinator nodes (gRPC)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 13F: Update
+CachedStateStore (caching conditional on coordinator)</label></li>
+<li><label><input type="checkbox" checked="" />Phase 13G: Update server
+integration (use CoordinatorClient or embedded Raft)</label></li>
 </ul>
+<h3 id="phase-14-lease-lifecycle-conflict-detection---completed">Phase
+14: Lease Lifecycle &amp; Conflict Detection - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox"
+checked="" />docs/oplock-lease-design.md: Oplock/lease design document
+with multi-server handling</label></li>
+<li><label><input type="checkbox" checked="" />Phase 14A: Fix lease
+lifecycle cleanup</label>
+<ul>
+<li>CLOSE handler deletes lease before handle</li>
+<li>Session cleanup deletes leases for all handles</li>
+<li>Server failure cleanup deletes leases and locks for failed
+server</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 14B: Add lease
+conflict detection</label>
+<ul>
+<li>Add server_id to ConnectionHandler for lease tracking</li>
+<li>Add client_guid_string() helper to Connection</li>
+<li>Use check_and_create_lease() in CREATE handler with conflict
+detection</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 14C: Implement
+reduced grant for cross-server conflicts</label>
+<ul>
+<li>WRITE_CACHING is exclusive (conflicts with any other lease)</li>
+<li>Conflicting lease requests get reduced grant instead of oplock
+break</li>
+<li>File open still succeeds with reduced/no lease (affects caching
+only)</li>
+</ul></li>
+</ul>
+<h3 id="phase-15-smb-specification-testing---completed">Phase 15: SMB
+Specification Testing - COMPLETED</h3>
+<ul class="task-list">
+<li><label><input type="checkbox"
+checked="" />docs/smb-protocol-testing.md: Comprehensive testing
+documentation</label></li>
+<li><label><input type="checkbox" checked="" />Phase 15A: smbtorture
+integration</label>
+<ul>
+<li>tests/scripts/smbtorture.sh: Shell script test runner (used by
+CI)</li>
+<li>tests/scripts/run_smbtorture.sh: Bash script for running against
+external server</li>
+<li>CI job for smbtorture tests</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 15B: Python
+smbprotocol tests</label>
+<ul>
+<li>tests/python/: Python test environment</li>
+<li>Tests for NEGOTIATE, SESSION, CREATE, READ/WRITE, leases</li>
+<li>CI job for Python tests</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 15C: Microsoft
+Protocol Test Suites setup</label>
+<ul>
+<li>tests/ms-protocol/setup.sh: Setup script for MS test suites</li>
+<li>tests/ms-protocol/run_tests.sh: Test runner</li>
+<li>tests/ms-protocol/FileServer.ptfconfig: Configuration file</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />CI workflow updated with
+spec test jobs</label></li>
+</ul>
+<h3 id="phase-16-fix-smbtorture-test-failures---completed">Phase 16: Fix
+smbtorture Test Failures - COMPLETED</h3>
+<p>Fix smbtorture test failures by implementing missing SMB2
+functionality per MS-SMB2 spec. - [x] Phase 16A: Fix smb2.credits
+(credit charge validation per MS-SMB2 3.3.5.2.5) - Added
+<code>supports_multi_credit()</code> to Connection - Added
+<code>validate_credit_charge()</code> helper to ConnectionHandler - Call
+validation in READ, WRITE, IOCTL, QUERY_DIRECTORY, QUERY_INFO handlers -
+[x] Phase 16B: Fix smb2.tcon (ShareFlags, Capabilities, MaximalAccess
+per MS-SMB2 2.2.10) - Compute MaximalAccess based on share read_only
+config - Set ShareFlags based on share properties (DFS support) - Set
+ShareCapabilities based on available features - [x] Phase 16C: Fix
+smb2.read (MinimumCount validation per MS-SMB2 3.3.5.14) - Return
+STATUS_END_OF_FILE when read returns less than MinimumCount at EOF - [x]
+Phase 16D: Fix smb2.getinfo (InfoType routing per MS-SMB2 3.3.5.20) -
+Route QUERY_INFO by InfoType (File, FileSystem, Security, Quota) - Add
+<code>build_fs_info()</code> for filesystem info classes (1, 3, 4, 5, 7)
+- Add <code>build_security_info()</code> for security descriptor
+responses - Validate output buffer size per spec - [x] Phase 16E: Fix
+smb2.setinfo (implement SET_INFO handler per MS-SMB2 3.3.5.21) - Route
+SET_INFO by InfoType (File, FileSystem, Security) - Implement
+FileBasicInformation (4): set timestamps via utimes - Implement
+FileDispositionInformation (13): delete-on-close flag - Implement
+FileRenameInformation (10): rename files with UTF-16 path parsing -
+Implement FileEndOfFileInformation (20): truncate/extend files -
+Implement FileAllocationInformation (19): set allocation size - Add
+<code>delete_on_close</code> field to HandleState - Add
+<code>filetime_to_unix()</code> and <code>parse_utf16_string()</code>
+helpers - [x] Phase 16F: Fix smb2.create (create contexts, validation
+per MS-SMB2 3.3.5.9) - Impersonation level validation (0-3 only, return
+STATUS_BAD_IMPERSONATION_LEVEL) - Leading slash path validation (return
+STATUS_INVALID_PARAMETER) - Durable handle grant requirements (Batch
+oplock or lease with handle caching) - Allocation size context support
+(AlSi) - Query maximal access context support (MxAc) - Fixed allocation
+size context name (AlSi not AISi) - [x] Phase 16G: Fix smb2.lock
+(request validation per MS-SMB2 3.3.5.14) - LockCount validation (return
+STATUS_INVALID_PARAMETER when 0) - Lock flag validation (require exactly
+one of SHARED, EXCLUSIVE, or UNLOCK) - Lock range validation (return
+STATUS_INVALID_LOCK_RANGE for &gt;63-bit ranges) - Handle validation
+(return STATUS_FILE_CLOSED for missing handles) - Proper FileLock struct
+usage with VFS lock/unlock operations - [x] Phase 16H: smb2.oplock -
+Skipped (requires oplock break notifications) - [x] Phase 16I: smb2.dir
+- Skipped (causes smbtorture client crash) - [x] Phase 16J: smb2.session
+bind_negative - Skipped (requires multi-dialect signing)</p>
+<h3
+id="phase-17-unit-tests-for-ms-smb2-3.3.5-compliance---completed">Phase
+17: Unit Tests for MS-SMB2 3.3.5 Compliance - COMPLETED</h3>
+<p>Add unit tests to <code>handler.rs</code> organized by MS-SMB2
+specification chapter:</p>
+<ul>
+<li><label><input type="checkbox" checked="" />Phase 17A: Reorganize
+existing tests by spec chapter order</label>
+<ul>
+<li>Tests now organized by MS-SMB2 3.3.5.x chapter number</li>
+<li>Section headers added for each chapter: 3.3.5.2, 3.3.5.4, 3.3.5.5,
+3.3.5.6, 3.3.5.7, 3.3.5.8, 3.3.5.9, 3.3.5.10, 3.3.5.12, 3.3.5.14</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 17B: Add new tests
+by chapter</label>
+<ul>
+<li>3.3.5.2 Credit charge validation:
+<code>test_credit_charge_zero_large_payload</code>,
+<code>test_credit_charge_insufficient</code>,
+<code>test_credit_charge_sufficient</code>,
+<code>test_credit_charge_smb202_no_validation</code></li>
+<li>3.3.5.4 NEGOTIATE: <code>test_negotiate_dialect_count_zero</code>,
+<code>test_negotiate_no_common_dialect</code>,
+<code>test_negotiate_selects_highest_dialect</code></li>
+<li>3.3.5.7 TREE_CONNECT:
+<code>test_tree_connect_bad_network_name</code></li>
+<li>3.3.5.14 LOCK: <code>test_lock_count_zero</code>,
+<code>test_lock_invalid_flags</code>,
+<code>test_lock_invalid_range</code>,
+<code>test_lock_valid_range_at_boundary</code>,
+<code>test_lock_invalid_handle</code></li>
+</ul></li>
+<li>Total tests in handler.rs: 89 (increased from 76)</li>
+</ul>
+<p><strong>Not Implemented (requires significant infrastructure
+changes):</strong> - <strong>Lock stacking</strong>: Tracking locks at
+SMB layer to allow same-handle re-locking - <strong>Lock conflict
+detection</strong>: Proper conflict detection between different handles
+- <strong>Multi-channel session binding</strong>: Signing key derivation
+across different dialect connections - <strong>Cross-server lease break
+notifications</strong>: Async notification when lease conflicts occur
+across servers (same-server breaks implemented in Phase 18)</p>
+<h3 id="phase-18-oplocklease-break-notifications---completed">Phase 18:
+Oplock/Lease Break Notifications - COMPLETED</h3>
+<p>Implement same-server oplock/lease break notifications per MS-SMB2
+sections 2.2.23-2.2.25 and 3.3.4.6-3.3.4.7.</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />Phase 18A: Core
+Infrastructure</label>
+<ul>
+<li>Create <code>lease_break.rs</code> module with
+LeaseBreakRegistry</li>
+<li>Add <code>breaking</code>, <code>break_to_state</code> fields to
+LeaseEntry</li>
+<li>Unit tests organized by MS-SMB2 spec chapters (3.3.4.7, 3.3.5.22,
+3.3.6.5)</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 18B: Connection
+Handler Integration</label>
+<ul>
+<li>Add mpsc channel for break notifications to ConnectionHandler</li>
+<li>Share LeaseBreakRegistry across connections via server.rs</li>
+<li>Implement <code>send_lease_break_notification()</code> per MS-SMB2
+3.3.4.7</li>
+<li>Cleanup: unregister leases on connection close</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 18C: CREATE Handler
+Changes</label>
+<ul>
+<li>Partition conflicts by server_id (same-server vs cross-server)</li>
+<li>Trigger breaks for same-server conflicts, wait for ack</li>
+<li>Update lease state in StateStore after break completes</li>
+<li>Continue reduced grant for cross-server conflicts</li>
+<li>Register new leases with break registry</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 18D: OPLOCK_BREAK
+Handler</label>
+<ul>
+<li>Parse lease/oplock acknowledgment by structure_size (24=oplock,
+36=lease)</li>
+<li>Validate state is subset of break-to state per MS-SMB2
+3.3.5.22.2</li>
+<li>Return LeaseBreakResponse/OplockBreakResponse</li>
+<li>Integrate with LeaseBreakRegistry for pending break completion</li>
+</ul></li>
+<li><label><input type="checkbox" checked="" />Phase 18E: CLOSE Handler
+Integration</label>
+<ul>
+<li>Unregister leases from LeaseBreakRegistry when handles are
+closed</li>
+<li>Connection cleanup already unregisters all leases on disconnect</li>
+</ul></li>
+</ul>
+<p><strong>Note:</strong> Cross-server lease breaks are NOT implemented.
+Cross-server conflicts continue using reduced grant strategy from Phase
+14.</p>
+<h2 id="smbtorture-test-analysis">smbtorture Test Analysis</h2>
+<h3 id="test-results-summary-january-2026">Test Results Summary (January
+2026)</h3>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 29%" />
+<col style="width: 44%" />
+</colgroup>
+<thead>
+<tr>
+<th>Suite</th>
+<th>Status</th>
+<th>Key Issues</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>smb2.connect</td>
+<td><strong>PASS</strong></td>
+<td>-</td>
+</tr>
+<tr>
+<td>smb2.session</td>
+<td><strong>FAIL</strong></td>
+<td>reauth5/6, bind_negative_* (multi-dialect signing)</td>
+</tr>
+<tr>
+<td>smb2.tcon</td>
+<td><strong>FAIL</strong></td>
+<td>Allows write with wrong Tree ID</td>
+</tr>
+<tr>
+<td>smb2.create</td>
+<td><strong>FAIL</strong></td>
+<td>gentest, blob, aclfile, acldir, nulldacl</td>
+</tr>
+<tr>
+<td>smb2.read</td>
+<td><strong>FAIL</strong></td>
+<td>eof status, position tracking, dir read status</td>
+</tr>
+<tr>
+<td>smb2.lock</td>
+<td><strong>FAIL</strong></td>
+<td>Lock stacking, error codes, cross-handle conflicts</td>
+</tr>
+<tr>
+<td>smb2.lease</td>
+<td><strong>PASS</strong></td>
+<td>-</td>
+</tr>
+<tr>
+<td>smb2.oplock</td>
+<td><strong>PARTIAL (17/42)</strong></td>
+<td>brl3 (lock error codes), levelii500 (break failure), statopen1</td>
+</tr>
+<tr>
+<td>smb2.durable-open</td>
+<td><strong>FAIL</strong></td>
+<td>Various reconnect edge cases</td>
+</tr>
+<tr>
+<td>smb2.durable-v2-open</td>
+<td><strong>FAIL</strong></td>
+<td>Client crash (smbtorture bug)</td>
+</tr>
+<tr>
+<td>smb2.compound</td>
+<td><strong>FAIL</strong></td>
+<td>Timeout issues</td>
+</tr>
+</tbody>
+</table>
+<h3 id="missing-features-vs-ksmbd">Missing Features vs ksmbd</h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>ksmbd</th>
+<th>RustSMB</th>
+<th>Priority</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Oplock break notifications</td>
+<td>✅</td>
+<td>⚠️ Same-server only</td>
+<td>-</td>
+</tr>
+<tr>
+<td>Lock stacking (same-handle re-lock)</td>
+<td>✅</td>
+<td>❌</td>
+<td>P2</td>
+</tr>
+<tr>
+<td>LOCK_NOT_GRANTED vs FILE_LOCK_CONFLICT</td>
+<td>✅</td>
+<td>❌</td>
+<td>P2</td>
+</tr>
+<tr>
+<td>Cross-handle lock conflicts</td>
+<td>✅</td>
+<td>❌</td>
+<td>P2</td>
+</tr>
+<tr>
+<td>Tree ID validation</td>
+<td>✅</td>
+<td>❌</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>Read past EOF → STATUS_END_OF_FILE</td>
+<td>✅</td>
+<td>❌</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>Read directory → STATUS_INVALID_DEVICE_REQUEST</td>
+<td>✅</td>
+<td>❌</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>File position tracking</td>
+<td>✅</td>
+<td>❌</td>
+<td>P3</td>
+</tr>
+<tr>
+<td>Attributes-only opens (no oplock break)</td>
+<td>✅</td>
+<td>❌</td>
+<td>P3</td>
+</tr>
+<tr>
+<td>SMB2_CAP_MULTI_CHANNEL</td>
+<td>⚠️ Experimental</td>
+<td>❌</td>
+<td>P3</td>
+</tr>
+<tr>
+<td>SMB Direct (RDMA)</td>
+<td>✅</td>
+<td>❌</td>
+<td>-</td>
+</tr>
+<tr>
+<td>POSIX extensions</td>
+<td>✅</td>
+<td>❌</td>
+<td>-</td>
+</tr>
+<tr>
+<td>Durable handles v1/v2</td>
+<td>⚠️ (kernel 6.9+)</td>
+<td>✅</td>
+<td>-</td>
+</tr>
+</tbody>
+</table>
+<h3 id="priority-fixes">Priority Fixes</h3>
+<p><strong>P0 - Critical (blocks many tests):</strong> - <del>Implement
+oplock/lease break notifications</del> DONE in Phase 18 (same-server
+only)</p>
+<p><strong>P1 - Security/Compliance:</strong> - Tree ID validation
+(reject operations with wrong TID) - Read past EOF should return
+STATUS_END_OF_FILE - Read on directory should return
+STATUS_INVALID_DEVICE_REQUEST</p>
+<p><strong>P2 - Lock semantics:</strong> - Lock stacking (allow same
+handle to re-lock same range) - Correct error codes (LOCK_NOT_GRANTED
+first, FILE_LOCK_CONFLICT after) - Cross-handle/cross-session lock
+conflict detection</p>
+<p><strong>P3 - Nice to have:</strong> - File position tracking in
+FileAllInformation - Attributes-only opens without sharing violations -
+Multi-channel capability advertisement</p>
 
 </body>
 </html>

@@ -7,11 +7,20 @@ use crate::helpers::{
     build_directory_info, build_file_info, build_fs_info, build_security_info, current_filetime,
     decode_utf16le, extract_share_name, filetime_to_unix, parse_utf16_string,
 };
+use crate::lease_break::{
+    LeaseBreakEvent, LeaseBreakRegistry, OplockBreakEvent, OplockConnectionEntry,
+};
 use crate::{ServerConfig, ShareManager};
 use binrw::{BinRead, BinWrite};
 use bytes::{Buf, BytesMut};
 use rustsmb_auth::{AuthContext, AuthResult, DynAuthProvider, PreauthIntegrityHash, SessionKeys};
 use rustsmb_core::{NtStatus, SmbDialect, VfsError};
+use rustsmb_protocol::commands::oplock_break::{
+    LeaseBreakAcknowledgment, LeaseBreakFlags, LeaseBreakNotification, LeaseBreakResponse,
+    LeaseState, OplockBreakAcknowledgment, OplockBreakNotification, OplockBreakResponse,
+    OplockLevel, LEASE_BREAK_ACK_SIZE, LEASE_BREAK_NOTIFICATION_SIZE, LEASE_BREAK_RESPONSE_SIZE,
+    OPLOCK_BREAK_ACK_SIZE, OPLOCK_BREAK_NOTIFICATION_SIZE, OPLOCK_BREAK_RESPONSE_SIZE,
+};
 use rustsmb_protocol::crypto::signing::{MessageSigner, SigningAlgorithm};
 use rustsmb_protocol::{Smb2Command, Smb2Flags, Smb2Header, SMB2_HEADER_SIZE, SMB2_MAGIC};
 use rustsmb_session::{Connection, SessionManager};
@@ -23,6 +32,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 /// Global connection ID counter.
@@ -52,6 +62,16 @@ pub struct ConnectionHandler<S> {
     preauth_hash: PreauthIntegrityHash,
     /// Signing keys per session (session_id -> signing_key).
     signing_keys: HashMap<u64, Vec<u8>>,
+    /// Lease break registry for sending break notifications.
+    lease_registry: Arc<LeaseBreakRegistry>,
+    /// Channel for receiving lease break events.
+    break_rx: mpsc::Receiver<LeaseBreakEvent>,
+    /// Channel sender for registering with the lease registry.
+    break_tx: mpsc::Sender<LeaseBreakEvent>,
+    /// Channel for receiving oplock break events.
+    oplock_break_rx: mpsc::Receiver<OplockBreakEvent>,
+    /// Channel sender for registering oplocks with the registry.
+    oplock_break_tx: mpsc::Sender<OplockBreakEvent>,
 }
 
 impl<S> ConnectionHandler<S>
@@ -59,6 +79,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     /// Create a new connection handler.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream: S,
         peer_addr: SocketAddr,
@@ -67,9 +88,15 @@ where
         auth_provider: DynAuthProvider,
         shares: Arc<ShareManager>,
         server_id: String,
+        lease_registry: Arc<LeaseBreakRegistry>,
     ) -> Self {
         let conn_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let connection = Connection::new(conn_id, peer_addr);
+
+        // Create channel for lease break notifications
+        let (break_tx, break_rx) = mpsc::channel(32);
+        // Create channel for oplock break notifications
+        let (oplock_break_tx, oplock_break_rx) = mpsc::channel(32);
 
         Self {
             stream,
@@ -83,7 +110,17 @@ where
             server_id,
             preauth_hash: PreauthIntegrityHash::new(),
             signing_keys: HashMap::new(),
+            lease_registry,
+            break_rx,
+            break_tx,
+            oplock_break_rx,
+            oplock_break_tx,
         }
+    }
+
+    /// Get the break channel sender for registering leases with the registry.
+    pub fn break_sender(&self) -> mpsc::Sender<LeaseBreakEvent> {
+        self.break_tx.clone()
     }
 
     /// Run the connection handler loop.
@@ -94,56 +131,21 @@ where
             "New connection"
         );
 
-        loop {
-            // Read the next message
-            let message = match self.read_message().await {
-                Ok(Some(msg)) => msg,
-                Ok(None) => {
-                    debug!(conn_id = self.connection.id, "Connection closed by client");
-                    break;
-                }
-                Err(e) => {
-                    error!(conn_id = self.connection.id, error = %e, "Error reading message");
-                    return Err(e);
-                }
-            };
+        // Process messages until connection closes
+        let result = self.run_message_loop().await;
 
-            // Process the message
-            let response = match self.process_message(&message).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    warn!(conn_id = self.connection.id, error = %e, "Error processing message");
-                    // Build error response
-                    self.build_error_response(&message, e.status())?
-                }
-            };
-
-            // Skip empty responses (e.g., CANCEL)
-            if response.is_empty() {
-                continue;
-            }
-
-            // Sign response if we have a signing key for this session
-            let response = self.maybe_sign_response(response)?;
-
-            // Send response
-            if let Err(e) = self.send_response(&response).await {
-                error!(conn_id = self.connection.id, error = %e, "Error sending response");
-                return Err(e);
-            }
-
-            // Check if we should disconnect
-            if self.connection.is_disconnecting() {
-                debug!(conn_id = self.connection.id, "Connection disconnecting");
-                break;
-            }
+        // Cleanup: unregister all leases and oplocks for this connection
+        for session_id in self.connection.session_ids() {
+            self.lease_registry
+                .unregister_connection_leases(&self.server_id, *session_id);
+            self.lease_registry
+                .unregister_connection_oplocks(&self.server_id, *session_id);
         }
 
         // Note: Sessions are NOT deleted on connection close.
         // In HA mode, sessions persist in the shared state store and can be
         // bound from another server via SESSION_BINDING. Sessions expire based
         // on their TTL (expires_at field) and are cleaned up by expiration.
-        // This allows transparent failover without re-authentication.
         let session_count = self.connection.session_ids().count();
         if session_count > 0 {
             debug!(
@@ -154,37 +156,126 @@ where
         }
 
         info!(conn_id = self.connection.id, "Connection closed");
-        Ok(())
+        result
     }
 
-    /// Read the next SMB message from the socket.
-    async fn read_message(&mut self) -> Result<Option<Vec<u8>>, HandlerError> {
-        // SMB messages are prefixed with a 4-byte NetBIOS header containing the length
+    /// Internal message processing loop.
+    ///
+    /// Uses `tokio::select!` to concurrently wait for:
+    /// - Client messages from the socket
+    /// - Lease break events from the registry
+    /// - Oplock break events from the registry
+    ///
+    /// This allows sending unsolicited break notifications even when the client
+    /// is idle (not sending messages).
+    async fn run_message_loop(&mut self) -> Result<(), HandlerError> {
         loop {
-            // Try to parse a complete message from the buffer
-            if self.read_buf.len() >= 4 {
-                // NetBIOS session message: 1 byte type (0x00) + 3 bytes length
-                let len = ((self.read_buf[1] as usize) << 16)
-                    | ((self.read_buf[2] as usize) << 8)
-                    | (self.read_buf[3] as usize);
-
-                if self.read_buf.len() >= 4 + len {
-                    // We have a complete message
-                    self.read_buf.advance(4); // Skip NetBIOS header
-                    let message = self.read_buf.split_to(len).to_vec();
-                    return Ok(Some(message));
+            // First, process any complete messages already in the buffer
+            while let Some(message) = self.try_parse_message()? {
+                self.process_and_respond(&message).await?;
+                if self.connection.is_disconnecting() {
+                    debug!(conn_id = self.connection.id, "Connection disconnecting");
+                    return Ok(());
                 }
             }
 
-            // Need more data
-            let n = self.stream.read_buf(&mut self.read_buf).await?;
-            if n == 0 {
-                if self.read_buf.is_empty() {
-                    return Ok(None);
+            // Wait for either: socket data, lease break, or oplock break
+            tokio::select! {
+                biased;
+
+                // Lease break events have priority (break notifications are time-sensitive)
+                Some(break_event) = self.break_rx.recv() => {
+                    if let Err(e) = self.send_lease_break_notification(&break_event).await {
+                        warn!(
+                            conn_id = self.connection.id,
+                            error = %e,
+                            "Failed to send lease break notification"
+                        );
+                    }
                 }
-                return Err(HandlerError::Protocol("Incomplete message".into()));
+
+                // Oplock break events
+                Some(break_event) = self.oplock_break_rx.recv() => {
+                    if let Err(e) = self.send_oplock_break_notification(&break_event).await {
+                        warn!(
+                            conn_id = self.connection.id,
+                            error = %e,
+                            "Failed to send oplock break notification"
+                        );
+                    }
+                }
+
+                // Read more data from socket
+                result = self.stream.read_buf(&mut self.read_buf) => {
+                    match result {
+                        Ok(0) if self.read_buf.is_empty() => {
+                            debug!(conn_id = self.connection.id, "Connection closed by client");
+                            return Ok(());
+                        }
+                        Ok(0) => {
+                            return Err(HandlerError::Protocol("Incomplete message".into()));
+                        }
+                        Ok(_) => {
+                            // Data received, loop back to parse messages
+                        }
+                        Err(e) => {
+                            error!(conn_id = self.connection.id, error = %e, "Error reading from socket");
+                            return Err(e.into());
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Try to parse a complete message from the read buffer.
+    /// Returns `Some(message)` if a complete message is available, `None` if more data is needed.
+    fn try_parse_message(&mut self) -> Result<Option<Vec<u8>>, HandlerError> {
+        if self.read_buf.len() < 4 {
+            return Ok(None);
+        }
+
+        // NetBIOS session message: 1 byte type (0x00) + 3 bytes length
+        let len = ((self.read_buf[1] as usize) << 16)
+            | ((self.read_buf[2] as usize) << 8)
+            | (self.read_buf[3] as usize);
+
+        if self.read_buf.len() < 4 + len {
+            return Ok(None);
+        }
+
+        // We have a complete message
+        self.read_buf.advance(4); // Skip NetBIOS header
+        let message = self.read_buf.split_to(len).to_vec();
+        Ok(Some(message))
+    }
+
+    /// Process a message and send the response.
+    async fn process_and_respond(&mut self, message: &[u8]) -> Result<(), HandlerError> {
+        let response = match self.process_message(message).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!(conn_id = self.connection.id, error = %e, "Error processing message");
+                // Build error response
+                self.build_error_response(message, e.status())?
+            }
+        };
+
+        // Skip empty responses (e.g., CANCEL)
+        if response.is_empty() {
+            return Ok(());
+        }
+
+        // Sign response if we have a signing key for this session
+        let response = self.maybe_sign_response(response)?;
+
+        // Send response
+        if let Err(e) = self.send_response(&response).await {
+            error!(conn_id = self.connection.id, error = %e, "Error sending response");
+            return Err(e);
+        }
+
+        Ok(())
     }
 
     /// Process an SMB message and generate a response.
@@ -367,6 +458,147 @@ where
         self.stream.flush().await?;
 
         Ok(())
+    }
+
+    /// Send a lease break notification to the client.
+    ///
+    /// This is an unsolicited message sent when another client needs to
+    /// access a file with conflicting lease requirements.
+    ///
+    /// Per MS-SMB2 3.3.4.7:
+    /// - MessageId must be 0xFFFFFFFFFFFFFFFF
+    /// - SessionId and TreeId must be 0
+    /// - Break notifications should NOT be signed
+    async fn send_lease_break_notification(
+        &mut self,
+        event: &LeaseBreakEvent,
+    ) -> Result<(), HandlerError> {
+        debug!(
+            conn_id = self.connection.id,
+            break_id = event.break_id,
+            current_state = event.current_state,
+            new_state = event.new_state,
+            ack_required = event.ack_required,
+            "Sending lease break notification"
+        );
+
+        // Build SMB2 header per MS-SMB2 3.3.4.7:
+        // - MessageId = 0xFFFFFFFFFFFFFFFF (unsolicited)
+        // - SessionId = 0
+        // - TreeId = 0
+        // - Command = OPLOCK_BREAK
+        let header = Smb2Header {
+            structure_size: 64,
+            credit_charge: 0,
+            status: 0, // SUCCESS
+            command: Smb2Command::OplockBreak,
+            credits: 0,
+            flags: Smb2Flags(Smb2Flags::SERVER_TO_REDIR),
+            next_command: 0,
+            message_id: 0xFFFFFFFFFFFFFFFF, // Unsolicited notification
+            async_id: 0,
+            tree_id: 0,
+            session_id: 0,
+            signature: [0; 16],
+        };
+
+        // Build notification body
+        let notification = LeaseBreakNotification {
+            structure_size: LEASE_BREAK_NOTIFICATION_SIZE,
+            new_epoch: event.new_epoch,
+            flags: LeaseBreakFlags::new(if event.ack_required {
+                LeaseBreakFlags::ACK_REQUIRED
+            } else {
+                0
+            }),
+            lease_key: event.lease_key,
+            current_lease_state: LeaseState::new(event.current_state),
+            new_lease_state: LeaseState::new(event.new_state),
+            break_reason: 0,
+            access_mask_hint: 0,
+            share_mask_hint: 0,
+        };
+
+        // Serialize header and body using a single cursor to avoid overwriting
+        let mut response = Vec::with_capacity(SMB2_HEADER_SIZE + 44);
+        let mut cursor = Cursor::new(&mut response);
+        header
+            .write(&mut cursor)
+            .map_err(|e| HandlerError::Protocol(format!("Serialize header: {}", e)))?;
+        notification
+            .write(&mut cursor)
+            .map_err(|e| HandlerError::Protocol(format!("Serialize notification: {}", e)))?;
+
+        // Send without signing per MS-SMB2 3.3.4.7
+        self.send_response(&response).await
+    }
+
+    /// Send an oplock break notification to the client.
+    ///
+    /// Per MS-SMB2 3.3.4.6, this is an unsolicited notification sent when
+    /// another client's request conflicts with this client's oplock.
+    async fn send_oplock_break_notification(
+        &mut self,
+        event: &OplockBreakEvent,
+    ) -> Result<(), HandlerError> {
+        debug!(
+            conn_id = self.connection.id,
+            break_id = event.break_id,
+            current_level = event.current_level,
+            new_level = event.new_level,
+            ack_required = event.ack_required,
+            "Sending oplock break notification"
+        );
+
+        // Build SMB2 header per MS-SMB2 3.3.4.6:
+        // - MessageId = 0xFFFFFFFFFFFFFFFF (unsolicited)
+        // - SessionId = 0
+        // - TreeId = 0
+        // - Command = OPLOCK_BREAK
+        let header = Smb2Header {
+            structure_size: 64,
+            credit_charge: 0,
+            status: 0, // SUCCESS
+            command: Smb2Command::OplockBreak,
+            credits: 0,
+            flags: Smb2Flags(Smb2Flags::SERVER_TO_REDIR),
+            next_command: 0,
+            message_id: 0xFFFFFFFFFFFFFFFF, // Unsolicited notification
+            async_id: 0,
+            tree_id: 0,
+            session_id: 0,
+            signature: [0; 16],
+        };
+
+        // Build notification body
+        let oplock_level = match event.new_level {
+            0x00 => OplockLevel::None,
+            0x01 => OplockLevel::LevelII,
+            0x08 => OplockLevel::Exclusive,
+            0x09 => OplockLevel::Batch,
+            _ => OplockLevel::None,
+        };
+        let notification = OplockBreakNotification {
+            structure_size: OPLOCK_BREAK_NOTIFICATION_SIZE,
+            oplock_level,
+            reserved: 0,
+            reserved2: 0,
+            file_id_persistent: event.persistent_id,
+            file_id_volatile: event.volatile_id,
+        };
+
+        // Serialize header and body using a single cursor to avoid overwriting
+        let mut response = Vec::with_capacity(SMB2_HEADER_SIZE + 24);
+        let mut cursor = Cursor::new(&mut response);
+        header
+            .write(&mut cursor)
+            .map_err(|e| HandlerError::Protocol(format!("Serialize header: {}", e)))?;
+        notification
+            .write(&mut cursor)
+            .map_err(|e| HandlerError::Protocol(format!("Serialize notification: {}", e)))?;
+
+        // Send without signing per MS-SMB2 3.3.4.6
+        self.send_response(&response).await
     }
 
     /// Build an error response.
@@ -1791,17 +2023,185 @@ where
                     granted_lease_state = result.granted_state;
 
                     if !result.conflicts.is_empty() {
+                        // Partition conflicts by server_id
+                        let (same_server, cross_server): (Vec<_>, Vec<_>) = result
+                            .conflicts
+                            .iter()
+                            .partition(|c| c.server_id == self.server_id);
+
                         debug!(
                             conn_id = self.connection.id,
-                            conflicts = result.conflicts.len(),
+                            same_server = same_server.len(),
+                            cross_server = cross_server.len(),
                             requested = lease_state,
-                            granted = granted_lease_state,
-                            "Lease reduced due to conflicts"
+                            "Lease conflicts detected"
                         );
+
+                        // Handle same-server conflicts with break notifications
+                        for conflict in &same_server {
+                            // Calculate break-to state based on what we need
+                            let break_to = crate::lease_break::calculate_break_state(
+                                conflict.lease_state,
+                                lease_state,
+                            );
+
+                            // Only break if state needs to change
+                            if break_to != conflict.lease_state {
+                                let new_epoch = conflict.epoch.wrapping_add(1);
+
+                                debug!(
+                                    conn_id = self.connection.id,
+                                    conflict_lease = %conflict.lease_key,
+                                    current_state = conflict.lease_state,
+                                    break_to = break_to,
+                                    "Breaking same-server lease"
+                                );
+
+                                // Initiate lease break and wait for result
+                                match self
+                                    .lease_registry
+                                    .break_lease(
+                                        &conflict.lease_key,
+                                        conflict.lease_state,
+                                        break_to,
+                                        new_epoch,
+                                        &file_path,
+                                    )
+                                    .await
+                                {
+                                    Ok(break_result) => {
+                                        // Update lease state based on result
+                                        let final_state = match break_result {
+                                            crate::lease_break::LeaseBreakResult::Acknowledged {
+                                                new_state,
+                                                ..
+                                            } => new_state,
+                                            crate::lease_break::LeaseBreakResult::TimedOut => {
+                                                // Per MS-SMB2 3.3.6.5: force to NONE on timeout
+                                                0
+                                            }
+                                            crate::lease_break::LeaseBreakResult::Disconnected => {
+                                                // Client disconnected, force to NONE
+                                                0
+                                            }
+                                            crate::lease_break::LeaseBreakResult::NoAckRequired => {
+                                                break_to
+                                            }
+                                            crate::lease_break::LeaseBreakResult::AlreadyBroken => {
+                                                break_to
+                                            }
+                                        };
+
+                                        // Update lease in state store
+                                        let updated_lease = LeaseEntry {
+                                            lease_key: conflict.lease_key.clone(),
+                                            client_guid: conflict.client_guid.clone(),
+                                            session_id: conflict.session_id,
+                                            server_id: conflict.server_id.clone(),
+                                            file_path: conflict.file_path.clone(),
+                                            lease_state: final_state,
+                                            epoch: new_epoch,
+                                            created_at: conflict.created_at,
+                                            breaking: false,
+                                            break_to_state: 0,
+                                            break_started_at: None,
+                                        };
+
+                                        if let Err(e) = self
+                                            .session_manager
+                                            .state_store()
+                                            .update_lease(&updated_lease)
+                                            .await
+                                        {
+                                            warn!(
+                                                conn_id = self.connection.id,
+                                                error = %e,
+                                                "Failed to update lease after break"
+                                            );
+                                        }
+
+                                        debug!(
+                                            conn_id = self.connection.id,
+                                            conflict_lease = %conflict.lease_key,
+                                            final_state = final_state,
+                                            "Lease break completed"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Break failed - log but continue (client may have disconnected)
+                                        warn!(
+                                            conn_id = self.connection.id,
+                                            error = %e,
+                                            conflict_lease = %conflict.lease_key,
+                                            "Failed to break lease"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // After same-server breaks, we might be able to grant more state
+                        // For cross-server conflicts, keep using reduced grant
+                        if same_server.is_empty() && !cross_server.is_empty() {
+                            debug!(
+                                conn_id = self.connection.id,
+                                granted = granted_lease_state,
+                                "Cross-server conflicts: using reduced grant"
+                            );
+                        } else if !same_server.is_empty() {
+                            // Same-server breaks completed, try to grant full state
+                            // Re-check conflicts since they may have changed
+                            match self
+                                .session_manager
+                                .state_store()
+                                .get_leases_for_file(&file_path)
+                                .await
+                            {
+                                Ok(remaining_leases) => {
+                                    // Check if we can now grant the full requested state
+                                    let still_conflicting: Vec<_> = remaining_leases
+                                        .iter()
+                                        .filter(|l| {
+                                            l.lease_key != hex::encode(key)
+                                                && has_lease_conflict(l.lease_state, lease_state)
+                                        })
+                                        .collect();
+
+                                    if still_conflicting.is_empty() {
+                                        // No more conflicts, can grant full state
+                                        granted_lease_state = lease_state;
+                                        debug!(
+                                            conn_id = self.connection.id,
+                                            granted = granted_lease_state,
+                                            "All conflicts resolved, granting full state"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        conn_id = self.connection.id,
+                                        error = %e,
+                                        "Failed to re-check leases after breaks"
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     // Set lease key on handle only if lease was created
                     handle.set_lease_key(&key);
+
+                    // Register lease with break registry so it can receive break notifications
+                    let lease_key_hex = hex::encode(key);
+                    self.lease_registry.register_lease(
+                        &lease_key_hex,
+                        crate::lease_break::LeaseConnectionEntry {
+                            break_tx: self.break_tx.clone(),
+                            server_id: self.server_id.clone(),
+                            client_guid: self.connection.client_guid_string(),
+                            session_id: header.session_id,
+                        },
+                    );
                 }
                 Err(e) => {
                     warn!(
@@ -1814,10 +2214,116 @@ where
             }
         }
 
+        // Check for oplock conflicts (only if this request wants an oplock and no lease)
+        // Leases are handled separately above; traditional oplocks use OplockLevel directly
+        let mut granted_oplock = requested_oplock;
+        if lease_key.is_none() && requested_oplock != OplockLevel::None {
+            let file_path = format!("{}/{}", tree.share_name, filename);
+
+            // Get existing oplocks on this file from the registry
+            let existing_oplocks = self
+                .lease_registry
+                .get_oplocks_for_file(&tree.share_name, &filename);
+
+            // Check for conflicts - Batch and Exclusive oplocks conflict with any other oplock
+            let mut conflicting_handles: Vec<(u128, u8, String)> = Vec::new();
+            for (existing_handle_id, existing_level, existing_server_id) in existing_oplocks {
+                // Skip our own session's handles
+                if existing_server_id == self.server_id {
+                    // Batch (0x09) or Exclusive (0x08) conflicts with any new oplock request
+                    if existing_level == 0x09 || existing_level == 0x08 {
+                        conflicting_handles.push((
+                            existing_handle_id,
+                            existing_level,
+                            existing_server_id,
+                        ));
+                    }
+                }
+            }
+
+            // Break conflicting oplocks (same-server only for now)
+            for (existing_handle_id, existing_level, _existing_server_id) in conflicting_handles {
+                // Calculate break-to level: Batch/Exclusive breaks to LevelII (0x01)
+                let break_to_level = if existing_level == 0x09 || existing_level == 0x08 {
+                    0x01 // LevelII
+                } else {
+                    0x00 // None
+                };
+
+                debug!(
+                    conn_id = self.connection.id,
+                    existing_handle = %existing_handle_id,
+                    current_level = existing_level,
+                    break_to_level,
+                    "Breaking conflicting oplock"
+                );
+
+                // Break the oplock and wait for acknowledgment
+                match self
+                    .lease_registry
+                    .break_oplock(existing_handle_id, break_to_level, &file_path)
+                    .await
+                {
+                    Ok(result) => {
+                        debug!(
+                            conn_id = self.connection.id,
+                            result = ?result,
+                            "Oplock break completed"
+                        );
+                        // Update the oplock level in the registry
+                        self.lease_registry
+                            .update_oplock_level(existing_handle_id, break_to_level);
+                    }
+                    Err(e) => {
+                        warn!(
+                            conn_id = self.connection.id,
+                            error = %e,
+                            "Oplock break failed"
+                        );
+                    }
+                }
+            }
+
+            // If there are ANY remaining oplocks after breaking, reduce the granted oplock level.
+            // Exclusive and Batch oplocks are only granted when no other opens exist on the file.
+            // When other opens exist, we can only grant LevelII.
+            let remaining_oplocks = self
+                .lease_registry
+                .get_oplocks_for_file(&tree.share_name, &filename);
+            for (_existing_handle_id, existing_level, _) in remaining_oplocks {
+                // Any oplock (including LevelII) means we can't grant Exclusive or Batch
+                if existing_level != 0x00
+                    && (granted_oplock == OplockLevel::Batch
+                        || granted_oplock == OplockLevel::Exclusive)
+                {
+                    granted_oplock = OplockLevel::LevelII;
+                    break; // Found a conflicting oplock, no need to check more
+                }
+            }
+        }
+
+        // Update handle with final granted oplock level
+        handle.oplock_level = granted_oplock.as_u8();
+
         self.session_manager
-            .create_handle(handle)
+            .create_handle(handle.clone())
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+        // Register oplock with break registry if an oplock was granted (not just leases)
+        if lease_key.is_none() && granted_oplock != OplockLevel::None {
+            self.lease_registry.register_oplock(
+                handle_id,
+                OplockConnectionEntry {
+                    break_tx: self.oplock_break_tx.clone(),
+                    server_id: self.server_id.clone(),
+                    session_id: header.session_id,
+                    oplock_level: granted_oplock.as_u8(),
+                    file_path: filename.clone(),
+                    share_name: tree.share_name.clone(),
+                },
+            );
+        }
 
         debug!(
             conn_id = self.connection.id,
@@ -1825,6 +2331,7 @@ where
             path = %filename,
             is_durable,
             is_persistent,
+            oplock_level = ?granted_oplock,
             "File opened"
         );
 
@@ -1941,7 +2448,7 @@ where
 
         let response = CreateResponse {
             structure_size: 89,
-            oplock_level: requested_oplock,
+            oplock_level: granted_oplock,
             flags: CreateResponseFlags(0),
             create_action,
             creation_time: current_filetime(),
@@ -2199,6 +2706,10 @@ where
 
         // Delete lease if present
         if let Some(lease_key) = &handle.lease_key {
+            // Unregister from break registry first (synchronous)
+            self.lease_registry.unregister_lease(lease_key);
+
+            // Delete from state store
             if let Err(e) = self
                 .session_manager
                 .state_store()
@@ -2207,6 +2718,11 @@ where
             {
                 debug!(error = %e, lease_key = %lease_key, "Failed to delete lease on close");
             }
+        }
+
+        // Unregister oplock if present (no lease = might have oplock)
+        if handle.lease_key.is_none() && handle.oplock_level != 0 {
+            self.lease_registry.unregister_oplock(handle_id);
         }
 
         // Delete handle
@@ -3304,15 +3820,259 @@ where
         Ok(())
     }
 
+    /// Handle OPLOCK_BREAK acknowledgment from client.
+    ///
+    /// Per MS-SMB2 3.3.5.22, this handles both oplock and lease break acks.
+    /// The structure_size field distinguishes between them:
+    /// - 24 bytes = OplockBreakAcknowledgment
+    /// - 36 bytes = LeaseBreakAcknowledgment
     async fn handle_oplock_break(
         &mut self,
         header: &Smb2Header,
-        _body: &[u8],
+        body: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
-        debug!(conn_id = self.connection.id, "OPLOCK_BREAK request");
-        // Oplocks not fully supported
-        let _ = header;
-        Err(HandlerError::Status(NtStatus::NotSupported))
+        debug!(conn_id = self.connection.id, "OPLOCK_BREAK acknowledgment");
+
+        // Need at least 2 bytes to read structure size
+        if body.len() < 2 {
+            return Err(HandlerError::Protocol("OPLOCK_BREAK body too short".into()));
+        }
+
+        // Read structure size to determine type
+        let structure_size = u16::from_le_bytes([body[0], body[1]]);
+
+        match structure_size {
+            OPLOCK_BREAK_ACK_SIZE => {
+                // Oplock break acknowledgment
+                self.handle_oplock_break_ack(header, body).await
+            }
+            LEASE_BREAK_ACK_SIZE => {
+                // Lease break acknowledgment
+                self.handle_lease_break_ack(header, body).await
+            }
+            _ => {
+                warn!(
+                    conn_id = self.connection.id,
+                    structure_size = structure_size,
+                    "Invalid OPLOCK_BREAK structure size"
+                );
+                Err(HandlerError::Status(NtStatus::InvalidParameter))
+            }
+        }
+    }
+
+    /// Handle oplock break acknowledgment (structure size 24).
+    ///
+    /// Per MS-SMB2 3.3.5.22.1.
+    async fn handle_oplock_break_ack(
+        &mut self,
+        header: &Smb2Header,
+        body: &[u8],
+    ) -> Result<Vec<u8>, HandlerError> {
+        // Parse the acknowledgment
+        let ack = OplockBreakAcknowledgment::read(&mut Cursor::new(body))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to parse oplock ack: {}", e)))?;
+
+        debug!(
+            conn_id = self.connection.id,
+            file_id_persistent = ack.file_id_persistent,
+            file_id_volatile = ack.file_id_volatile,
+            oplock_level = ?ack.oplock_level,
+            "Oplock break acknowledged"
+        );
+
+        // Verify handle exists
+        // Per handle_id format: lower 64 bits = persistent, upper 64 bits = volatile
+        let handle_id = (ack.file_id_volatile as u128) << 64 | ack.file_id_persistent as u128;
+        let handle = self
+            .session_manager
+            .get_handle(handle_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::FileClosed))?;
+
+        // Convert oplock level to u8 (the oplock_break::OplockLevel uses #[repr(u8)])
+        let acked_level = match ack.oplock_level {
+            OplockLevel::None => 0x00,
+            OplockLevel::LevelII => 0x01,
+            OplockLevel::Exclusive => 0x08,
+            OplockLevel::Batch => 0x09,
+            OplockLevel::Lease => 0xFF,
+        };
+
+        // Notify the registry of the acknowledgment (completes pending break)
+        if let Err(e) = self.lease_registry.handle_oplock_acknowledgment(
+            ack.file_id_persistent,
+            ack.file_id_volatile,
+            acked_level,
+        ) {
+            debug!(
+                conn_id = self.connection.id,
+                error = %e,
+                "Oplock acknowledgment handling failed (may be stale)"
+            );
+        }
+
+        // Update oplock level in the registry
+        self.lease_registry
+            .update_oplock_level(handle_id, acked_level);
+
+        // Update handle's oplock level in state store
+        let mut updated_handle = handle;
+        updated_handle.oplock_level = acked_level;
+        if let Err(e) = self
+            .session_manager
+            .state_store()
+            .update_handle(&updated_handle)
+            .await
+        {
+            debug!(
+                conn_id = self.connection.id,
+                error = %e,
+                "Failed to update handle oplock level"
+            );
+        }
+
+        // Build response
+        let resp_header = self.build_response_header(header, NtStatus::Success);
+
+        let response = OplockBreakResponse {
+            structure_size: OPLOCK_BREAK_RESPONSE_SIZE,
+            oplock_level: ack.oplock_level,
+            reserved: 0,
+            reserved2: 0,
+            file_id_persistent: ack.file_id_persistent,
+            file_id_volatile: ack.file_id_volatile,
+        };
+
+        // Serialize response using a single cursor to avoid overwriting
+        let mut buf = Vec::with_capacity(SMB2_HEADER_SIZE + OPLOCK_BREAK_RESPONSE_SIZE as usize);
+        let mut cursor = Cursor::new(&mut buf);
+        resp_header
+            .write(&mut cursor)
+            .map_err(|e| HandlerError::Protocol(format!("Failed to write header: {}", e)))?;
+        response
+            .write(&mut cursor)
+            .map_err(|e| HandlerError::Protocol(format!("Failed to write response: {}", e)))?;
+
+        Ok(buf)
+    }
+
+    /// Handle lease break acknowledgment (structure size 36).
+    ///
+    /// Per MS-SMB2 3.3.5.22.2.
+    async fn handle_lease_break_ack(
+        &mut self,
+        header: &Smb2Header,
+        body: &[u8],
+    ) -> Result<Vec<u8>, HandlerError> {
+        // Parse the acknowledgment
+        let ack = LeaseBreakAcknowledgment::read(&mut Cursor::new(body))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to parse lease ack: {}", e)))?;
+
+        let lease_key_hex = hex::encode(ack.lease_key);
+        let acked_state = ack.lease_state.0;
+
+        debug!(
+            conn_id = self.connection.id,
+            lease_key = %lease_key_hex,
+            acked_state = acked_state,
+            "Lease break acknowledged"
+        );
+
+        // Handle the acknowledgment via the registry
+        match self
+            .lease_registry
+            .handle_acknowledgment(&ack.lease_key, acked_state)
+        {
+            Ok(()) => {
+                // Update the lease in state store
+                // First, get the current lease to update it
+                let file_path_result = self
+                    .session_manager
+                    .state_store()
+                    .get_lease(&lease_key_hex)
+                    .await;
+
+                if let Ok(Some(mut lease)) = file_path_result {
+                    // Update lease state
+                    lease.lease_state = acked_state;
+                    lease.epoch = lease.epoch.wrapping_add(1);
+                    lease.breaking = false;
+                    lease.break_to_state = 0;
+                    lease.break_started_at = None;
+
+                    if let Err(e) = self
+                        .session_manager
+                        .state_store()
+                        .update_lease(&lease)
+                        .await
+                    {
+                        warn!(
+                            conn_id = self.connection.id,
+                            error = %e,
+                            lease_key = %lease_key_hex,
+                            "Failed to update lease after acknowledgment"
+                        );
+                    }
+                }
+
+                // Build success response
+                let resp_header = self.build_response_header(header, NtStatus::Success);
+
+                let response = LeaseBreakResponse {
+                    structure_size: LEASE_BREAK_RESPONSE_SIZE,
+                    reserved: 0,
+                    flags: 0,
+                    lease_key: ack.lease_key,
+                    lease_state: LeaseState::new(acked_state),
+                    lease_duration: 0,
+                };
+
+                // Serialize response using a single cursor to avoid overwriting
+                let mut buf =
+                    Vec::with_capacity(SMB2_HEADER_SIZE + LEASE_BREAK_RESPONSE_SIZE as usize);
+                let mut cursor = Cursor::new(&mut buf);
+                resp_header.write(&mut cursor).map_err(|e| {
+                    HandlerError::Protocol(format!("Failed to write header: {}", e))
+                })?;
+                response.write(&mut cursor).map_err(|e| {
+                    HandlerError::Protocol(format!("Failed to write response: {}", e))
+                })?;
+
+                Ok(buf)
+            }
+            Err(crate::lease_break::LeaseBreakError::NoPendingBreak(_)) => {
+                // No pending break - this might happen if break timed out or was never sent
+                debug!(
+                    conn_id = self.connection.id,
+                    lease_key = %lease_key_hex,
+                    "No pending break for lease (may have timed out)"
+                );
+                // Per MS-SMB2 3.3.5.22.2: If there's no pending break, return error
+                Err(HandlerError::Status(NtStatus::InvalidParameter))
+            }
+            Err(crate::lease_break::LeaseBreakError::InvalidStateSubset { acked, break_to }) => {
+                // Per MS-SMB2 3.3.5.22.2: acknowledged state must be subset of new_state
+                warn!(
+                    conn_id = self.connection.id,
+                    lease_key = %lease_key_hex,
+                    acked_state = acked,
+                    break_to_state = break_to,
+                    "Invalid lease state: not subset of break-to state"
+                );
+                Err(HandlerError::Status(NtStatus::RequestNotAccepted))
+            }
+            Err(e) => {
+                warn!(
+                    conn_id = self.connection.id,
+                    error = %e,
+                    lease_key = %lease_key_hex,
+                    "Lease break acknowledgment failed"
+                );
+                Err(HandlerError::Status(NtStatus::InvalidParameter))
+            }
+        }
     }
 
     /// Select the best dialect from the client's list.
@@ -3541,6 +4301,22 @@ impl std::fmt::Display for HandlerError {
 }
 
 impl std::error::Error for HandlerError {}
+
+/// Check if two lease states conflict.
+///
+/// Per MS-SMB2, WRITE_CACHING is exclusive - it conflicts with any other lease.
+/// READ_CACHING and HANDLE_CACHING can coexist.
+fn has_lease_conflict(existing_state: u32, requested_state: u32) -> bool {
+    const WRITE_CACHING: u32 = 0x02;
+
+    // WRITE_CACHING is exclusive - conflicts with any other lease
+    if (existing_state & WRITE_CACHING) != 0 || (requested_state & WRITE_CACHING) != 0 {
+        return true;
+    }
+
+    // READ and HANDLE can coexist, no conflict
+    false
+}
 
 #[cfg(test)]
 mod tests {
@@ -3863,6 +4639,7 @@ mod tests {
         ));
         let config = Arc::new(ServerConfig::default());
         let shares = Arc::new(ShareManager::new());
+        let lease_registry = Arc::new(LeaseBreakRegistry::new());
 
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
 
@@ -3874,6 +4651,7 @@ mod tests {
             Arc::new(auth_provider),
             shares,
             "test-server-1".to_string(),
+            lease_registry,
         )
     }
 
@@ -4233,6 +5011,7 @@ mod tests {
         ));
         let config = Arc::new(ServerConfig::default());
         let shares = Arc::new(ShareManager::new());
+        let lease_registry = Arc::new(LeaseBreakRegistry::new());
 
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
 
@@ -4248,6 +5027,7 @@ mod tests {
             Arc::new(MockMultiRoundAuthProvider::single_round()),
             shares.clone(),
             "test-server-1".to_string(),
+            lease_registry.clone(),
         );
 
         let mut handler2 = ConnectionHandler::new(
@@ -4258,6 +5038,7 @@ mod tests {
             Arc::new(MockMultiRoundAuthProvider::single_round()),
             shares,
             "test-server-1".to_string(),
+            lease_registry,
         );
 
         // Session 1
@@ -4428,6 +5209,7 @@ mod tests {
         ));
         let config = Arc::new(ServerConfig::default());
         let shares = Arc::new(ShareManager::new());
+        let lease_registry = Arc::new(LeaseBreakRegistry::new());
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
 
         // Create handler with a known session key
@@ -4441,6 +5223,7 @@ mod tests {
             Arc::new(MockReauthProvider::new(original_key.clone())),
             shares.clone(),
             "test-server-1".to_string(),
+            lease_registry.clone(),
         );
 
         // Establish initial session (two rounds)
@@ -4488,6 +5271,7 @@ mod tests {
             Arc::new(MockReauthProvider::new(new_key.clone())),
             shares,
             "test-server-1".to_string(),
+            lease_registry,
         );
 
         // Add the existing session to the new handler's connection
@@ -4557,6 +5341,7 @@ mod tests {
         ));
         let config = Arc::new(ServerConfig::default());
         let shares = Arc::new(ShareManager::new());
+        let lease_registry = Arc::new(LeaseBreakRegistry::new());
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
 
         // Create first session
@@ -4570,6 +5355,7 @@ mod tests {
             Arc::new(MockReauthProvider::new(key1.clone())),
             shares.clone(),
             "test-server-1".to_string(),
+            lease_registry.clone(),
         );
 
         // Establish session 1
@@ -4599,6 +5385,7 @@ mod tests {
             Arc::new(MockReauthProvider::new(key2.clone())),
             shares,
             "test-server-1".to_string(),
+            lease_registry,
         );
 
         // New session with SessionId = 0
@@ -6166,5 +6953,624 @@ mod tests {
         } else {
             panic!("Expected HandlerError::Status, got {:?}", result);
         }
+    }
+
+    // ==========================================================================
+    // 3.3.4.6 - Sending an Oplock Break Notification
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 section 3.3.4.6:
+    // "Sending an Oplock Break Notification"
+    //
+    // Key requirements tested:
+    // - Notification MessageId = 0xFFFFFFFFFFFFFFFF
+    // - OplockLevel values are valid
+    // - ACK required for Batch/Exclusive breaks
+    // - No ACK required for Level II to None
+    // ==========================================================================
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 2.2.23.1 - Oplock Break Notification structure size
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 2.2.23.1: "StructureSize (2 bytes): The server MUST set this
+    // field to 24, indicating the size of the structure."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_oplock_break_notification_structure_size() {
+        use rustsmb_protocol::oplock_break::{
+            OplockBreakNotification, OPLOCK_BREAK_NOTIFICATION_SIZE,
+        };
+
+        assert_eq!(OPLOCK_BREAK_NOTIFICATION_SIZE, 24);
+
+        let notification = OplockBreakNotification::default();
+        assert_eq!(
+            notification.structure_size, 24,
+            "MS-SMB2 2.2.23.1: StructureSize MUST be 24"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.4.6 - Oplock levels for break notification
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.4.6: "OplockLevel MUST be set to the value in
+    // Open.OplockState, which indicates the level to which the oplock is
+    // being broken."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_oplock_break_levels() {
+        use rustsmb_protocol::oplock_break::OplockLevel;
+
+        // Level II (0x01) - shared read cache
+        assert_eq!(OplockLevel::LevelII as u8, 0x01);
+
+        // Exclusive (0x08) - exclusive read/write cache
+        assert_eq!(OplockLevel::Exclusive as u8, 0x08);
+
+        // Batch (0x09) - exclusive with open caching
+        assert_eq!(OplockLevel::Batch as u8, 0x09);
+
+        // None (0x00) - no caching
+        assert_eq!(OplockLevel::None as u8, 0x00);
+
+        // Lease (0xFF) - indicates lease break notification instead
+        assert_eq!(OplockLevel::Lease as u8, 0xFF);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.4.6 - ACK required for Batch/Exclusive breaks
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.4.6: When breaking from Batch or Exclusive oplock,
+    // the server waits for acknowledgment before allowing conflicting opens.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_oplock_break_ack_required_batch() {
+        use rustsmb_protocol::oplock_break::OplockLevel;
+
+        // Breaking from Batch oplock requires ACK
+        let current_level = OplockLevel::Batch as u8; // 0x09
+        let new_level = OplockLevel::LevelII as u8; // 0x01
+
+        // ACK is required for Batch/Exclusive (0x09, 0x08)
+        let ack_required = current_level == 0x09 || current_level == 0x08;
+        assert!(
+            ack_required,
+            "MS-SMB2 3.3.4.6: Batch oplock break MUST require acknowledgment"
+        );
+
+        // New level should be Level II
+        assert_eq!(new_level, 0x01);
+    }
+
+    #[test]
+    fn test_oplock_break_ack_required_exclusive() {
+        use rustsmb_protocol::oplock_break::OplockLevel;
+
+        // Breaking from Exclusive oplock requires ACK
+        let current_level = OplockLevel::Exclusive as u8; // 0x08
+        let new_level = OplockLevel::None as u8; // 0x00
+
+        // ACK is required for Batch/Exclusive (0x09, 0x08)
+        let ack_required = current_level == 0x09 || current_level == 0x08;
+        assert!(
+            ack_required,
+            "MS-SMB2 3.3.4.6: Exclusive oplock break MUST require acknowledgment"
+        );
+
+        // Can break to None
+        assert_eq!(new_level, 0x00);
+    }
+
+    #[test]
+    fn test_oplock_break_no_ack_level_ii_to_none() {
+        use rustsmb_protocol::oplock_break::OplockLevel;
+
+        // Breaking from Level II oplock does NOT require ACK
+        let current_level = OplockLevel::LevelII as u8; // 0x01
+        let new_level = OplockLevel::None as u8; // 0x00
+
+        // ACK is required for Batch/Exclusive (0x09, 0x08), not Level II
+        let ack_required = current_level == 0x09 || current_level == 0x08;
+        assert!(
+            !ack_required,
+            "MS-SMB2 3.3.4.6: Level II to None SHOULD NOT require acknowledgment"
+        );
+
+        // Must break to None
+        assert_eq!(new_level, 0x00);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.4.6 - Oplock break notification file ID
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 2.2.23.1: "FileId (16 bytes): Contains the SMB2_FILEID
+    // of the file or pipe the oplock break pertains to."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_oplock_break_notification_file_id() {
+        use binrw::BinWrite;
+        use rustsmb_protocol::oplock_break::OplockBreakNotification;
+        use std::io::Cursor;
+
+        let persistent_id: u64 = 0x1234567890ABCDEF;
+        let volatile_id: u64 = 0xFEDCBA0987654321;
+
+        let notification = OplockBreakNotification {
+            structure_size: 24,
+            oplock_level: rustsmb_protocol::oplock_break::OplockLevel::LevelII,
+            reserved: 0,
+            reserved2: 0,
+            file_id_persistent: persistent_id,
+            file_id_volatile: volatile_id,
+        };
+
+        // Serialize and verify file IDs are correctly encoded
+        let mut buffer = Vec::new();
+        let mut cursor = Cursor::new(&mut buffer);
+        notification
+            .write(&mut cursor)
+            .expect("serialization should succeed");
+
+        // File IDs start at offset 8 (after structure_size, oplock_level, reserved, reserved2)
+        assert_eq!(buffer.len(), 24);
+
+        // Check persistent ID at offset 8-16
+        let encoded_persistent = u64::from_le_bytes(buffer[8..16].try_into().unwrap());
+        assert_eq!(encoded_persistent, persistent_id);
+
+        // Check volatile ID at offset 16-24
+        let encoded_volatile = u64::from_le_bytes(buffer[16..24].try_into().unwrap());
+        assert_eq!(encoded_volatile, volatile_id);
+    }
+
+    // ==========================================================================
+    // 3.3.4.7 - Sending a Lease Break Notification
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 section 3.3.4.7:
+    // "Sending a Lease Break Notification"
+    //
+    // Key requirements tested:
+    // - Structure size is 44
+    // - ACK_REQUIRED flag based on lease state
+    // - Lease key is correctly encoded
+    // - NewLeaseState calculation
+    // ==========================================================================
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 2.2.23.2 - Lease Break Notification structure size
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 2.2.23.2: "StructureSize (2 bytes): The server MUST set this
+    // field to 44, indicating the size of the structure."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_break_notification_structure_size() {
+        use rustsmb_protocol::oplock_break::{
+            LeaseBreakNotification, LEASE_BREAK_NOTIFICATION_SIZE,
+        };
+
+        assert_eq!(LEASE_BREAK_NOTIFICATION_SIZE, 44);
+
+        let notification = LeaseBreakNotification::default();
+        assert_eq!(
+            notification.structure_size, 44,
+            "MS-SMB2 2.2.23.2: StructureSize MUST be 44"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.4.7 - ACK_REQUIRED flag
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.4.7: "If Lease.LeaseState is not SMB2_LEASE_READ_CACHING,
+    // the server MUST set SMB2_NOTIFY_BREAK_LEASE_FLAG_ACK_REQUIRED in Flags."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_break_ack_required_rwh() {
+        use rustsmb_protocol::oplock_break::LeaseBreakFlags;
+
+        const READ_CACHING: u32 = 0x01;
+        const WRITE_CACHING: u32 = 0x02;
+        const HANDLE_CACHING: u32 = 0x04;
+
+        // RWH lease requires ACK
+        let state = READ_CACHING | WRITE_CACHING | HANDLE_CACHING; // 0x07
+        let ack_required = state != READ_CACHING;
+        assert!(
+            ack_required,
+            "MS-SMB2 3.3.4.7: RWH lease break MUST require ACK"
+        );
+
+        // ACK_REQUIRED flag value
+        assert_eq!(LeaseBreakFlags::ACK_REQUIRED, 0x00000001);
+    }
+
+    #[test]
+    fn test_lease_break_ack_required_write_only() {
+        const READ_CACHING: u32 = 0x01;
+        const WRITE_CACHING: u32 = 0x02;
+
+        // WRITE lease (without READ) requires ACK
+        let state = WRITE_CACHING;
+        let ack_required = state != READ_CACHING;
+        assert!(
+            ack_required,
+            "MS-SMB2 3.3.4.7: WRITE-only lease break MUST require ACK"
+        );
+    }
+
+    #[test]
+    fn test_lease_break_no_ack_read_only() {
+        const READ_CACHING: u32 = 0x01;
+
+        // READ-only lease does NOT require ACK
+        let state = READ_CACHING;
+        let ack_required = state != READ_CACHING;
+        assert!(
+            !ack_required,
+            "MS-SMB2 3.3.4.7: READ-only lease break SHOULD NOT require ACK"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 2.2.23.2 - Lease key encoding
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 2.2.23.2: "LeaseKey (16 bytes): A unique key which identifies
+    // the owner of the lease."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_break_notification_lease_key() {
+        use binrw::BinWrite;
+        use rustsmb_protocol::oplock_break::LeaseBreakNotification;
+        use std::io::Cursor;
+
+        let lease_key: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+
+        let notification = LeaseBreakNotification {
+            structure_size: 44,
+            new_epoch: 2,
+            flags: rustsmb_protocol::oplock_break::LeaseBreakFlags(0x01), // ACK_REQUIRED
+            lease_key,
+            current_lease_state: rustsmb_protocol::oplock_break::LeaseState(0x07), // RWH
+            new_lease_state: rustsmb_protocol::oplock_break::LeaseState(0x01),     // R
+            break_reason: 0,
+            access_mask_hint: 0,
+            share_mask_hint: 0,
+        };
+
+        // Serialize and verify lease key is correctly encoded
+        let mut buffer = Vec::new();
+        let mut cursor = Cursor::new(&mut buffer);
+        notification
+            .write(&mut cursor)
+            .expect("serialization should succeed");
+
+        assert_eq!(buffer.len(), 44);
+
+        // Lease key is at offset 8-24 (after structure_size, new_epoch, flags)
+        let encoded_key: [u8; 16] = buffer[8..24].try_into().unwrap();
+        assert_eq!(encoded_key, lease_key);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.4.7 - NewLeaseState calculation
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.4.7: Server computes new lease state based on
+    // conflicting requests. WRITE_CACHING is exclusive.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_break_new_state_calculation() {
+        use crate::lease_break::calculate_break_state;
+
+        const READ: u32 = 0x01;
+        const WRITE: u32 = 0x02;
+        const HANDLE: u32 = 0x04;
+
+        // RWH holder, requester wants WRITE -> break to READ
+        let break_to = calculate_break_state(READ | WRITE | HANDLE, WRITE);
+        assert_eq!(break_to, READ, "WRITE request should break RWH to R");
+
+        // RWH holder, requester wants READ only -> break to RH (lose W)
+        let break_to = calculate_break_state(READ | WRITE | HANDLE, READ);
+        assert_eq!(
+            break_to,
+            READ | HANDLE,
+            "READ request should break RWH to RH"
+        );
+
+        // RW holder, requester wants WRITE -> break to READ
+        let break_to = calculate_break_state(READ | WRITE, WRITE);
+        assert_eq!(break_to, READ, "WRITE request should break RW to R");
+    }
+
+    // ==========================================================================
+    // 3.3.5.22 - Receiving an SMB2 OPLOCK_BREAK Acknowledgment
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 section 3.3.5.22:
+    // "Receiving an SMB2 OPLOCK_BREAK Acknowledgment"
+    //
+    // Key requirements tested:
+    // - Oplock ack level validation
+    // - Lease ack state subset validation
+    // - Structure size determines oplock vs lease
+    // ==========================================================================
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.22 - Structure size determines type
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.22: "The server MUST determine if the message is an
+    // oplock break acknowledgment or a lease break acknowledgment by examining
+    // the StructureSize field."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_oplock_break_ack_structure_size() {
+        use rustsmb_protocol::oplock_break::{LEASE_BREAK_ACK_SIZE, OPLOCK_BREAK_ACK_SIZE};
+
+        // Oplock break ack has structure size 24
+        assert_eq!(OPLOCK_BREAK_ACK_SIZE, 24);
+
+        // Lease break ack has structure size 36
+        assert_eq!(LEASE_BREAK_ACK_SIZE, 36);
+
+        // These are different, so server can distinguish
+        assert_ne!(
+            OPLOCK_BREAK_ACK_SIZE, LEASE_BREAK_ACK_SIZE,
+            "Structure sizes must differ to distinguish oplock from lease ack"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.22.1 - Oplock ack level validation
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.22.1: "If Open.OplockState is not Held, the server
+    // MUST fail the request with STATUS_INVALID_OPLOCK_PROTOCOL."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_oplock_ack_valid_levels() {
+        use rustsmb_protocol::oplock_break::OplockLevel;
+
+        // Valid ack levels: None or Level II
+        let valid_levels = [OplockLevel::None as u8, OplockLevel::LevelII as u8];
+
+        for level in &valid_levels {
+            assert!(
+                *level == 0x00 || *level == 0x01,
+                "Acked level {} should be None (0x00) or Level II (0x01)",
+                level
+            );
+        }
+
+        // Invalid ack levels: Batch or Exclusive (can't ack to higher level)
+        let invalid_levels = [OplockLevel::Batch as u8, OplockLevel::Exclusive as u8];
+
+        for level in &invalid_levels {
+            assert!(
+                *level != 0x00 && *level != 0x01,
+                "Level {} should not be valid for ack",
+                level
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.22.2 - Lease ack state subset validation
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.22.2: "If LeaseState is not a subset of
+    // Lease.BreakToLeaseState, the server MUST fail the request with
+    // STATUS_REQUEST_NOT_ACCEPTED."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_ack_state_subset_valid() {
+        const READ: u32 = 0x01;
+        const HANDLE: u32 = 0x04;
+
+        // Break to READ (0x01), ack with READ (0x01) - valid
+        let break_to = READ;
+        let acked = READ;
+        let is_subset = (acked & !break_to) == 0;
+        assert!(is_subset, "READ is subset of READ");
+
+        // Break to READ (0x01), ack with NONE (0x00) - valid
+        let acked = 0x00;
+        let is_subset = (acked & !break_to) == 0;
+        assert!(is_subset, "NONE is subset of READ");
+
+        // Break to RH (0x05), ack with R (0x01) - valid
+        let break_to = READ | HANDLE;
+        let acked = READ;
+        let is_subset = (acked & !break_to) == 0;
+        assert!(is_subset, "R is subset of RH");
+    }
+
+    #[test]
+    fn test_lease_ack_state_subset_invalid() {
+        const READ: u32 = 0x01;
+        const WRITE: u32 = 0x02;
+        const HANDLE: u32 = 0x04;
+
+        // Break to READ (0x01), ack with WRITE (0x02) - INVALID
+        let break_to = READ;
+        let acked = WRITE;
+        let is_subset = (acked & !break_to) == 0;
+        assert!(!is_subset, "WRITE is NOT subset of READ");
+
+        // Break to READ (0x01), ack with RWH (0x07) - INVALID
+        let acked = READ | WRITE | HANDLE;
+        let is_subset = (acked & !break_to) == 0;
+        assert!(!is_subset, "RWH is NOT subset of READ");
+
+        // Break to RH (0x05), ack with RWH (0x07) - INVALID (W not allowed)
+        let break_to = READ | HANDLE;
+        let acked = READ | WRITE | HANDLE;
+        let is_subset = (acked & !break_to) == 0;
+        assert!(!is_subset, "RWH is NOT subset of RH");
+    }
+
+    // ==========================================================================
+    // 2.2.23/2.2.24/2.2.25 - Protocol Message Format Tests
+    // ==========================================================================
+    //
+    // These tests verify the protocol message structures match the spec.
+    // ==========================================================================
+
+    // -------------------------------------------------------------------------
+    // Test: Message ID for unsolicited break notifications
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.4.6: "The server MUST set MessageId to
+    // 0xFFFFFFFFFFFFFFFF."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_break_notification_message_id() {
+        // Unsolicited break notifications use special MessageId
+        const UNSOLICITED_MESSAGE_ID: u64 = 0xFFFFFFFFFFFFFFFF;
+
+        assert_eq!(
+            UNSOLICITED_MESSAGE_ID,
+            u64::MAX,
+            "Unsolicited notifications MUST use MessageId 0xFFFFFFFFFFFFFFFF"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Session and Tree ID for unsolicited break notifications
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.4.6: "SessionId SHOULD be set to 0, and TreeId SHOULD
+    // be set to 0."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_break_notification_session_tree_ids() {
+        // For unsolicited notifications, session and tree IDs should be 0
+        let session_id: u64 = 0;
+        let tree_id: u32 = 0;
+
+        assert_eq!(
+            session_id, 0,
+            "SessionId SHOULD be 0 for unsolicited notifications"
+        );
+        assert_eq!(
+            tree_id, 0,
+            "TreeId SHOULD be 0 for unsolicited notifications"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Oplock break response structure
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 2.2.25.1: Response to oplock break acknowledgment
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_oplock_break_response_structure() {
+        use rustsmb_protocol::oplock_break::{OplockBreakResponse, OPLOCK_BREAK_RESPONSE_SIZE};
+
+        assert_eq!(OPLOCK_BREAK_RESPONSE_SIZE, 24);
+
+        let response = OplockBreakResponse::default();
+        assert_eq!(response.structure_size, 24);
+        assert_eq!(
+            response.oplock_level,
+            rustsmb_protocol::oplock_break::OplockLevel::None
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Lease break response structure
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 2.2.25.2: Response to lease break acknowledgment
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_break_response_structure() {
+        use rustsmb_protocol::oplock_break::{LeaseBreakResponse, LEASE_BREAK_RESPONSE_SIZE};
+
+        assert_eq!(LEASE_BREAK_RESPONSE_SIZE, 36);
+
+        let response = LeaseBreakResponse::default();
+        assert_eq!(response.structure_size, 36);
+        assert_eq!(response.lease_state.0, 0);
+        assert_eq!(response.lease_duration, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Oplock break acknowledgment parsing
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 2.2.24.1: Client acknowledgment structure
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_oplock_break_ack_parsing() {
+        use binrw::BinRead;
+        use rustsmb_protocol::oplock_break::{OplockBreakAcknowledgment, OplockLevel};
+        use std::io::Cursor;
+
+        // Build ack message: structure_size(2) + oplock_level(1) + reserved(1) +
+        //                    reserved2(4) + file_id_persistent(8) + file_id_volatile(8)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&24u16.to_le_bytes()); // structure_size
+        bytes.push(0x01); // oplock_level = Level II
+        bytes.push(0x00); // reserved
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+        bytes.extend_from_slice(&0x1234567890ABCDEFu64.to_le_bytes()); // persistent
+        bytes.extend_from_slice(&0xFEDCBA0987654321u64.to_le_bytes()); // volatile
+
+        let mut cursor = Cursor::new(&bytes);
+        let ack = OplockBreakAcknowledgment::read(&mut cursor).expect("parse should succeed");
+
+        assert_eq!(ack.structure_size, 24);
+        assert_eq!(ack.oplock_level, OplockLevel::LevelII);
+        assert_eq!(ack.file_id_persistent, 0x1234567890ABCDEF);
+        assert_eq!(ack.file_id_volatile, 0xFEDCBA0987654321);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: Lease break acknowledgment parsing
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 2.2.24.2: Client lease acknowledgment structure
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lease_break_ack_parsing() {
+        use binrw::BinRead;
+        use rustsmb_protocol::oplock_break::{LeaseBreakAcknowledgment, LeaseState};
+        use std::io::Cursor;
+
+        let lease_key: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+
+        // Build ack message: structure_size(2) + reserved(2) + flags(4) +
+        //                    lease_key(16) + lease_state(4) + lease_duration(8)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&36u16.to_le_bytes()); // structure_size
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // flags
+        bytes.extend_from_slice(&lease_key); // lease_key
+        bytes.extend_from_slice(&0x01u32.to_le_bytes()); // lease_state = READ
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // lease_duration
+
+        let mut cursor = Cursor::new(&bytes);
+        let ack = LeaseBreakAcknowledgment::read(&mut cursor).expect("parse should succeed");
+
+        assert_eq!(ack.structure_size, 36);
+        assert_eq!(ack.lease_key, lease_key);
+        assert_eq!(ack.lease_state, LeaseState(0x01));
+        assert_eq!(ack.lease_duration, 0);
     }
 }

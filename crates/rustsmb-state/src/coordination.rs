@@ -86,6 +86,15 @@ pub struct LeaseEntry {
     pub epoch: u16,
     /// Creation timestamp.
     pub created_at: u64,
+    /// Whether a break is in progress.
+    #[serde(default)]
+    pub breaking: bool,
+    /// Target state for the break (used during break acknowledgment).
+    #[serde(default)]
+    pub break_to_state: u32,
+    /// When break started (Unix timestamp, for timeout tracking).
+    #[serde(default)]
+    pub break_started_at: Option<u64>,
 }
 
 impl LeaseEntry {
@@ -118,6 +127,9 @@ impl LeaseEntry {
             lease_state,
             epoch: 1,
             created_at: now,
+            breaking: false,
+            break_to_state: 0,
+            break_started_at: None,
         }
     }
 

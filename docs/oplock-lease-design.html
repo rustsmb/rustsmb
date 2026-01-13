@@ -358,34 +358,398 @@ EXEC
 <code>delete_leases_for_server(failed_server_id)</code></li>
 <li>Stale leases removed from Redis</li>
 </ol>
-<h2 id="future-enhancements-phase-15">Future Enhancements (Phase
-15+)</h2>
-<h3 id="same-server-oplock-breaks">Same-Server Oplock Breaks</h3>
-<p>For clients on the same server, we can implement full oplock
-breaks:</p>
-<div class="sourceCode" id="cb8"><pre
-class="sourceCode rust"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LeaseBreakManager <span class="op">{</span></span>
-<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Map lease_key → connection channel</span></span>
-<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    lease_connections<span class="op">:</span> DashMap<span class="op">&lt;</span><span class="dt">String</span><span class="op">,</span> <span class="pp">mpsc::</span>Sender<span class="op">&lt;</span>LeaseBreakNotification<span class="op">&gt;&gt;,</span></span>
-<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Pending break acknowledgments</span></span>
-<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    pending_breaks<span class="op">:</span> DashMap<span class="op">&lt;</span><span class="dt">String</span><span class="op">,</span> PendingBreak<span class="op">&gt;,</span></span>
-<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p>Flow: 1. Detect conflict with lease on same server 2. Send
-<code>LeaseBreakNotification</code> via channel 3. Wait up to 35 seconds
-for <code>LeaseBreakAcknowledgment</code> 4. Client flushes cached
-writes, acknowledges 5. Grant conflicting lease</p>
-<h3 id="cross-server-oplock-breaks">Cross-Server Oplock Breaks</h3>
-<p>Options for future implementation: 1. <strong>Redis Pub/Sub</strong>:
-Publish break request, servers subscribe 2. <strong>Coordinator
-RPC</strong>: Route breaks through coordinator service 3. <strong>Direct
-gRPC</strong>: Server-to-server communication</p>
+<h2 id="phase-18-oplocklease-break-notifications">Phase 18: Oplock/Lease
+Break Notifications</h2>
+<p>This section documents the implementation design for same-server
+oplock/lease break notifications per MS-SMB2 specification sections
+2.2.23-2.2.25 and 3.3.4.6-3.3.4.7.</p>
+<h3 id="architecture-1">Architecture</h3>
+<pre><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│                           LeaseBreakRegistry                                 │
+│  (Arc&lt;&gt; shared across all connections, held in SmbServer)                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  lease_connections: DashMap&lt;lease_key, LeaseConnectionEntry&gt;                │
+│  pending_breaks: DashMap&lt;break_id, PendingBreak&gt;                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+         │
+         │  mpsc channels
+         ▼
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│  ConnectionHandler│    │  ConnectionHandler│    │  ConnectionHandler│
+│  break_rx: Receiver│   │  break_rx: Receiver│   │  break_rx: Receiver│
+└──────────────────┘    └──────────────────┘    └──────────────────┘</code></pre>
+<p><strong>Key design decisions:</strong> - Same-server breaks use local
+mpsc channels (no network hop) - Cross-server conflicts continue using
+reduced-grant strategy (NOT implemented - see below) - 35-second break
+timeout per MS-SMB2 spec - MessageId=0xFFFFFFFFFFFFFFFF for unsolicited
+notifications</p>
+<h3 id="data-structures-1">Data Structures</h3>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">/// Registry for managing lease break notifications across connections.</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LeaseBreakRegistry <span class="op">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Map from lease_key (hex) to connection entry.</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    lease_connections<span class="op">:</span> DashMap<span class="op">&lt;</span><span class="dt">String</span><span class="op">,</span> LeaseConnectionEntry<span class="op">&gt;,</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Map from break_id to pending break info.</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    pending_breaks<span class="op">:</span> DashMap<span class="op">&lt;</span><span class="dt">u64</span><span class="op">,</span> PendingBreak<span class="op">&gt;,</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Next break ID.</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    next_break_id<span class="op">:</span> AtomicU64<span class="op">,</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Break timeout duration (35 seconds per MS-SMB2).</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    break_timeout<span class="op">:</span> Duration<span class="op">,</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="co">/// Entry for a connection that owns a lease.</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LeaseConnectionEntry <span class="op">{</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Channel to send break notifications to this connection.</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> break_tx<span class="op">:</span> <span class="pp">mpsc::</span>Sender<span class="op">&lt;</span>LeaseBreakEvent<span class="op">&gt;,</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Server ID that owns this connection.</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> server_id<span class="op">:</span> <span class="dt">String</span><span class="op">,</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Client GUID for this connection.</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> client_guid<span class="op">:</span> <span class="dt">String</span><span class="op">,</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="co">/// A lease break event to be sent to a client.</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LeaseBreakEvent <span class="op">{</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Lease key being broken.</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> lease_key<span class="op">:</span> [<span class="dt">u8</span><span class="op">;</span> <span class="dv">16</span>]<span class="op">,</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Current lease state before break.</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> current_state<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// New lease state to transition to.</span></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> new_state<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// New epoch (SMB 3.x).</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> new_epoch<span class="op">:</span> <span class="dt">u16</span><span class="op">,</span></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Whether acknowledgment is required.</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> ack_required<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Unique break ID for tracking acknowledgment.</span></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> break_id<span class="op">:</span> <span class="dt">u64</span><span class="op">,</span></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a><span class="co">/// Result of a lease break attempt.</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">enum</span> LeaseBreakResult <span class="op">{</span></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Client acknowledged the break.</span></span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a>    Acknowledged <span class="op">{</span> new_state<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span> epoch<span class="op">:</span> <span class="dt">u16</span> <span class="op">},</span></span>
+<span id="cb9-43"><a href="#cb9-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Break timed out (forced to NONE).</span></span>
+<span id="cb9-44"><a href="#cb9-44" aria-hidden="true" tabindex="-1"></a>    TimedOut<span class="op">,</span></span>
+<span id="cb9-45"><a href="#cb9-45" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Client disconnected during break.</span></span>
+<span id="cb9-46"><a href="#cb9-46" aria-hidden="true" tabindex="-1"></a>    Disconnected<span class="op">,</span></span>
+<span id="cb9-47"><a href="#cb9-47" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="leaseentry-extensions">LeaseEntry Extensions</h3>
+<p>Add fields to <code>LeaseEntry</code> in <code>coordination.rs</code>
+for break tracking:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> LeaseEntry <span class="op">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... existing fields ...</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Whether a break is in progress.</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> breaking<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// Target state for the break.</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> break_to_state<span class="op">:</span> <span class="dt">u32</span><span class="op">,</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// When break started (for timeout).</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> break_started_at<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">u64</span><span class="op">&gt;,</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="implementation-phases">Implementation Phases</h3>
+<h4 id="phase-18a-core-infrastructure">Phase 18A: Core
+Infrastructure</h4>
+<p>Create new module
+<code>crates/rustsmb-server/src/lease_break.rs</code>: -
+<code>LeaseBreakRegistry</code> struct with DashMap-based storage -
+<code>LeaseBreakEvent</code>, <code>PendingBreak</code>,
+<code>LeaseBreakResult</code> types - Methods:
+<code>register_lease()</code>, <code>unregister_lease()</code>,
+<code>break_lease()</code>, <code>handle_acknowledgment()</code> -
+Background timeout processor task</p>
+<h4 id="phase-18b-connection-handler-integration">Phase 18B: Connection
+Handler Integration</h4>
+<p>Modify <code>ConnectionHandler</code>: 1. Add
+<code>break_rx: mpsc::Receiver&lt;LeaseBreakEvent&gt;</code> field 2.
+Add <code>lease_registry: Arc&lt;LeaseBreakRegistry&gt;</code> field 3.
+Change <code>run()</code> loop to use <code>tokio::select!</code>:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="cf">loop</span> <span class="op">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>        message_result <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>read_message() <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>            <span class="co">// Handle client request</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Some</span>(break_event) <span class="op">=</span> <span class="kw">self</span><span class="op">.</span>break_rx<span class="op">.</span>recv() <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>            <span class="kw">self</span><span class="op">.</span>send_lease_break_notification(<span class="op">&amp;</span>break_event)<span class="op">.</span><span class="kw">await</span><span class="op">?;</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ol start="4" type="1">
+<li>Implement <code>send_lease_break_notification()</code> to build and
+send notification with:
+<ul>
+<li>MessageId = 0xFFFFFFFFFFFFFFFF</li>
+<li>SessionId = 0, TreeId = 0</li>
+<li>No signing (per MS-SMB2 3.3.4.7)</li>
+</ul></li>
+</ol>
+<h4 id="phase-18c-create-handler-changes">Phase 18C: CREATE Handler
+Changes</h4>
+<p>Modify CREATE handler after <code>check_and_create_lease()</code>: 1.
+Partition conflicts by <code>server_id == self.server_id</code> 2. For
+same-server conflicts: - Calculate break-to state using
+<code>calculate_break_state()</code> - Call
+<code>lease_registry.break_lease()</code> (async, waits for ack/timeout)
+- Update lease state in StateStore 3. For cross-server conflicts:
+continue with reduced grant (existing behavior) 4. Register lease with
+<code>lease_registry.register_lease()</code></p>
+<h4 id="phase-18d-oplock_break-handler">Phase 18D: OPLOCK_BREAK
+Handler</h4>
+<p>Replace <code>STATUS_NOT_SUPPORTED</code> with proper handling: 1.
+Parse acknowledgment (detect lease vs oplock by structure_size: 36 for
+lease, 24 for oplock) 2. Validate lease state is subset of break-to
+state (per MS-SMB2 3.3.5.22.2) 3. Call
+<code>lease_registry.handle_acknowledgment()</code> 4. Update lease in
+StateStore 5. Return LeaseBreakResponse/OplockBreakResponse</p>
+<h4 id="phase-18e-close-handler-integration">Phase 18E: CLOSE Handler
+Integration</h4>
+<p>On CLOSE: 1. Call <code>lease_registry.unregister_lease()</code> for
+handle’s lease 2. Delete lease from StateStore (existing code)</p>
+<p>On disconnect: 1. Unregister all leases for this connection</p>
+<h3 id="protocol-requirements-ms-smb2">Protocol Requirements
+(MS-SMB2)</h3>
+<ol type="1">
+<li><strong>Notification format</strong> (Section 2.2.23.2):
+<ul>
+<li>Structure size: 44 bytes for lease break</li>
+<li>Flags: ACK_REQUIRED (0x01) unless READ_CACHING only</li>
+<li>Epoch: increment on each state change</li>
+</ul></li>
+<li><strong>When ACK required</strong> (Section 3.3.4.7):
+<ul>
+<li>READ_CACHING only: No ACK required, break completes immediately</li>
+<li>Any other state: ACK required, start 35s timer</li>
+</ul></li>
+<li><strong>Acknowledgment validation</strong> (Section 3.3.5.22.2):
+<ul>
+<li>LeaseState MUST be subset of NewLeaseState from notification</li>
+<li>Reject with STATUS_REQUEST_NOT_ACCEPTED if not</li>
+</ul></li>
+<li><strong>Timeout handling</strong> (Section 3.3.6.5):
+<ul>
+<li>If timer expires and Lease.Breaking is TRUE</li>
+<li>Force LeaseState to NONE</li>
+<li>Set Lease.Breaking to FALSE</li>
+</ul></li>
+</ol>
+<h3 id="files-to-modify">Files to Modify</h3>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 60%" />
+</colgroup>
+<thead>
+<tr>
+<th>File</th>
+<th>Changes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crates/rustsmb-server/src/lease_break.rs</code></td>
+<td>NEW - LeaseBreakRegistry, events, timeout handling</td>
+</tr>
+<tr>
+<td><code>crates/rustsmb-server/src/lib.rs</code></td>
+<td>Export lease_break module</td>
+</tr>
+<tr>
+<td><code>crates/rustsmb-server/src/server.rs</code></td>
+<td>Create Arc<LeaseBreakRegistry>, pass to handlers</td>
+</tr>
+<tr>
+<td><code>crates/rustsmb-server/src/handler.rs</code></td>
+<td>Channel integration, select! loop, break notification, OPLOCK_BREAK
+handler</td>
+</tr>
+<tr>
+<td><code>crates/rustsmb-state/src/coordination.rs</code></td>
+<td>Add breaking/break_to_state to LeaseEntry</td>
+</tr>
+<tr>
+<td><code>crates/rustsmb-server/Cargo.toml</code></td>
+<td>Add dashmap dependency</td>
+</tr>
+</tbody>
+</table>
+<h3 id="unit-tests-ms-smb2-compliance">Unit Tests (MS-SMB2
+Compliance)</h3>
+<p>Unit tests organized by MS-SMB2 specification chapter:</p>
+<h4 id="tests---sending-a-lease-break-notification">3.3.4.7 Tests -
+Sending a Lease Break Notification</h4>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_notification_structure_size() <span class="op">{</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Verify structure size is 44 bytes per MS-SMB2 2.2.23.2</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_notification_message_id() <span class="op">{</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// MessageId MUST be 0xFFFFFFFFFFFFFFFF per MS-SMB2 3.3.4.7</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_notification_session_tree_zero() <span class="op">{</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SessionId and TreeId MUST be 0 per MS-SMB2 3.3.4.7</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_ack_required_non_read() <span class="op">{</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ACK_REQUIRED flag set when state includes WRITE or HANDLE</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Per MS-SMB2 3.3.4.7: &quot;If Lease.LeaseState is not SMB2_LEASE_READ_CACHING&quot;</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_no_ack_required_read_only() <span class="op">{</span></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">// No ACK required when breaking to READ_CACHING only</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Per MS-SMB2 3.3.4.7: &quot;Otherwise the server does not require acknowledgment&quot;</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_epoch_increment() <span class="op">{</span></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// NewEpoch is incremented on each break per MS-SMB2 3.3.4.7</span></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_not_signed() <span class="op">{</span></span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Break notifications should NOT be signed per MS-SMB2 3.3.4.7</span></span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 id="tests---receiving-oplock_break-acknowledgment">3.3.5.22 Tests -
+Receiving OPLOCK_BREAK Acknowledgment</h4>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_ack_state_must_be_subset() <span class="op">{</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// LeaseState MUST be subset of Lease.BreakToLeaseState</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Per MS-SMB2 3.3.5.22.2: reject with STATUS_REQUEST_NOT_ACCEPTED</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_ack_invalid_lease_key() <span class="op">{</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Return STATUS_OBJECT_NAME_NOT_FOUND if lease not found</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_ack_not_breaking() <span class="op">{</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Return error if lease is not in Breaking state</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_ack_updates_state() <span class="op">{</span></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">// After ACK, Lease.LeaseState = acknowledged state</span></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Lease.Breaking = FALSE per MS-SMB2 3.3.5.22.2</span></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_oplock_ack_structure_size_24() <span class="op">{</span></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Oplock ACK has structure size 24, lease ACK has 36</span></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_oplock_ack_file_not_found() <span class="op">{</span></span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Return STATUS_FILE_CLOSED if handle not found</span></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 id="tests---lease-break-acknowledgment-timer-event">3.3.6.5 Tests -
+Lease Break Acknowledgment Timer Event</h4>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_timeout_35_seconds() <span class="op">{</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Break times out after 35 seconds per MS-SMB2</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_timeout_forces_none() <span class="op">{</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// On timeout, LeaseState forced to NONE per MS-SMB2 3.3.6.5</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_lease_break_timeout_clears_breaking() <span class="op">{</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">// On timeout, Lease.Breaking set to FALSE</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 id="leasebreakregistry-tests">LeaseBreakRegistry Tests</h4>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_registry_register_lease() <span class="op">{</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Register lease creates entry with channel</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_registry_unregister_lease() <span class="op">{</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Unregister removes entry</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_registry_break_sends_event() <span class="op">{</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">// break_lease() sends LeaseBreakEvent via channel</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_registry_handle_ack_completes_break() <span class="op">{</span></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// handle_acknowledgment() notifies waiting caller</span></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_registry_concurrent_breaks() <span class="op">{</span></span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Multiple concurrent breaks to different leases</span></span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb15-25"><a href="#cb15-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-26"><a href="#cb15-26" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb15-27"><a href="#cb15-27" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> test_registry_break_nonexistent_lease() <span class="op">{</span></span>
+<span id="cb15-28"><a href="#cb15-28" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Breaking unregistered lease returns appropriate error</span></span>
+<span id="cb15-29"><a href="#cb15-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 id="integration-tests">Integration Tests</h4>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>test<span class="at">]</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> test_two_clients_lease_break_flow() <span class="op">{</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client A opens file with RWH lease</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client B opens same file</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client A receives break notification</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client A acknowledges with reduced state</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client B&#39;s open completes</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>test<span class="at">]</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> test_lease_break_timeout_integration() <span class="op">{</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client A opens file with RWH lease</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client B opens same file</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client A does NOT acknowledge</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">// After 35s timeout, Client B&#39;s open completes</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>test<span class="at">]</span></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> test_client_disconnect_during_break() <span class="op">{</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client A opens file with lease</span></span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client B opens same file (triggers break)</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client A disconnects before ACK</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Client B&#39;s open completes</span></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="cross-server-lease-breaks-not-implemented">Cross-Server Lease
+Breaks (NOT IMPLEMENTED)</h3>
+<p>Cross-server lease breaks require inter-server communication and are
+significantly more complex. The current design continues using the
+<strong>reduced grant</strong> strategy from Phase 14 for cross-server
+conflicts:</p>
+<ul>
+<li>When Server B detects a conflict with a lease held on Server A, it
+grants a reduced lease state to the new client</li>
+<li>No break notification is sent to the client on Server A</li>
+<li>The file open still succeeds with reduced caching capability</li>
+</ul>
+<p>Future options for cross-server breaks (not planned): 1.
+<strong>Redis Pub/Sub</strong>: Publish break request, servers subscribe
+2. <strong>Coordinator RPC</strong>: Route breaks through coordinator
+service 3. <strong>Direct gRPC</strong>: Server-to-server
+communication</p>
 <h2 id="references">References</h2>
 <ul>
 <li><a
 href="https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/">MS-SMB2:
 Server Message Block Protocol Version 2</a></li>
-<li>Section 3.3.1.4: Lease Management</li>
-<li>Section 2.2.13.2: SMB2 CREATE Request - Lease contexts</li>
+<li>Section 2.2.23: SMB2 OPLOCK_BREAK Notification</li>
+<li>Section 2.2.24: SMB2 OPLOCK_BREAK Acknowledgment</li>
+<li>Section 3.3.4.6: Sending an Oplock Break Notification</li>
+<li>Section 3.3.4.7: Sending a Lease Break Notification</li>
+<li>Section 3.3.5.22: Receiving an SMB2 OPLOCK_BREAK Acknowledgment</li>
+<li>Section 3.3.6.5: Lease Break Acknowledgment Timer Event</li>
 </ul>
 
 </body>
