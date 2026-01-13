@@ -394,24 +394,26 @@ where
             }
         }
 
-        // Commands that require a valid tree connection
+        // Commands that require a valid tree connection (MS-SMB2 3.3.5.2.11)
         let requires_tree = matches!(
             header.command,
-            Smb2Command::Create
+            Smb2Command::TreeDisconnect
+                | Smb2Command::Create
                 | Smb2Command::Close
                 | Smb2Command::Flush
                 | Smb2Command::Read
                 | Smb2Command::Write
                 | Smb2Command::Lock
+                | Smb2Command::Ioctl
                 | Smb2Command::QueryDirectory
                 | Smb2Command::ChangeNotify
                 | Smb2Command::QueryInfo
                 | Smb2Command::SetInfo
         );
 
-        // Validate tree_id for commands that require it
+        // Validate tree_id for commands that require it (MS-SMB2 3.3.5.2.11)
+        // Note: tree_id = 0 is NOT valid for tree-requiring commands
         if requires_tree
-            && header.tree_id != 0
             && self
                 .session_manager
                 .get_tree(header.session_id, header.tree_id)
@@ -721,6 +723,37 @@ where
             return Err(HandlerError::Status(NtStatus::InvalidParameter));
         }
 
+        Ok(())
+    }
+
+    /// Validates that the header's tree_id matches the handle's tree_id.
+    ///
+    /// Per MS-SMB2, operations on a file handle must use the correct tree_id
+    /// that was used when the handle was created.
+    ///
+    /// # Arguments
+    ///
+    /// * `header` - The SMB2 header containing the tree_id from the request
+    /// * `handle` - The handle state containing the tree_id from when it was opened
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Tree IDs match
+    /// * `Err(HandlerError::Status(NtStatus::InvalidParameter))` - Tree IDs don't match
+    fn validate_handle_tree_id(
+        &self,
+        header: &Smb2Header,
+        handle: &rustsmb_state::HandleState,
+    ) -> Result<(), HandlerError> {
+        if header.tree_id != handle.tree_id {
+            debug!(
+                conn_id = self.connection.id,
+                header_tree_id = header.tree_id,
+                handle_tree_id = handle.tree_id,
+                "Tree ID mismatch: header tree_id does not match handle's tree_id"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
         Ok(())
     }
 }
@@ -2704,6 +2737,9 @@ where
             }
         };
 
+        // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
+        self.validate_handle_tree_id(header, &handle)?;
+
         // Delete lease if present
         if let Some(lease_key) = &handle.lease_key {
             // Unregister from break registry first (synchronous)
@@ -2790,10 +2826,13 @@ where
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
 
-        // Get tree and backend
+        // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
+        self.validate_handle_tree_id(header, &handle)?;
+
+        // Get tree and backend (use header.tree_id since we validated it matches)
         let tree = self
             .session_manager
-            .get_tree(header.session_id, handle.tree_id)
+            .get_tree(header.session_id, header.tree_id)
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
@@ -2883,10 +2922,13 @@ where
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
 
-        // Get tree and backend
+        // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
+        self.validate_handle_tree_id(header, &handle)?;
+
+        // Get tree and backend (use header.tree_id since we validated it matches)
         let tree = self
             .session_manager
-            .get_tree(header.session_id, handle.tree_id)
+            .get_tree(header.session_id, header.tree_id)
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
@@ -2973,6 +3015,9 @@ where
         if handle.session_id != header.session_id {
             return Err(HandlerError::Status(NtStatus::FileClosed));
         }
+
+        // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
+        self.validate_handle_tree_id(header, &handle)?;
 
         // Parse lock elements
         let lock_elements_offset = 24; // LockRequest fixed part is 24 bytes
@@ -3352,10 +3397,13 @@ where
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
 
-        // Get backend
+        // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
+        self.validate_handle_tree_id(header, &handle)?;
+
+        // Get backend (use header.tree_id since we validated it matches)
         let tree = self
             .session_manager
-            .get_tree(header.session_id, handle.tree_id)
+            .get_tree(header.session_id, header.tree_id)
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
@@ -3426,10 +3474,13 @@ where
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
 
-        // Get backend
+        // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
+        self.validate_handle_tree_id(header, &handle)?;
+
+        // Get backend (use header.tree_id since we validated it matches)
         let tree = self
             .session_manager
-            .get_tree(header.session_id, handle.tree_id)
+            .get_tree(header.session_id, header.tree_id)
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
@@ -3527,10 +3578,13 @@ where
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidHandle))?;
 
-        // Get backend
+        // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
+        self.validate_handle_tree_id(header, &handle)?;
+
+        // Get backend (use header.tree_id since we validated it matches)
         let tree = self
             .session_manager
-            .get_tree(header.session_id, handle.tree_id)
+            .get_tree(header.session_id, header.tree_id)
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
@@ -5559,6 +5613,218 @@ mod tests {
         buf.extend_from_slice(&header_buf);
         buf.extend_from_slice(&request_buf);
         buf
+    }
+
+    /// Build a WRITE request message.
+    fn build_write_request(session_id: u64, tree_id: u32, file_id: u128, data: &[u8]) -> Vec<u8> {
+        use rustsmb_protocol::write::{WriteFlags, WriteRequest};
+
+        let header = Smb2Header {
+            structure_size: 64,
+            credit_charge: 1,
+            status: 0,
+            command: Smb2Command::Write,
+            credits: 1,
+            flags: Smb2Flags(0),
+            next_command: 0,
+            message_id: 1,
+            async_id: 0,
+            tree_id,
+            session_id,
+            signature: [0u8; 16],
+        };
+
+        // WriteRequest: data_offset is 70 (64 header + 6 bytes into request)
+        let request = WriteRequest {
+            structure_size: 49,
+            data_offset: 70,
+            length: data.len() as u32,
+            offset: 0,
+            file_id_persistent: file_id as u64,
+            file_id_volatile: (file_id >> 64) as u64,
+            channel: 0,
+            remaining_bytes: 0,
+            write_channel_info_offset: 0,
+            write_channel_info_length: 0,
+            flags: WriteFlags(0),
+        };
+
+        // Write header and request to separate buffers, then combine
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        header
+            .write(&mut Cursor::new(&mut header_buf))
+            .expect("header serialization should succeed");
+
+        let mut request_buf = Vec::with_capacity(49 + data.len());
+        request
+            .write(&mut Cursor::new(&mut request_buf))
+            .expect("request serialization should succeed");
+
+        let mut buf = Vec::with_capacity(header_buf.len() + request_buf.len() + data.len());
+        buf.extend_from_slice(&header_buf);
+        buf.extend_from_slice(&request_buf);
+        // Pad to data_offset if needed
+        while buf.len() < 70 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    // ==========================================================================
+    // 3.3.5.2.11 - Verifying the Tree Connect
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 section 3.3.5.2.11:
+    // "The server MUST look up the TreeConnect in Session.TreeConnectTable
+    // by using the TreeId in the SMB2 header of the request. If no tree
+    // connect is found, the request MUST be failed with
+    // STATUS_NETWORK_NAME_DELETED."
+    //
+    // Key requirements tested:
+    // - Tree-requiring commands with tree_id = 0 return STATUS_NETWORK_NAME_DELETED
+    // - Tree-requiring commands with non-existent tree_id return STATUS_NETWORK_NAME_DELETED
+    // - Handle operations with mismatched tree_id return STATUS_INVALID_PARAMETER
+    // ==========================================================================
+
+    #[tokio::test]
+    async fn test_write_with_tree_id_zero_returns_network_name_deleted() {
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // First, establish a session
+        let session_request = build_session_setup_request(0, b"auth_token");
+        let session_header = Smb2Header::read(&mut Cursor::new(&session_request[..64])).unwrap();
+        let session_response = handler
+            .handle_session_setup(&session_header, &session_request[64..], &session_request)
+            .await
+            .unwrap();
+        let session_id = extract_session_id_from_response(&session_response);
+
+        // Try WRITE with tree_id = 0 (invalid for tree-requiring commands)
+        let write_request = build_write_request(session_id, 0, 12345, b"test data");
+        let write_header = Smb2Header::read(&mut Cursor::new(&write_request[..64])).unwrap();
+
+        let result = handler
+            .dispatch_command(&write_header, &write_request[64..], &write_request)
+            .await;
+
+        // Per MS-SMB2 3.3.5.2.11, tree_id = 0 is not valid for tree-requiring commands
+        assert!(result.is_err());
+        if let Err(HandlerError::Status(status)) = result {
+            assert_eq!(
+                status.code(),
+                STATUS_NETWORK_NAME_DELETED,
+                "MS-SMB2 3.3.5.2.11: Tree-requiring command with tree_id=0 MUST fail"
+            );
+        } else {
+            panic!("Expected HandlerError::Status, got {:?}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_with_nonexistent_tree_id_returns_network_name_deleted() {
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // First, establish a session
+        let session_request = build_session_setup_request(0, b"auth_token");
+        let session_header = Smb2Header::read(&mut Cursor::new(&session_request[..64])).unwrap();
+        let session_response = handler
+            .handle_session_setup(&session_header, &session_request[64..], &session_request)
+            .await
+            .unwrap();
+        let session_id = extract_session_id_from_response(&session_response);
+
+        // Try WRITE with tree_id = 999 (doesn't exist)
+        let write_request = build_write_request(session_id, 999, 12345, b"test data");
+        let write_header = Smb2Header::read(&mut Cursor::new(&write_request[..64])).unwrap();
+
+        let result = handler
+            .dispatch_command(&write_header, &write_request[64..], &write_request)
+            .await;
+
+        // Per MS-SMB2 3.3.5.2.11, invalid tree_id MUST return STATUS_NETWORK_NAME_DELETED
+        assert!(result.is_err());
+        if let Err(HandlerError::Status(status)) = result {
+            assert_eq!(
+                status.code(),
+                STATUS_NETWORK_NAME_DELETED,
+                "MS-SMB2 3.3.5.2.11: Non-existent tree_id MUST return STATUS_NETWORK_NAME_DELETED"
+            );
+        } else {
+            panic!("Expected HandlerError::Status, got {:?}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ioctl_with_nonexistent_tree_id_returns_network_name_deleted() {
+        use rustsmb_protocol::ioctl::{IoctlFlags, IoctlRequest};
+
+        let mut handler = create_test_handler(MockMultiRoundAuthProvider::single_round()).await;
+
+        // First, establish a session
+        let session_request = build_session_setup_request(0, b"auth_token");
+        let session_header = Smb2Header::read(&mut Cursor::new(&session_request[..64])).unwrap();
+        let session_response = handler
+            .handle_session_setup(&session_header, &session_request[64..], &session_request)
+            .await
+            .unwrap();
+        let session_id = extract_session_id_from_response(&session_response);
+
+        // Build IOCTL request with tree_id = 999 (doesn't exist)
+        let header = Smb2Header {
+            structure_size: 64,
+            credit_charge: 1,
+            status: 0,
+            command: Smb2Command::Ioctl,
+            credits: 1,
+            flags: Smb2Flags(0),
+            next_command: 0,
+            message_id: 1,
+            async_id: 0,
+            tree_id: 999, // Invalid tree_id
+            session_id,
+            signature: [0u8; 16],
+        };
+
+        let request = IoctlRequest {
+            structure_size: 57,
+            reserved: 0,
+            ctl_code: 0x00140078, // FSCTL_SRV_REQUEST_RESUME_KEY
+            file_id_persistent: 0,
+            file_id_volatile: u64::MAX,
+            input_offset: 0,
+            input_count: 0,
+            max_input_response: 0,
+            output_offset: 0,
+            output_count: 0,
+            max_output_response: 1024,
+            flags: IoctlFlags(0),
+            reserved2: 0,
+        };
+
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        header.write(&mut Cursor::new(&mut header_buf)).unwrap();
+
+        let mut request_buf = Vec::with_capacity(57);
+        request.write(&mut Cursor::new(&mut request_buf)).unwrap();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header_buf);
+        buf.extend_from_slice(&request_buf);
+
+        let result = handler.dispatch_command(&header, &buf[64..], &buf).await;
+
+        // Per MS-SMB2 3.3.5.2.11, IOCTL with invalid tree_id MUST return STATUS_NETWORK_NAME_DELETED
+        assert!(result.is_err());
+        if let Err(HandlerError::Status(status)) = result {
+            assert_eq!(
+                status.code(),
+                STATUS_NETWORK_NAME_DELETED,
+                "MS-SMB2 3.3.5.2.11: IOCTL with invalid tree_id MUST return STATUS_NETWORK_NAME_DELETED"
+            );
+        } else {
+            panic!("Expected HandlerError::Status, got {:?}", result);
+        }
     }
 
     // ==========================================================================

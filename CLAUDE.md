@@ -623,6 +623,22 @@ Implement same-server oplock/lease break notifications per MS-SMB2 sections 2.2.
 
 **Note:** Cross-server lease breaks are NOT implemented. Cross-server conflicts continue using reduced grant strategy from Phase 14.
 
+### Phase 19: Tree ID Validation - COMPLETED
+
+Implement proper Tree ID validation per MS-SMB2 section 3.3.5.2.11.
+
+- [x] Phase 19A: Fix pre-dispatch validation
+  - Add TreeDisconnect and Ioctl to requires_tree command list
+  - Remove tree_id != 0 check (tree_id = 0 is NOT valid for tree-requiring commands)
+- [x] Phase 19B: Add tree ID matching for handle operations
+  - Add `validate_handle_tree_id()` helper function
+  - Apply validation in CLOSE, READ, WRITE, LOCK, QUERY_DIRECTORY, QUERY_INFO, SET_INFO handlers
+  - Reject with STATUS_INVALID_PARAMETER when header.tree_id != handle.tree_id
+- [x] Phase 19C: Add unit tests for MS-SMB2 3.3.5.2.11
+  - test_write_with_tree_id_zero_returns_network_name_deleted
+  - test_write_with_nonexistent_tree_id_returns_network_name_deleted
+  - test_ioctl_with_nonexistent_tree_id_returns_network_name_deleted
+
 ## smbtorture Test Analysis
 
 ### Test Results Summary (January 2026)
@@ -631,7 +647,7 @@ Implement same-server oplock/lease break notifications per MS-SMB2 sections 2.2.
 |-------|--------|------------|
 | smb2.connect | **PASS** | - |
 | smb2.session | **FAIL** | reauth5/6, bind_negative_* (multi-dialect signing) |
-| smb2.tcon | **FAIL** | Allows write with wrong Tree ID |
+| smb2.tcon | **PASS** | - |
 | smb2.create | **FAIL** | gentest, blob, aclfile, acldir, nulldacl |
 | smb2.read | **FAIL** | eof status, position tracking, dir read status |
 | smb2.lock | **FAIL** | Lock stacking, error codes, cross-handle conflicts |
@@ -649,7 +665,7 @@ Implement same-server oplock/lease break notifications per MS-SMB2 sections 2.2.
 | Lock stacking (same-handle re-lock) | ✅ | ❌ | P2 |
 | LOCK_NOT_GRANTED vs FILE_LOCK_CONFLICT | ✅ | ❌ | P2 |
 | Cross-handle lock conflicts | ✅ | ❌ | P2 |
-| Tree ID validation | ✅ | ❌ | P1 |
+| Tree ID validation | ✅ | ✅ | - |
 | Read past EOF → STATUS_END_OF_FILE | ✅ | ❌ | P1 |
 | Read directory → STATUS_INVALID_DEVICE_REQUEST | ✅ | ❌ | P1 |
 | File position tracking | ✅ | ❌ | P3 |
