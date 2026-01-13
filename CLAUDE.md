@@ -726,6 +726,18 @@ Document lessons learned from Phase 21 compound bugs and implement safety improv
   - Tests verify byte offsets in serialized command buffers
 - [x] Phase 22E: Update handler.rs to use protocol constants
 
+### Phase 23: Fix smb2.read Test Compliance - COMPLETED
+
+Fix smb2.read smbtorture test failures per MS-SMB2 3.3.5.12.
+
+- [x] Phase 23A: Add access rights validation (FILE_READ_DATA or FILE_EXECUTE)
+- [x] Phase 23B: Fix EOF handling (return STATUS_END_OF_FILE when read returns 0 bytes)
+- [x] Phase 23C: Update file position after READ operations
+- [x] Phase 23D: Fix FileAllInformation structure (position at offset 80 per MS-FSCC 2.4.18)
+- [x] Phase 23E: Update handle_query_info to pass position to build_file_info
+
+All smb2.read tests now pass: eof, position, dir, access.
+
 ## smbtorture Test Analysis
 
 ### Test Results Summary (January 2026)
@@ -736,7 +748,7 @@ Document lessons learned from Phase 21 compound bugs and implement safety improv
 | smb2.session | **FAIL** | reauth5/6, bind_negative_* (multi-dialect signing) |
 | smb2.tcon | **PASS** | - |
 | smb2.create | **FAIL** | gentest, blob, aclfile, acldir, nulldacl |
-| smb2.read | **PARTIAL** | position tracking (EOF and dir read fixed in Phase 20) |
+| smb2.read | **PASS** | All tests pass (eof, position, dir, access) - Fixed in Phase 23 |
 | smb2.lock | **FAIL** | Lock stacking, error codes, cross-handle conflicts |
 | smb2.lease | **PASS** | - |
 | smb2.oplock | **PARTIAL (17/42)** | brl3 (lock error codes), levelii500 (break failure), statopen1 |
@@ -756,7 +768,7 @@ Document lessons learned from Phase 21 compound bugs and implement safety improv
 | Tree ID validation | ✅ | ✅ | - |
 | Read past EOF → STATUS_END_OF_FILE | ✅ | ✅ | - |
 | Read directory → STATUS_INVALID_DEVICE_REQUEST | ✅ | ✅ | - |
-| File position tracking | ✅ | ❌ | P3 |
+| File position tracking | ✅ | ✅ | - |
 | Attributes-only opens (no oplock break) | ✅ | ❌ | P3 |
 | SMB2_CAP_MULTI_CHANNEL | ⚠️ Experimental | ❌ | P3 |
 | SMB Direct (RDMA) | ✅ | ❌ | - |
