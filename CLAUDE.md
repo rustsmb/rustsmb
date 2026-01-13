@@ -742,7 +742,7 @@ Document lessons learned from Phase 21 compound bugs and implement safety improv
 | smb2.oplock | **PARTIAL (17/42)** | brl3 (lock error codes), levelii500 (break failure), statopen1 |
 | smb2.durable-open | **FAIL** | Various reconnect edge cases |
 | smb2.durable-v2-open | **FAIL** | Client crash (smbtorture bug) |
-| smb2.compound | **PARTIAL** | Fixed in Phase 21 (related/unrelated now handled) |
+| smb2.compound | **PARTIAL** | related1, compound-break, create-write-close pass; others need IOCTL |
 
 ### Missing Features vs ksmbd
 
