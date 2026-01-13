@@ -3334,6 +3334,19 @@ where
             return Err(HandlerError::Status(NtStatus::InvalidDeviceRequest));
         }
 
+        // Check read access per MS-SMB2 3.3.5.12
+        // Open must have FILE_READ_DATA or FILE_EXECUTE permission
+        const FILE_READ_DATA: u32 = 0x0001;
+        const FILE_EXECUTE: u32 = 0x0020;
+        if (handle.access_mask & (FILE_READ_DATA | FILE_EXECUTE)) == 0 {
+            debug!(
+                conn_id = self.connection.id,
+                access_mask = handle.access_mask,
+                "READ: Access denied - no FILE_READ_DATA or FILE_EXECUTE permission"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
+
         // Get tree and backend (use header.tree_id since we validated it matches)
         let tree = self
             .session_manager
@@ -3366,19 +3379,40 @@ where
             .await
             .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 
-        // Per MS-SMB2 3.3.5.14: Check MinimumCount
-        // If the read returns less than MinimumCount AND less than the requested length
-        // (meaning we hit EOF), return STATUS_END_OF_FILE
-        if (data.len() as u32) < request.minimum_count && (data.len() as u32) < request.length {
+        // Per MS-SMB2 3.3.5.12: Return STATUS_END_OF_FILE when:
+        // - No data was read AND length > 0 (attempted to read but got nothing at EOF)
+        // - OR data.len() < minimum_count (didn't meet minimum requirement)
+        if data.is_empty() && request.length > 0 {
+            debug!(
+                conn_id = self.connection.id,
+                offset = request.offset,
+                requested_length = request.length,
+                "READ: No data returned (offset >= file size), returning STATUS_END_OF_FILE"
+            );
+            return Err(HandlerError::Status(NtStatus::EndOfFile));
+        }
+        if (data.len() as u32) < request.minimum_count {
             debug!(
                 conn_id = self.connection.id,
                 bytes_read = data.len(),
                 minimum_count = request.minimum_count,
-                requested_length = request.length,
                 "READ: MinimumCount not satisfied, returning STATUS_END_OF_FILE"
             );
             return Err(HandlerError::Status(NtStatus::EndOfFile));
         }
+
+        // Update file position after successful read (MS-SMB2: server tracks current position)
+        let new_offset = request.offset + data.len() as u64;
+        let mut updated_handle = handle.clone();
+        updated_handle.file_offset = new_offset;
+        updated_handle.last_access = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.session_manager
+            .update_handle(updated_handle)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
         let resp_header = self.build_response_header(header, NtStatus::Success);
 
@@ -4003,7 +4037,8 @@ where
                     .stat(&handle.path)
                     .await
                     .map_err(|e| HandlerError::Vfs(e.to_string()))?;
-                build_file_info(&metadata, request.file_info_class)
+                // Pass handle.file_offset for FileAllInformation (class 18) position field
+                build_file_info(&metadata, request.file_info_class, Some(handle.file_offset))
             }
             InfoType::FileSystem => {
                 // Get filesystem info

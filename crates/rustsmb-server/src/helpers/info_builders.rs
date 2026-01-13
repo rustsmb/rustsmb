@@ -64,7 +64,16 @@ pub fn build_directory_info(entries: &[rustsmb_vfs::DirEntry]) -> Vec<u8> {
 /// - FileBasicInformation (4)
 /// - FileStandardInformation (5)
 /// - FileAllInformation (18)
-pub fn build_file_info(metadata: &rustsmb_vfs::Metadata, info_class: u8) -> Vec<u8> {
+///
+/// # Arguments
+/// - `metadata` - File metadata from VFS
+/// - `info_class` - File information class being requested
+/// - `position` - Optional file position for FileAllInformation (class 18)
+pub fn build_file_info(
+    metadata: &rustsmb_vfs::Metadata,
+    info_class: u8,
+    position: Option<u64>,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     let is_dir = metadata.file_type == FileType::Directory;
 
@@ -88,25 +97,46 @@ pub fn build_file_info(metadata: &rustsmb_vfs::Metadata, info_class: u8) -> Vec<
             buf.push(if is_dir { 1 } else { 0 }); // Directory
             buf.extend_from_slice(&[0u8; 2]); // Reserved
         }
-        // FileAllInformation (combination)
+        // FileAllInformation (combination) - per MS-FSCC 2.4.18
         18 => {
-            // Basic info
-            buf.extend_from_slice(&current_filetime().to_le_bytes());
-            buf.extend_from_slice(&current_filetime().to_le_bytes());
-            buf.extend_from_slice(&current_filetime().to_le_bytes());
-            buf.extend_from_slice(&current_filetime().to_le_bytes());
+            // FileBasicInformation (40 bytes)
+            buf.extend_from_slice(&current_filetime().to_le_bytes()); // CreationTime
+            buf.extend_from_slice(&current_filetime().to_le_bytes()); // LastAccessTime
+            buf.extend_from_slice(&current_filetime().to_le_bytes()); // LastWriteTime
+            buf.extend_from_slice(&current_filetime().to_le_bytes()); // ChangeTime
             let attrs = if is_dir { 0x10u32 } else { 0x80u32 };
-            buf.extend_from_slice(&attrs.to_le_bytes());
-            buf.extend_from_slice(&0u32.to_le_bytes());
-            // Standard info
-            buf.extend_from_slice(&metadata.size.to_le_bytes());
-            buf.extend_from_slice(&metadata.size.to_le_bytes());
-            buf.extend_from_slice(&1u32.to_le_bytes());
-            buf.push(0);
-            buf.push(if is_dir { 1 } else { 0 });
-            buf.extend_from_slice(&[0u8; 2]);
-            // Internal, EA, Access, Position info...
-            buf.extend_from_slice(&[0u8; 48]);
+            buf.extend_from_slice(&attrs.to_le_bytes()); // FileAttributes
+            buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+
+            // FileStandardInformation (24 bytes)
+            buf.extend_from_slice(&metadata.size.to_le_bytes()); // AllocationSize
+            buf.extend_from_slice(&metadata.size.to_le_bytes()); // EndOfFile
+            buf.extend_from_slice(&1u32.to_le_bytes()); // NumberOfLinks
+            buf.push(0); // DeletePending
+            buf.push(if is_dir { 1 } else { 0 }); // Directory
+            buf.extend_from_slice(&[0u8; 2]); // Reserved
+
+            // FileInternalInformation (8 bytes)
+            buf.extend_from_slice(&0u64.to_le_bytes()); // IndexNumber
+
+            // FileEaInformation (4 bytes)
+            buf.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+
+            // FileAccessInformation (4 bytes)
+            buf.extend_from_slice(&0u32.to_le_bytes()); // AccessFlags
+
+            // FilePositionInformation (8 bytes) - THIS IS THE POSITION FIELD
+            buf.extend_from_slice(&position.unwrap_or(0).to_le_bytes()); // CurrentByteOffset
+
+            // FileModeInformation (4 bytes)
+            buf.extend_from_slice(&0u32.to_le_bytes()); // Mode
+
+            // FileAlignmentInformation (4 bytes)
+            buf.extend_from_slice(&0u32.to_le_bytes()); // AlignmentRequirement
+
+            // FileNameInformation (variable - just length for now)
+            buf.extend_from_slice(&0u32.to_le_bytes()); // FileNameLength
+                                                        // Empty name (no additional bytes needed when length is 0)
         }
         _ => {
             // Unknown info class - return minimal data
@@ -506,7 +536,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buf = build_file_info(&metadata, 4); // FileBasicInformation
+        let buf = build_file_info(&metadata, 4, None); // FileBasicInformation
 
         // Should have: 4 timestamps (8 bytes each) + FileAttributes (4) + Reserved (4) = 40 bytes
         assert_eq!(buf.len(), 40, "FileBasicInformation should be 40 bytes");
@@ -524,7 +554,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buf = build_file_info(&metadata, 4); // FileBasicInformation
+        let buf = build_file_info(&metadata, 4, None); // FileBasicInformation
 
         // Check attributes - directory should have 0x10
         let attrs = u32::from_le_bytes(buf[32..36].try_into().unwrap());
@@ -539,7 +569,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buf = build_file_info(&metadata, 5); // FileStandardInformation
+        let buf = build_file_info(&metadata, 5, None); // FileStandardInformation
 
         // Should have: AllocationSize(8) + EndOfFile(8) + NumberOfLinks(4) +
         // DeletePending(1) + Directory(1) + Reserved(2) = 24 bytes
@@ -551,5 +581,34 @@ mod tests {
 
         let end_of_file = u64::from_le_bytes(buf[8..16].try_into().unwrap());
         assert_eq!(end_of_file, 4096, "EndOfFile");
+    }
+
+    #[test]
+    fn test_build_file_info_all_information_with_position() {
+        let metadata = rustsmb_vfs::Metadata {
+            file_type: FileType::Regular,
+            size: 65536,
+            ..Default::default()
+        };
+
+        let position = 10u64;
+        let buf = build_file_info(&metadata, 18, Some(position)); // FileAllInformation
+
+        // FileAllInformation structure (per MS-FSCC 2.4.18):
+        // - FileBasicInformation (40 bytes)
+        // - FileStandardInformation (24 bytes)
+        // - FileInternalInformation (8 bytes)
+        // - FileEaInformation (4 bytes)
+        // - FileAccessInformation (4 bytes)
+        // - FilePositionInformation (8 bytes) <- position at offset 80
+        // - FileModeInformation (4 bytes)
+        // - FileAlignmentInformation (4 bytes)
+        // - FileNameInformation (4 bytes for length, 0 chars)
+        // Total: 100 bytes
+        assert_eq!(buf.len(), 100, "FileAllInformation should be 100 bytes");
+
+        // Check position at offset 80 (after Basic(40) + Standard(24) + Internal(8) + EA(4) + Access(4))
+        let pos = u64::from_le_bytes(buf[80..88].try_into().unwrap());
+        assert_eq!(pos, 10, "Position should be 10");
     }
 }
