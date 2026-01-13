@@ -794,7 +794,7 @@ Fix smb2.durable-open smbtorture test failures per MS-SMB2 specification.
 | smb2.lock | **FAIL** | Lock stacking, error codes, cross-handle conflicts |
 | smb2.lease | **PASS** | - |
 | smb2.oplock | **PARTIAL (17/42)** | brl3 (lock error codes), levelii500 (break failure), statopen1 |
-| smb2.durable-open | **PARTIAL (7/22)** | open-oplock, open-lease, lock-oplock/lease, stat-open pass; reconnect tests fail |
+| smb2.durable-open | **PARTIAL (10/22)** | Fixed in Phase 24; reconnect tests pass; remaining need oplock breaks |
 | smb2.durable-v2-open | **FAIL** | Client crash (smbtorture bug) |
 | smb2.compound | **PARTIAL** | related1, compound-break, create-write-close pass; others need IOCTL |
 
@@ -833,6 +833,6 @@ Fix smb2.durable-open smbtorture test failures per MS-SMB2 specification.
 - Cross-handle/cross-session lock conflict detection
 
 **P3 - Nice to have:**
-- File position tracking in FileAllInformation
+- ~~File position tracking in FileAllInformation~~ DONE in Phase 23
 - Attributes-only opens without sharing violations
 - Multi-channel capability advertisement
