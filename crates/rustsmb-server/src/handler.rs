@@ -1255,13 +1255,34 @@ where
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - Tree IDs match
+    /// * `Ok(())` - Handle is valid for this request
+    /// * `Err(HandlerError::Status(NtStatus::FileClosed))` - Handle is disconnected (durable handle needs reconnect)
     /// * `Err(HandlerError::Status(NtStatus::InvalidParameter))` - Tree IDs don't match
     fn validate_handle_tree_id(
         &self,
         header: &Smb2Header,
         handle: &rustsmb_state::HandleState,
     ) -> Result<(), HandlerError> {
+        // Per MS-SMB2 3.3.5.2.8: If the handle's session is not the same as the request's
+        // session, return STATUS_FILE_CLOSED. For disconnected durable handles (session_id=0),
+        // this indicates the client must reconnect the handle first.
+        if handle.session_id == 0 {
+            debug!(
+                conn_id = self.connection.id,
+                persistent_id = handle.persistent_id,
+                "Handle is disconnected (durable handle needs reconnect)"
+            );
+            return Err(HandlerError::Status(NtStatus::FileClosed));
+        }
+        if handle.session_id != header.session_id {
+            debug!(
+                conn_id = self.connection.id,
+                header_session_id = header.session_id,
+                handle_session_id = handle.session_id,
+                "Session ID mismatch: handle belongs to different session"
+            );
+            return Err(HandlerError::Status(NtStatus::FileClosed));
+        }
         if header.tree_id != handle.tree_id {
             debug!(
                 conn_id = self.connection.id,
@@ -4613,12 +4634,21 @@ where
             }
             Some(SetFileInfoClass::FilePositionInformation) => {
                 // FilePositionInformation: CurrentByteOffset(8)
-                // This updates the file position for subsequent reads/writes
-                // For stateless servers, this is typically a no-op
-                debug!(
-                    path = %handle.path,
-                    "SET_INFO: FilePositionInformation (ignored)"
-                );
+                // Per MS-FSCC 2.4.40, this contains the current byte offset
+                if buffer.len() >= 8 {
+                    let position = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
+                    let mut updated_handle = handle.clone();
+                    updated_handle.file_offset = position;
+                    self.session_manager
+                        .update_handle(updated_handle)
+                        .await
+                        .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                    debug!(
+                        path = %handle.path,
+                        position,
+                        "SET_INFO: FilePositionInformation"
+                    );
+                }
             }
             Some(SetFileInfoClass::FileModeInformation) => {
                 // FileModeInformation: Mode(4)

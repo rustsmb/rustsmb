@@ -138,6 +138,11 @@ pub fn build_file_info(
             buf.extend_from_slice(&0u32.to_le_bytes()); // FileNameLength
                                                         // Empty name (no additional bytes needed when length is 0)
         }
+        // FilePositionInformation (14) - per MS-FSCC 2.4.40
+        14 => {
+            // CurrentByteOffset (8 bytes)
+            buf.extend_from_slice(&position.unwrap_or(0).to_le_bytes());
+        }
         _ => {
             // Unknown info class - return minimal data
             buf.extend_from_slice(&[0u8; 8]);

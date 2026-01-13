@@ -798,10 +798,18 @@ Improve durable handle reconnection per MS-SMB2 specification.
   - test_delete_on_close_preserved_in_handle_state
   - test_file_offset_tracking_for_durable_handles
   - test_durable_vs_non_durable_file_offset
+- [x] Phase 25E: Fix SET_INFO FilePositionInformation handling
+  - Previously ignored, now stores position in handle.file_offset
+  - Per MS-FSCC 2.4.40
+- [x] Phase 25F: Add QUERY_INFO FilePositionInformation (class 14) handler
+  - Returns current byte offset from handle.file_offset
+- [x] Phase 25G: Fix validate_handle_tree_id for disconnected handles (MS-SMB2 3.3.5.2.8)
+  - Return STATUS_FILE_CLOSED for disconnected durable handles (session_id=0)
+  - Return STATUS_FILE_CLOSED for session mismatch
+  - Enables proper client reconnect flow
 
-**Results**: 10/22 smb2.durable-open tests still pass (same as Phase 24).
-Phase 25 improvements are structural/compliance fixes that didn't change test outcomes.
-Remaining failures require more complex oplock/lease break handling during reconnect.
+**Results**: 11/23 smb2.durable-open tests pass (up from 10/22 in Phase 24).
+- file-position test now passes (file offset tracking and proper disconnected handle status)
 
 ## smbtorture Test Analysis
 
@@ -817,7 +825,7 @@ Remaining failures require more complex oplock/lease break handling during recon
 | smb2.lock | **FAIL** | Lock stacking, error codes, cross-handle conflicts |
 | smb2.lease | **PASS** | - |
 | smb2.oplock | **PARTIAL (17/42)** | brl3 (lock error codes), levelii500 (break failure), statopen1 |
-| smb2.durable-open | **PARTIAL (10/22)** | Fixed in Phase 24; reconnect tests pass; remaining need oplock breaks |
+| smb2.durable-open | **PARTIAL (11/23)** | Phase 25 fixed file-position; reconnect tests pass; remaining need oplock breaks |
 | smb2.durable-v2-open | **FAIL** | Client crash (smbtorture bug) |
 | smb2.compound | **PARTIAL** | related1, compound-break, create-write-close pass; others need IOCTL |
 
