@@ -180,6 +180,11 @@ pub struct HandleState {
     /// Set via FileDispositionInformation (SET_INFO).
     #[serde(default)]
     pub delete_on_close: bool,
+
+    /// Handle is for a directory (not a file).
+    /// Used to reject READ operations per MS-SMB2 3.3.5.12.
+    #[serde(default)]
+    pub is_directory: bool,
 }
 
 impl Default for HandleState {
@@ -213,6 +218,7 @@ impl Default for HandleState {
             oplock_level: 0,
             bound_server_id: None,
             delete_on_close: false,
+            is_directory: false,
         }
     }
 }

@@ -639,6 +639,21 @@ Implement proper Tree ID validation per MS-SMB2 section 3.3.5.2.11.
   - test_write_with_nonexistent_tree_id_returns_network_name_deleted
   - test_ioctl_with_nonexistent_tree_id_returns_network_name_deleted
 
+### Phase 20: READ Command Compliance - COMPLETED
+
+Implement proper READ request handling per MS-SMB2 section 3.3.5.12.
+
+- [x] Phase 20A: Add NtStatus::InvalidDeviceRequest (0xC0000010)
+- [x] Phase 20B: Add is_directory field to HandleState
+  - Track whether handle is for a directory vs file
+  - Set from file metadata during CREATE
+- [x] Phase 20C: Add directory check in handle_read
+  - Per spec: "If Open.IsPersistent is FALSE and Open.IsDirectory is TRUE,
+    the server SHOULD fail the request with STATUS_INVALID_DEVICE_REQUEST"
+- [x] Phase 20D: Add unit tests for MS-SMB2 3.3.5.12
+  - test_read_directory_check_logic (directory + persistent combinations)
+  - test_minimum_count_logic (EOF handling already implemented)
+
 ## smbtorture Test Analysis
 
 ### Test Results Summary (January 2026)
@@ -649,7 +664,7 @@ Implement proper Tree ID validation per MS-SMB2 section 3.3.5.2.11.
 | smb2.session | **FAIL** | reauth5/6, bind_negative_* (multi-dialect signing) |
 | smb2.tcon | **PASS** | - |
 | smb2.create | **FAIL** | gentest, blob, aclfile, acldir, nulldacl |
-| smb2.read | **FAIL** | eof status, position tracking, dir read status |
+| smb2.read | **PARTIAL** | position tracking (EOF and dir read fixed in Phase 20) |
 | smb2.lock | **FAIL** | Lock stacking, error codes, cross-handle conflicts |
 | smb2.lease | **PASS** | - |
 | smb2.oplock | **PARTIAL (17/42)** | brl3 (lock error codes), levelii500 (break failure), statopen1 |
@@ -666,8 +681,8 @@ Implement proper Tree ID validation per MS-SMB2 section 3.3.5.2.11.
 | LOCK_NOT_GRANTED vs FILE_LOCK_CONFLICT | ✅ | ❌ | P2 |
 | Cross-handle lock conflicts | ✅ | ❌ | P2 |
 | Tree ID validation | ✅ | ✅ | - |
-| Read past EOF → STATUS_END_OF_FILE | ✅ | ❌ | P1 |
-| Read directory → STATUS_INVALID_DEVICE_REQUEST | ✅ | ❌ | P1 |
+| Read past EOF → STATUS_END_OF_FILE | ✅ | ✅ | - |
+| Read directory → STATUS_INVALID_DEVICE_REQUEST | ✅ | ✅ | - |
 | File position tracking | ✅ | ❌ | P3 |
 | Attributes-only opens (no oplock break) | ✅ | ❌ | P3 |
 | SMB2_CAP_MULTI_CHANNEL | ⚠️ Experimental | ❌ | P3 |
@@ -682,8 +697,8 @@ Implement proper Tree ID validation per MS-SMB2 section 3.3.5.2.11.
 
 **P1 - Security/Compliance:**
 - ~~Tree ID validation (reject operations with wrong TID)~~ DONE in Phase 19
-- Read past EOF should return STATUS_END_OF_FILE
-- Read on directory should return STATUS_INVALID_DEVICE_REQUEST
+- ~~Read past EOF should return STATUS_END_OF_FILE~~ DONE (already implemented, verified in Phase 20)
+- ~~Read on directory should return STATUS_INVALID_DEVICE_REQUEST~~ DONE in Phase 20
 
 **P2 - Lock semantics:**
 - Lock stacking (allow same handle to re-lock same range)

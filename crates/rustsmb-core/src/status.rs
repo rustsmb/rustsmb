@@ -32,6 +32,8 @@ pub enum NtStatus {
     NoSuchFile = 0xC000000F,
     /// Invalid handle.
     InvalidHandle = 0xC0000008,
+    /// Invalid device request (e.g., read on directory).
+    InvalidDeviceRequest = 0xC0000010,
     /// End of file was reached.
     EndOfFile = 0xC0000011,
     /// Access is denied.
@@ -144,6 +146,7 @@ impl NtStatus {
             0xC000000D => Self::InvalidParameter,
             0xC000000F => Self::NoSuchFile,
             0xC0000008 => Self::InvalidHandle,
+            0xC0000010 => Self::InvalidDeviceRequest,
             0xC0000011 => Self::EndOfFile,
             0xC0000022 => Self::AccessDenied,
             0xC0000023 => Self::BufferTooSmall,

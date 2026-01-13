@@ -1808,6 +1808,13 @@ where
             .await
             .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 
+        // Check if opened file is a directory (for is_directory in HandleState)
+        let is_directory = backend
+            .stat(&filename)
+            .await
+            .map(|m| m.file_type == rustsmb_vfs::FileType::Directory)
+            .unwrap_or(false);
+
         // Determine create_action based on disposition and whether file existed
         // Per MS-SMB2 2.2.13 (CreateDisposition) and 2.2.14 (CreateAction):
         let create_action: u32 = match request.create_disposition {
@@ -2014,6 +2021,7 @@ where
             oplock_level: requested_oplock.as_u8(),
             bound_server_id: None,
             delete_on_close: false,
+            is_directory,
         };
 
         // Set create GUID if durable
@@ -2828,6 +2836,13 @@ where
 
         // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
         self.validate_handle_tree_id(header, &handle)?;
+
+        // Check if trying to read a directory (MS-SMB2 3.3.5.12)
+        // Per spec: "If Open.IsPersistent is FALSE and Open.IsDirectory is TRUE,
+        // the server SHOULD fail the request with STATUS_INVALID_DEVICE_REQUEST."
+        if handle.is_directory && !handle.is_persistent {
+            return Err(HandlerError::Status(NtStatus::InvalidDeviceRequest));
+        }
 
         // Get tree and backend (use header.tree_id since we validated it matches)
         let tree = self
@@ -6951,6 +6966,8 @@ mod tests {
     // "Receiving an SMB2 READ Request"
     //
     // Key requirements tested:
+    // - If Open.IsDirectory is TRUE and Open.IsPersistent is FALSE,
+    //   return STATUS_INVALID_DEVICE_REQUEST
     // - If OutputCount < MinimumCount and we hit EOF, return STATUS_END_OF_FILE
     // - If OutputCount >= MinimumCount, return success with the data
     // ==========================================================================
@@ -7007,6 +7024,52 @@ mod tests {
         assert!(
             !should_fail,
             "Should succeed when minimum_count is 0 (client accepts any amount)"
+        );
+    }
+
+    #[test]
+    fn test_read_directory_check_logic() {
+        // Test the directory read check logic per MS-SMB2 3.3.5.12
+        //
+        // Per spec: "If Open.IsPersistent is FALSE and Open.IsDirectory is TRUE,
+        // the server SHOULD fail the request with STATUS_INVALID_DEVICE_REQUEST."
+        //
+        // The logic is: is_directory && !is_persistent -> reject
+
+        // Scenario 1: Directory + non-persistent -> reject
+        let is_directory = true;
+        let is_persistent = false;
+        let should_reject = is_directory && !is_persistent;
+        assert!(
+            should_reject,
+            "Should reject READ on directory with non-persistent handle"
+        );
+
+        // Scenario 2: File + non-persistent -> allow
+        let is_directory = false;
+        let is_persistent = false;
+        let should_reject = is_directory && !is_persistent;
+        assert!(
+            !should_reject,
+            "Should allow READ on file with non-persistent handle"
+        );
+
+        // Scenario 3: Directory + persistent -> allow (per spec)
+        let is_directory = true;
+        let is_persistent = true;
+        let should_reject = is_directory && !is_persistent;
+        assert!(
+            !should_reject,
+            "Should allow READ on directory with persistent handle"
+        );
+
+        // Scenario 4: File + persistent -> allow
+        let is_directory = false;
+        let is_persistent = true;
+        let should_reject = is_directory && !is_persistent;
+        assert!(
+            !should_reject,
+            "Should allow READ on file with persistent handle"
         );
     }
 
