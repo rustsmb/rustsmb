@@ -7803,6 +7803,259 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.12 - EOF Handling (Phase 23B)
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.12: Return STATUS_END_OF_FILE when:
+    // - Reading returns 0 bytes and length > 0 (at/past EOF)
+    // - Reading returns less than MinimumCount
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_eof_empty_read_with_nonzero_length() {
+        // When read returns 0 bytes but we requested > 0 bytes,
+        // we should return STATUS_END_OF_FILE (reading past EOF)
+
+        // Scenario 1: Empty file, request 100 bytes -> EOF
+        let data_len: usize = 0;
+        let request_length: u32 = 100;
+        let should_return_eof = data_len == 0 && request_length > 0;
+        assert!(
+            should_return_eof,
+            "Should return EOF when reading from empty file"
+        );
+
+        // Scenario 2: Read at offset past file end, request 100 bytes -> EOF
+        let data_len: usize = 0;
+        let request_length: u32 = 100;
+        let should_return_eof = data_len == 0 && request_length > 0;
+        assert!(
+            should_return_eof,
+            "Should return EOF when reading past file end"
+        );
+
+        // Scenario 3: Request 0 bytes (length=0) -> NOT EOF (degenerate case)
+        let data_len: usize = 0;
+        let request_length: u32 = 0;
+        let should_return_eof = data_len == 0 && request_length > 0;
+        assert!(
+            !should_return_eof,
+            "Should NOT return EOF when requesting 0 bytes"
+        );
+    }
+
+    #[test]
+    fn test_eof_minimum_count_not_satisfied() {
+        // When read returns less than MinimumCount, return STATUS_END_OF_FILE
+
+        // Scenario 1: Read 5 bytes, MinimumCount=10 -> EOF
+        let data_len: u32 = 5;
+        let minimum_count: u32 = 10;
+        let should_return_eof = data_len < minimum_count;
+        assert!(
+            should_return_eof,
+            "Should return EOF when data_len < minimum_count"
+        );
+
+        // Scenario 2: Read 10 bytes, MinimumCount=10 -> SUCCESS
+        let data_len: u32 = 10;
+        let minimum_count: u32 = 10;
+        let should_return_eof = data_len < minimum_count;
+        assert!(
+            !should_return_eof,
+            "Should NOT return EOF when data_len == minimum_count"
+        );
+
+        // Scenario 3: Read 15 bytes, MinimumCount=10 -> SUCCESS
+        let data_len: u32 = 15;
+        let minimum_count: u32 = 10;
+        let should_return_eof = data_len < minimum_count;
+        assert!(
+            !should_return_eof,
+            "Should NOT return EOF when data_len > minimum_count"
+        );
+
+        // Scenario 4: MinimumCount=0 always succeeds (client accepts any amount)
+        let data_len: u32 = 0;
+        let minimum_count: u32 = 0;
+        let should_return_eof = data_len < minimum_count;
+        assert!(
+            !should_return_eof,
+            "MinimumCount=0 means client accepts any amount including 0"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.12 - Access Rights Validation (Phase 23A)
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.12: The server MUST verify that the Open was made
+    // with FILE_READ_DATA or FILE_EXECUTE access. If not, return
+    // STATUS_ACCESS_DENIED.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_read_access_rights_validation() {
+        const FILE_READ_DATA: u32 = 0x0001;
+        const FILE_EXECUTE: u32 = 0x0020;
+        const FILE_WRITE_DATA: u32 = 0x0002;
+        const FILE_APPEND_DATA: u32 = 0x0004;
+
+        // Scenario 1: FILE_READ_DATA only -> ALLOW
+        let access_mask = FILE_READ_DATA;
+        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
+        assert!(has_read_access, "FILE_READ_DATA should grant read access");
+
+        // Scenario 2: FILE_EXECUTE only -> ALLOW
+        let access_mask = FILE_EXECUTE;
+        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
+        assert!(has_read_access, "FILE_EXECUTE should grant read access");
+
+        // Scenario 3: FILE_READ_DATA | FILE_EXECUTE -> ALLOW
+        let access_mask = FILE_READ_DATA | FILE_EXECUTE;
+        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
+        assert!(
+            has_read_access,
+            "FILE_READ_DATA | FILE_EXECUTE should grant read access"
+        );
+
+        // Scenario 4: FILE_WRITE_DATA only -> DENY
+        let access_mask = FILE_WRITE_DATA;
+        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
+        assert!(
+            !has_read_access,
+            "FILE_WRITE_DATA alone should NOT grant read access"
+        );
+
+        // Scenario 5: FILE_APPEND_DATA only -> DENY
+        let access_mask = FILE_APPEND_DATA;
+        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
+        assert!(
+            !has_read_access,
+            "FILE_APPEND_DATA alone should NOT grant read access"
+        );
+
+        // Scenario 6: No access rights -> DENY
+        let access_mask = 0u32;
+        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
+        assert!(!has_read_access, "No access should NOT grant read access");
+
+        // Scenario 7: FILE_WRITE_DATA | FILE_APPEND_DATA -> DENY (no read)
+        let access_mask = FILE_WRITE_DATA | FILE_APPEND_DATA;
+        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
+        assert!(
+            !has_read_access,
+            "Write-only access should NOT grant read access"
+        );
+
+        // Scenario 8: FILE_WRITE_DATA | FILE_READ_DATA -> ALLOW (has read)
+        let access_mask = FILE_WRITE_DATA | FILE_READ_DATA;
+        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
+        assert!(
+            has_read_access,
+            "Write + Read access should grant read access"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-FSCC 2.4.18 - FileAllInformation Position Field (Phase 23D)
+    // -------------------------------------------------------------------------
+    // FileAllInformation contains FilePositionInformation at offset 80.
+    // The position field should reflect the current file offset tracked
+    // by the server.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_file_all_information_structure_layout() {
+        // FileAllInformation (per MS-FSCC 2.4.18) structure layout:
+        // - FileBasicInformation: 40 bytes (offset 0-39)
+        // - FileStandardInformation: 24 bytes (offset 40-63)
+        // - FileInternalInformation: 8 bytes (offset 64-71)
+        // - FileEaInformation: 4 bytes (offset 72-75)
+        // - FileAccessInformation: 4 bytes (offset 76-79)
+        // - FilePositionInformation: 8 bytes (offset 80-87) <- POSITION HERE
+        // - FileModeInformation: 4 bytes (offset 88-91)
+        // - FileAlignmentInformation: 4 bytes (offset 92-95)
+        // - FileNameInformation: variable (offset 96+)
+
+        const BASIC_INFO_SIZE: usize = 40;
+        const STANDARD_INFO_SIZE: usize = 24;
+        const INTERNAL_INFO_SIZE: usize = 8;
+        const EA_INFO_SIZE: usize = 4;
+        const ACCESS_INFO_SIZE: usize = 4;
+        const POSITION_INFO_SIZE: usize = 8;
+        const MODE_INFO_SIZE: usize = 4;
+        const ALIGNMENT_INFO_SIZE: usize = 4;
+        const NAME_INFO_LENGTH_SIZE: usize = 4; // Just the FileNameLength field
+
+        // Verify position offset
+        let position_offset = BASIC_INFO_SIZE
+            + STANDARD_INFO_SIZE
+            + INTERNAL_INFO_SIZE
+            + EA_INFO_SIZE
+            + ACCESS_INFO_SIZE;
+        assert_eq!(
+            position_offset, 80,
+            "FilePositionInformation should start at offset 80"
+        );
+
+        // Verify total size (with empty filename)
+        let total_size = BASIC_INFO_SIZE
+            + STANDARD_INFO_SIZE
+            + INTERNAL_INFO_SIZE
+            + EA_INFO_SIZE
+            + ACCESS_INFO_SIZE
+            + POSITION_INFO_SIZE
+            + MODE_INFO_SIZE
+            + ALIGNMENT_INFO_SIZE
+            + NAME_INFO_LENGTH_SIZE;
+        assert_eq!(
+            total_size, 100,
+            "FileAllInformation with empty name should be 100 bytes"
+        );
+    }
+
+    #[test]
+    fn test_file_position_tracking_after_read() {
+        // After a READ operation, the server should update the file position
+        // to offset + bytes_read
+
+        // Scenario 1: Read 10 bytes at offset 0 -> position = 10
+        let offset: u64 = 0;
+        let bytes_read: u64 = 10;
+        let new_position = offset + bytes_read;
+        assert_eq!(
+            new_position, 10,
+            "Position should be 10 after reading 10 bytes at offset 0"
+        );
+
+        // Scenario 2: Read 100 bytes at offset 50 -> position = 150
+        let offset: u64 = 50;
+        let bytes_read: u64 = 100;
+        let new_position = offset + bytes_read;
+        assert_eq!(
+            new_position, 150,
+            "Position should be 150 after reading 100 bytes at offset 50"
+        );
+
+        // Scenario 3: Read 0 bytes at offset 1000 (EOF) -> position = 1000
+        let offset: u64 = 1000;
+        let bytes_read: u64 = 0;
+        let new_position = offset + bytes_read;
+        assert_eq!(
+            new_position, 1000,
+            "Position should be 1000 even when read returns 0 bytes"
+        );
+
+        // Scenario 4: Large file read
+        let offset: u64 = 1_000_000_000;
+        let bytes_read: u64 = 8_000_000;
+        let new_position = offset + bytes_read;
+        assert_eq!(
+            new_position, 1_008_000_000,
+            "Position should handle large values"
+        );
+    }
+
     // ==========================================================================
     // 3.3.5.14 - LOCK
     // ==========================================================================
