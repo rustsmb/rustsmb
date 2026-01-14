@@ -7,6 +7,17 @@ use md5::Md5;
 
 type HmacMd5 = Hmac<Md5>;
 
+/// Error type for NTLMv2 response verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NtlmVerifyError {
+    /// Response data is malformed (too short, invalid structure).
+    /// Maps to STATUS_INVALID_PARAMETER per MS-SMB2 3.3.5.5.
+    Malformed(String),
+    /// Response is valid but verification failed (wrong credentials).
+    /// Maps to STATUS_LOGON_FAILURE.
+    VerificationFailed,
+}
+
 /// Compute NT hash from password.
 ///
 /// NT hash = MD4(UTF-16LE(password))
@@ -187,20 +198,87 @@ pub fn compute_ntlmv2_response(
     (nt_response, session_key)
 }
 
+/// Validate AV_PAIR list structure.
+///
+/// Checks that each AV_PAIR is well-formed (has valid length fields that don't
+/// exceed the remaining buffer). Returns Ok(()) if valid, Err with message if malformed.
+fn validate_av_pairs(data: &[u8]) -> Result<(), String> {
+    let mut offset = 0;
+
+    while offset < data.len() {
+        // Each AV_PAIR needs at least 4 bytes for header (2 bytes AvId + 2 bytes AvLen)
+        if data.len() - offset < 4 {
+            return Err(format!(
+                "Truncated AV_PAIR header at offset {}: {} bytes remaining, need 4",
+                offset,
+                data.len() - offset
+            ));
+        }
+
+        let av_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        let av_len = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
+
+        // Check if the value fits in the remaining buffer
+        if data.len() - offset - 4 < av_len {
+            return Err(format!(
+                "AV_PAIR at offset {} has length {} but only {} bytes remaining",
+                offset,
+                av_len,
+                data.len() - offset - 4
+            ));
+        }
+
+        // MsvAvEOL (0) marks end of list
+        if av_id == 0 {
+            break;
+        }
+
+        offset += 4 + av_len;
+    }
+
+    Ok(())
+}
+
 /// Verify NTLMv2 response.
 ///
-/// Returns session_base_key if valid, None otherwise.
+/// Returns session_base_key if valid.
+///
+/// # Errors
+///
+/// - `NtlmVerifyError::Malformed` - response is too short or has invalid structure
+/// - `NtlmVerifyError::VerificationFailed` - response is well-formed but HMAC doesn't match
 pub fn verify_ntlmv2_response(
     ntowf: &[u8; 16],
     server_challenge: &[u8; 8],
     nt_response: &[u8],
-) -> Option<[u8; 16]> {
+) -> Result<[u8; 16], NtlmVerifyError> {
+    // NTLMv2 response must be at least NtProofStr (16 bytes) + CLIENT_CHALLENGE struct (28 bytes min)
     if nt_response.len() < 16 + 28 {
-        return None;
+        return Err(NtlmVerifyError::Malformed(format!(
+            "NTLMv2 response too short: {} bytes (minimum 44)",
+            nt_response.len()
+        )));
     }
 
     let nt_proof_str = &nt_response[..16];
     let temp = &nt_response[16..];
+
+    // Validate CLIENT_CHALLENGE structure (MS-NLMP 2.2.2.7)
+    // RespType and HiRespType must both be 1
+    if temp[0] != 1 || temp[1] != 1 {
+        return Err(NtlmVerifyError::Malformed(format!(
+            "Invalid CLIENT_CHALLENGE: RespType={}, HiRespType={} (both must be 1)",
+            temp[0], temp[1]
+        )));
+    }
+
+    // Validate AvPairs if present (they start at offset 28 in temp)
+    if temp.len() > 28 {
+        let av_pairs = &temp[28..];
+        if let Err(e) = validate_av_pairs(av_pairs) {
+            return Err(NtlmVerifyError::Malformed(e));
+        }
+    }
 
     // Recompute NtProofStr
     let mut concat = Vec::with_capacity(8 + temp.len());
@@ -218,7 +296,7 @@ pub fn verify_ntlmv2_response(
     }
 
     if !eq {
-        return None;
+        return Err(NtlmVerifyError::VerificationFailed);
     }
 
     // Compute session base key
@@ -228,7 +306,7 @@ pub fn verify_ntlmv2_response(
 
     let mut key = [0u8; 16];
     key.copy_from_slice(&session_base_key);
-    Some(key)
+    Ok(key)
 }
 
 /// Generate random challenge.
@@ -365,7 +443,7 @@ mod tests {
 
         // Verify
         let verified_key = verify_ntlmv2_response(&ntowf, &server_challenge, &nt_response);
-        assert!(verified_key.is_some());
+        assert!(verified_key.is_ok());
         assert_eq!(verified_key.unwrap(), session_key);
     }
 
@@ -398,9 +476,9 @@ mod tests {
             &target_info,
         );
 
-        // Verify with wrong challenge should fail
+        // Verify with wrong challenge should fail with VerificationFailed (not malformed)
         let verified = verify_ntlmv2_response(&ntowf, &wrong_challenge, &nt_response);
-        assert!(verified.is_none());
+        assert!(matches!(verified, Err(NtlmVerifyError::VerificationFailed)));
     }
 
     #[test]

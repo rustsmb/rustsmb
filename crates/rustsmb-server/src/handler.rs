@@ -14,7 +14,7 @@ use crate::{ServerConfig, ShareManager};
 use binrw::{BinRead, BinWrite};
 use bytes::{Buf, BytesMut};
 use rustsmb_auth::{AuthContext, AuthResult, DynAuthProvider, PreauthIntegrityHash, SessionKeys};
-use rustsmb_core::{NtStatus, SmbDialect, VfsError};
+use rustsmb_core::{AuthError, NtStatus, SmbDialect, VfsError};
 use rustsmb_protocol::commands::fileid_body_offset;
 use rustsmb_protocol::commands::oplock_break::{
     LeaseBreakAcknowledgment, LeaseBreakFlags, LeaseBreakNotification, LeaseBreakResponse,
@@ -1490,11 +1490,16 @@ where
         };
 
         // Perform authentication
+        // Per MS-SMB2 3.3.5.5, malformed tokens should return STATUS_INVALID_PARAMETER,
+        // not STATUS_LOGON_FAILURE (which is for valid tokens with wrong credentials).
         let auth_result = self
             .auth_provider
             .authenticate(&mut self.auth_context, security_buffer)
             .await
-            .map_err(|e| HandlerError::Auth(e.to_string()))?;
+            .map_err(|e| match e {
+                AuthError::MalformedToken(_) => HandlerError::Status(NtStatus::InvalidParameter),
+                _ => HandlerError::Auth(e.to_string()),
+            })?;
 
         match auth_result {
             AuthResult::Success {

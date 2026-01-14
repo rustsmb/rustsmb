@@ -2,6 +2,7 @@
 
 use super::crypto::{
     decrypt_session_key, generate_challenge, nt_hash, ntowf_v2, verify_ntlmv2_response,
+    NtlmVerifyError,
 };
 use super::messages::{AuthenticateMessage, ChallengeMessage, NegotiateMessage};
 use super::{build_target_info, current_filetime, NtlmFlags};
@@ -230,9 +231,15 @@ impl NtlmAuthProvider {
 
         // Verify NTLMv2 response
         let session_base_key = verify_ntlmv2_response(&ntowf, &server_challenge, &msg.nt_response)
-            .ok_or_else(|| {
-                warn!("NTLMv2 verification failed for user {}", msg.user_name);
-                AuthError::InvalidCredentials
+            .map_err(|e| match e {
+                NtlmVerifyError::Malformed(msg) => {
+                    warn!("Malformed NTLMv2 response: {}", msg);
+                    AuthError::MalformedToken(msg)
+                }
+                NtlmVerifyError::VerificationFailed => {
+                    warn!("NTLMv2 verification failed for user {}", msg.user_name);
+                    AuthError::InvalidCredentials
+                }
             })?;
 
         // If NEGOTIATE_KEY_EXCH is set, decrypt the exchanged session key
@@ -299,7 +306,7 @@ impl AuthProvider for NtlmAuthProvider {
             }
 
             if token.len() < 12 {
-                return Err(AuthError::Failed("Token too short".to_string()));
+                return Err(AuthError::MalformedToken("Token too short".to_string()));
             }
 
             // Determine message type
@@ -308,19 +315,17 @@ impl AuthProvider for NtlmAuthProvider {
             match msg_type {
                 1 => {
                     // NEGOTIATE
-                    let msg = NegotiateMessage::parse(token)
-                        .ok_or(AuthError::Failed("Invalid NEGOTIATE message".to_string()))?;
+                    let msg = NegotiateMessage::parse(token).map_err(AuthError::MalformedToken)?;
                     self.process_negotiate(context, &msg)
                 }
                 3 => {
                     // AUTHENTICATE
-                    let msg = AuthenticateMessage::parse(token).ok_or(AuthError::Failed(
-                        "Invalid AUTHENTICATE message".to_string(),
-                    ))?;
+                    let msg =
+                        AuthenticateMessage::parse(token).map_err(AuthError::MalformedToken)?;
                     self.process_authenticate(context, &msg)
                 }
-                _ => Err(AuthError::Failed(format!(
-                    "Unexpected NTLM message type: {}",
+                _ => Err(AuthError::MalformedToken(format!(
+                    "Invalid NTLM message type: {}",
                     msg_type
                 ))),
             }
@@ -789,5 +794,93 @@ mod tests {
         buf.extend_from_slice(&ws_bytes);
 
         buf
+    }
+
+    // ==========================================================================
+    // Malformed Token Tests (MS-SMB2 Section 3.3.5.5)
+    // ==========================================================================
+    // Per MS-SMB2, malformed tokens should return STATUS_INVALID_PARAMETER,
+    // not STATUS_LOGON_FAILURE. These tests verify that MalformedToken is
+    // returned for various invalid token formats.
+
+    #[tokio::test]
+    async fn test_malformed_token_too_short() {
+        let provider = NtlmAuthProvider::new("SERVER", "DOMAIN");
+        let mut context = AuthContext::default();
+
+        // Token too short (less than 12 bytes needed for header)
+        let result = provider.authenticate(&mut context, &[0u8; 5]).await;
+        assert!(matches!(result, Err(AuthError::MalformedToken(_))));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_token_bad_signature() {
+        let provider = NtlmAuthProvider::new("SERVER", "DOMAIN");
+        let mut context = AuthContext::default();
+
+        // Valid length but wrong NTLMSSP signature
+        let mut bad_token = vec![0u8; 32];
+        bad_token[..8].copy_from_slice(b"BADMAGIC");
+        bad_token[8..12].copy_from_slice(&1u32.to_le_bytes()); // Type 1
+
+        let result = provider.authenticate(&mut context, &bad_token).await;
+        assert!(matches!(result, Err(AuthError::MalformedToken(_))));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_token_invalid_message_type() {
+        use super::super::NTLM_SIGNATURE;
+
+        let provider = NtlmAuthProvider::new("SERVER", "DOMAIN");
+        let mut context = AuthContext::default();
+
+        // Valid signature but invalid message type (not 1 or 3)
+        let mut bad_token = vec![0u8; 32];
+        bad_token[..8].copy_from_slice(NTLM_SIGNATURE);
+        bad_token[8..12].copy_from_slice(&99u32.to_le_bytes()); // Invalid type
+
+        let result = provider.authenticate(&mut context, &bad_token).await;
+        assert!(
+            matches!(result, Err(AuthError::MalformedToken(ref msg)) if msg.contains("Invalid NTLM message type"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_malformed_negotiate_too_short() {
+        use super::super::NTLM_SIGNATURE;
+
+        let provider = NtlmAuthProvider::new("SERVER", "DOMAIN");
+        let mut context = AuthContext::default();
+
+        // NEGOTIATE message but too short (needs 32 bytes minimum)
+        let mut bad_token = vec![0u8; 20];
+        bad_token[..8].copy_from_slice(NTLM_SIGNATURE);
+        bad_token[8..12].copy_from_slice(&1u32.to_le_bytes()); // Type 1
+
+        let result = provider.authenticate(&mut context, &bad_token).await;
+        assert!(matches!(result, Err(AuthError::MalformedToken(_))));
+    }
+
+    #[tokio::test]
+    async fn test_malformed_authenticate_too_short() {
+        use super::super::NTLM_SIGNATURE;
+
+        let provider = NtlmAuthProvider::new("SERVER", "DOMAIN");
+        let mut context = AuthContext::default();
+
+        // First, get a valid challenge
+        let negotiate = NegotiateMessage::default();
+        let _ = provider
+            .authenticate(&mut context, &negotiate.build())
+            .await
+            .unwrap();
+
+        // AUTHENTICATE message but too short (needs 64 bytes minimum)
+        let mut bad_token = vec![0u8; 32];
+        bad_token[..8].copy_from_slice(NTLM_SIGNATURE);
+        bad_token[8..12].copy_from_slice(&3u32.to_le_bytes()); // Type 3
+
+        let result = provider.authenticate(&mut context, &bad_token).await;
+        assert!(matches!(result, Err(AuthError::MalformedToken(_))));
     }
 }

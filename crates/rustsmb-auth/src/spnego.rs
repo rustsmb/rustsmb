@@ -204,7 +204,9 @@ impl SpnegoProvider {
         let token = resp
             .response_token
             .as_ref()
-            .ok_or(AuthError::Failed("No response token".to_string()))?;
+            .ok_or(AuthError::MalformedToken(
+                "NegTokenResp missing response token".to_string(),
+            ))?;
 
         let result = self.inner.authenticate(context, token).await?;
 

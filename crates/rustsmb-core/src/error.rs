@@ -85,6 +85,11 @@ pub enum AuthError {
     #[error("Invalid credentials")]
     InvalidCredentials,
 
+    /// Malformed authentication token (invalid structure/format).
+    /// This maps to STATUS_INVALID_PARAMETER per MS-SMB2 3.3.5.5.
+    #[error("Malformed token: {0}")]
+    MalformedToken(String),
+
     /// Account is disabled.
     #[error("Account disabled")]
     AccountDisabled,

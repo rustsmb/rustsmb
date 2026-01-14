@@ -19,20 +19,26 @@ pub struct NegotiateMessage {
 
 impl NegotiateMessage {
     /// Parse from bytes.
-    pub fn parse(data: &[u8]) -> Option<Self> {
+    ///
+    /// Returns an error string for malformed messages (maps to STATUS_INVALID_PARAMETER).
+    pub fn parse(data: &[u8]) -> Result<Self, String> {
         if data.len() < 32 {
-            return None;
+            return Err("NEGOTIATE message too short (< 32 bytes)".to_string());
         }
 
         // Check signature
         if &data[..8] != NTLM_SIGNATURE {
-            return None;
+            return Err("Invalid NTLM signature".to_string());
         }
 
         // Check message type
         let msg_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         if msg_type != NtlmMessageType::Negotiate as u32 {
-            return None;
+            return Err(format!(
+                "Wrong message type: expected {}, got {}",
+                NtlmMessageType::Negotiate as u32,
+                msg_type
+            ));
         }
 
         let flags = NtlmFlags(u32::from_le_bytes([data[12], data[13], data[14], data[15]]));
@@ -62,7 +68,7 @@ impl NegotiateMessage {
             None
         };
 
-        Some(Self {
+        Ok(Self {
             flags,
             domain_name,
             workstation,
@@ -143,20 +149,26 @@ impl ChallengeMessage {
     }
 
     /// Parse from bytes.
-    pub fn parse(data: &[u8]) -> Option<Self> {
+    ///
+    /// Returns an error string for malformed messages (maps to STATUS_INVALID_PARAMETER).
+    pub fn parse(data: &[u8]) -> Result<Self, String> {
         if data.len() < 56 {
-            return None;
+            return Err("CHALLENGE message too short (< 56 bytes)".to_string());
         }
 
         // Check signature
         if &data[..8] != NTLM_SIGNATURE {
-            return None;
+            return Err("Invalid NTLM signature".to_string());
         }
 
         // Check message type
         let msg_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         if msg_type != NtlmMessageType::Challenge as u32 {
-            return None;
+            return Err(format!(
+                "Wrong message type: expected {}, got {}",
+                NtlmMessageType::Challenge as u32,
+                msg_type
+            ));
         }
 
         // Target name security buffer (offset 12)
@@ -195,7 +207,7 @@ impl ChallengeMessage {
             Vec::new()
         };
 
-        Some(Self {
+        Ok(Self {
             target_name,
             flags,
             server_challenge,
@@ -282,21 +294,27 @@ pub struct AuthenticateMessage {
 
 impl AuthenticateMessage {
     /// Parse from bytes.
-    pub fn parse(data: &[u8]) -> Option<Self> {
+    ///
+    /// Returns an error string for malformed messages (maps to STATUS_INVALID_PARAMETER).
+    pub fn parse(data: &[u8]) -> Result<Self, String> {
         // Minimum header without Version or MIC is 64 bytes.
         if data.len() < 64 {
-            return None;
+            return Err("AUTHENTICATE message too short (< 64 bytes)".to_string());
         }
 
         // Check signature
         if &data[..8] != NTLM_SIGNATURE {
-            return None;
+            return Err("Invalid NTLM signature".to_string());
         }
 
         // Check message type
         let msg_type = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         if msg_type != NtlmMessageType::Authenticate as u32 {
-            return None;
+            return Err(format!(
+                "Wrong message type: expected {}, got {}",
+                NtlmMessageType::Authenticate as u32,
+                msg_type
+            ));
         }
 
         // LM response (offset 12)
@@ -385,7 +403,7 @@ impl AuthenticateMessage {
             Vec::new()
         };
 
-        Some(Self {
+        Ok(Self {
             lm_response,
             nt_response,
             domain_name,
@@ -537,7 +555,7 @@ mod tests {
         buf[8..12].copy_from_slice(&(NtlmMessageType::Authenticate as u32).to_le_bytes());
 
         let parsed = AuthenticateMessage::parse(&buf);
-        assert!(parsed.is_some());
+        assert!(parsed.is_ok());
     }
 
     #[test]
@@ -554,6 +572,40 @@ mod tests {
         let parsed = AuthenticateMessage::parse(&buf).unwrap();
         assert!(parsed.version.is_some());
         assert!(parsed.mic.is_none());
+    }
+
+    #[test]
+    fn test_negotiate_parse_too_short() {
+        let result = NegotiateMessage::parse(&[0u8; 16]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn test_negotiate_parse_bad_signature() {
+        let mut buf = vec![0u8; 32];
+        buf[..8].copy_from_slice(b"BADMAGIC");
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let result = NegotiateMessage::parse(&buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("signature"));
+    }
+
+    #[test]
+    fn test_authenticate_parse_too_short() {
+        let result = AuthenticateMessage::parse(&[0u8; 32]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn test_authenticate_parse_bad_signature() {
+        let mut buf = vec![0u8; 64];
+        buf[..8].copy_from_slice(b"BADMAGIC");
+        buf[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let result = AuthenticateMessage::parse(&buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("signature"));
     }
 
     #[test]
