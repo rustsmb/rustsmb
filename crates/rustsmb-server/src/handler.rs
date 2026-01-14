@@ -3718,9 +3718,13 @@ where
 
         // Check read access per MS-SMB2 3.3.5.12
         // Open must have FILE_READ_DATA or FILE_EXECUTE permission
+        // Also check GENERIC_READ and GENERIC_ALL as they imply FILE_READ_DATA
         const FILE_READ_DATA: u32 = 0x0001;
         const FILE_EXECUTE: u32 = 0x0020;
-        if (handle.access_mask & (FILE_READ_DATA | FILE_EXECUTE)) == 0 {
+        const GENERIC_READ: u32 = 0x80000000;
+        const GENERIC_ALL: u32 = 0x10000000;
+        if (handle.access_mask & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_ALL)) == 0
+        {
             debug!(
                 conn_id = self.connection.id,
                 access_mask = handle.access_mask,
@@ -8956,64 +8960,84 @@ mod tests {
 
     #[test]
     fn test_read_access_rights_validation() {
+        // Per MS-SMB2 3.3.5.12: The server MUST verify that the Open was made
+        // with FILE_READ_DATA or FILE_EXECUTE access.
+        //
+        // Additionally, per MS-FSA, GENERIC_READ and GENERIC_ALL imply FILE_READ_DATA.
         const FILE_READ_DATA: u32 = 0x0001;
         const FILE_EXECUTE: u32 = 0x0020;
         const FILE_WRITE_DATA: u32 = 0x0002;
         const FILE_APPEND_DATA: u32 = 0x0004;
+        const GENERIC_READ: u32 = 0x80000000;
+        const GENERIC_ALL: u32 = 0x10000000;
+
+        let check_read_access =
+            |mask: u32| (mask & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_ALL)) != 0;
 
         // Scenario 1: FILE_READ_DATA only -> ALLOW
-        let access_mask = FILE_READ_DATA;
-        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
-        assert!(has_read_access, "FILE_READ_DATA should grant read access");
+        assert!(
+            check_read_access(FILE_READ_DATA),
+            "FILE_READ_DATA should grant read access"
+        );
 
         // Scenario 2: FILE_EXECUTE only -> ALLOW
-        let access_mask = FILE_EXECUTE;
-        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
-        assert!(has_read_access, "FILE_EXECUTE should grant read access");
+        assert!(
+            check_read_access(FILE_EXECUTE),
+            "FILE_EXECUTE should grant read access"
+        );
 
         // Scenario 3: FILE_READ_DATA | FILE_EXECUTE -> ALLOW
-        let access_mask = FILE_READ_DATA | FILE_EXECUTE;
-        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
         assert!(
-            has_read_access,
+            check_read_access(FILE_READ_DATA | FILE_EXECUTE),
             "FILE_READ_DATA | FILE_EXECUTE should grant read access"
         );
 
         // Scenario 4: FILE_WRITE_DATA only -> DENY
-        let access_mask = FILE_WRITE_DATA;
-        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
         assert!(
-            !has_read_access,
+            !check_read_access(FILE_WRITE_DATA),
             "FILE_WRITE_DATA alone should NOT grant read access"
         );
 
         // Scenario 5: FILE_APPEND_DATA only -> DENY
-        let access_mask = FILE_APPEND_DATA;
-        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
         assert!(
-            !has_read_access,
+            !check_read_access(FILE_APPEND_DATA),
             "FILE_APPEND_DATA alone should NOT grant read access"
         );
 
         // Scenario 6: No access rights -> DENY
-        let access_mask = 0u32;
-        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
-        assert!(!has_read_access, "No access should NOT grant read access");
+        assert!(
+            !check_read_access(0),
+            "No access should NOT grant read access"
+        );
 
         // Scenario 7: FILE_WRITE_DATA | FILE_APPEND_DATA -> DENY (no read)
-        let access_mask = FILE_WRITE_DATA | FILE_APPEND_DATA;
-        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
         assert!(
-            !has_read_access,
+            !check_read_access(FILE_WRITE_DATA | FILE_APPEND_DATA),
             "Write-only access should NOT grant read access"
         );
 
         // Scenario 8: FILE_WRITE_DATA | FILE_READ_DATA -> ALLOW (has read)
-        let access_mask = FILE_WRITE_DATA | FILE_READ_DATA;
-        let has_read_access = (access_mask & (FILE_READ_DATA | FILE_EXECUTE)) != 0;
         assert!(
-            has_read_access,
+            check_read_access(FILE_WRITE_DATA | FILE_READ_DATA),
             "Write + Read access should grant read access"
+        );
+
+        // Scenario 9: GENERIC_READ only -> ALLOW (per MS-FSA, implies FILE_READ_DATA)
+        assert!(
+            check_read_access(GENERIC_READ),
+            "GENERIC_READ should grant read access"
+        );
+
+        // Scenario 10: GENERIC_ALL only -> ALLOW (per MS-FSA, implies all access)
+        assert!(
+            check_read_access(GENERIC_ALL),
+            "GENERIC_ALL should grant read access"
+        );
+
+        // Scenario 11: GENERIC_READ | FILE_WRITE_DATA -> ALLOW
+        assert!(
+            check_read_access(GENERIC_READ | FILE_WRITE_DATA),
+            "GENERIC_READ with write should grant read access"
         );
     }
 

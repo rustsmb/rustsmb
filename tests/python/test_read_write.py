@@ -27,12 +27,30 @@ class TestRead:
             delete_test_file(tree, unique_filename)
 
     def test_read_empty_file(self, tree, unique_filename):
-        """Test reading an empty file."""
+        """Test reading an empty file returns END_OF_FILE per MS-SMB2 3.3.5.12."""
+        from smbprotocol.open import Open, CreateDisposition, FilePipePrinterAccessMask
+        from smbprotocol.open import ShareAccess, CreateOptions, ImpersonationLevel
+        from smbprotocol.exceptions import EndOfFile
+
         create_test_file(tree, unique_filename, b"")
 
         try:
-            result = read_test_file(tree, unique_filename)
-            assert result == b""
+            # Per MS-SMB2 3.3.5.12: "If BytesRead is zero and Length is not zero,
+            # the server MUST fail the request with STATUS_END_OF_FILE."
+            file_open = Open(tree, unique_filename)
+            file_open.create(
+                ImpersonationLevel.Impersonation,
+                FilePipePrinterAccessMask.GENERIC_READ,
+                0,
+                ShareAccess.FILE_SHARE_READ,
+                CreateDisposition.FILE_OPEN,
+                CreateOptions.FILE_NON_DIRECTORY_FILE,
+            )
+            try:
+                with pytest.raises(EndOfFile):
+                    file_open.read(0, 1024)  # Read with length > 0 should raise EndOfFile
+            finally:
+                file_open.close()
         finally:
             delete_test_file(tree, unique_filename)
 
