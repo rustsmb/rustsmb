@@ -1,25 +1,26 @@
 #!/bin/bash
-# smbtorture test runner - client only
-#
-# This script runs smbtorture tests against an SMB server.
-# Designed to run inside Docker, connecting to a host SMB server.
+# smbtorture test runner for RustSMB
 #
 # Usage:
-#   ./smbtorture.sh [suite|all]
+#   ./smbtorture.sh [suite|all]                    # Start server and run tests
+#   ./smbtorture.sh [suite|all] --external HOST    # Test external server
 #
 # Examples:
-#   ./smbtorture.sh                    # Run all suites
-#   ./smbtorture.sh all                # Run all suites
+#   ./smbtorture.sh                    # Run all suites (starts local server)
+#   ./smbtorture.sh all                # Run all suites (starts local server)
 #   ./smbtorture.sh smb2.connect       # Run specific suite
-#   ./smbtorture.sh smb2.durable-open  # Run durable handle tests
+#   ./smbtorture.sh all --external localhost:445   # Test external server
+#   ./smbtorture.sh smb2.session --external 192.168.1.10 --user testuser --pass secret
 #
 # Environment variables:
-#   SMB_HOST        - Server hostname (default: host.docker.internal)
-#   SMB_PORT        - Server port (default: 4450)
+#   RUSTSMB_BIN     - Path to RustSMB server binary (default: ./target/release/rustsmb)
+#   SMB_PORT        - Port to listen on (default: 445)
 #   SMB_SHARE       - Share name (default: test)
-#   SMB_USER        - Username for auth (default: testuser)
-#   SMB_PASS        - Password for auth (default: testpass)
+#   SMB_SHARE_PATH  - Share directory path (default: /tmp/share)
+#   SMB_USER        - Username for auth (empty = anonymous)
+#   SMB_PASS        - Password for auth
 #   RESULTS_DIR     - Where to save logs (default: test-results/smbtorture)
+#   RUST_LOG        - Log level for server (default: info)
 
 set -e
 
@@ -30,15 +31,60 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # Parse command line arguments
-SUITE="${1:-all}"
+SUITE=""
+EXTERNAL_HOST=""
+EXTERNAL_PORT=""
+CLI_USER=""
+CLI_PASS=""
 
-# Configuration from environment
-SERVER_HOST="${SMB_HOST:-host.docker.internal}"
-PORT="${SMB_PORT:-4450}"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --external)
+            EXTERNAL_HOST="$2"
+            # Parse host:port if provided
+            if [[ "$EXTERNAL_HOST" == *:* ]]; then
+                EXTERNAL_PORT="${EXTERNAL_HOST##*:}"
+                EXTERNAL_HOST="${EXTERNAL_HOST%%:*}"
+            fi
+            shift 2
+            ;;
+        --user)
+            CLI_USER="$2"
+            shift 2
+            ;;
+        --pass)
+            CLI_PASS="$2"
+            shift 2
+            ;;
+        --help|-h)
+            head -24 "$0" | tail -22
+            exit 0
+            ;;
+        *)
+            SUITE="$1"
+            shift
+            ;;
+    esac
+done
+
+# Defaults
+SUITE="${SUITE:-all}"
+PORT="${EXTERNAL_PORT:-${SMB_PORT:-445}}"
 SHARE="${SMB_SHARE:-test}"
-SMB_USER="${SMB_USER:-testuser}"
-SMB_PASS="${SMB_PASS:-testpass}"
+SHARE_PATH="${SMB_SHARE_PATH:-/tmp/share}"
+SERVER_BIN="${RUSTSMB_BIN:-./target/release/rustsmb}"
 RESULTS_DIR="${RESULTS_DIR:-test-results/smbtorture}"
+SMB_USER="${CLI_USER:-${SMB_USER:-testuser}}"
+SMB_PASS="${CLI_PASS:-${SMB_PASS:-testpass}}"
+
+# Determine server host
+if [ -n "$EXTERNAL_HOST" ]; then
+    SERVER_HOST="$EXTERNAL_HOST"
+    EXTERNAL_MODE=true
+else
+    SERVER_HOST="127.0.0.1"
+    EXTERNAL_MODE=false
+fi
 
 # Build auth flag
 if [ -n "$SMB_USER" ]; then
@@ -78,27 +124,61 @@ SUITES=(
     "smb2.multichannel"
 )
 
-# Wait for server to be ready
-wait_for_server() {
+# Server PID (global for cleanup)
+SERVER_PID=""
+
+# Cleanup function - ensures server is killed on any exit
+cleanup() {
+    if [ -n "$SERVER_PID" ]; then
+        kill $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# Wait for port to be available
+wait_for_port() {
+    local host=$1
+    local port=$2
     local max_attempts=30
-    echo -n "Waiting for $SERVER_HOST:$PORT... "
+
+    echo -n "Waiting for $host:$port... "
     for i in $(seq 1 $max_attempts); do
-        if timeout 1 bash -c "echo >/dev/tcp/$SERVER_HOST/$PORT" 2>/dev/null; then
+        # Use bash's built-in /dev/tcp (more portable than nc)
+        if (echo >/dev/tcp/"$host"/"$port") 2>/dev/null; then
             echo "ready"
             return 0
         fi
-        sleep 0.5
+        sleep 0.1
     done
     echo "timeout"
     return 1
 }
 
-# Wait for server
-if ! wait_for_server; then
-    echo -e "${RED}Error: Cannot connect to SMB server at $SERVER_HOST:$PORT${NC}"
-    echo "Make sure the RustSMB server is running on the host."
-    exit 1
+# Start local server if not in external mode
+if [ "$EXTERNAL_MODE" = false ]; then
+    echo "Starting RustSMB server on port $PORT..."
+    echo "Using binary: $SERVER_BIN"
+
+    # Create and clean share directory
+    mkdir -p "$SHARE_PATH"
+
+    # Start server in background
+    "$SERVER_BIN" --listen "127.0.0.1:$PORT" --share-path "$SHARE_PATH" &
+    SERVER_PID=$!
+
+    # Wait for server to be ready
+    if ! wait_for_port "127.0.0.1" "$PORT"; then
+        echo -e "${RED}Error: Server failed to start${NC}"
+        exit 1
+    fi
+
+    echo "Server started (PID: $SERVER_PID)"
+else
+    echo "Using external server: $SERVER_HOST:$PORT"
 fi
+
+echo ""
 
 # Function to run a single test suite
 run_suite() {
@@ -107,7 +187,7 @@ run_suite() {
 
     echo -n "Running $suite... "
 
-    if smbtorture "//$SERVER_HOST:$PORT/$SHARE" $AUTH_FLAG "$suite" > "$logfile" 2>&1; then
+    if smbtorture "//$SERVER_HOST/$SHARE" $AUTH_FLAG "$suite" > "$logfile" 2>&1; then
         echo -e "${GREEN}PASS${NC}"
         return 0
     else
@@ -150,7 +230,7 @@ else
     echo ""
 
     logfile="$RESULTS_DIR/${SUITE//\./_}.log"
-    if smbtorture "//$SERVER_HOST:$PORT/$SHARE" $AUTH_FLAG "$SUITE" 2>&1 | tee "$logfile"; then
+    if smbtorture "//$SERVER_HOST/$SHARE" $AUTH_FLAG "$SUITE" 2>&1 | tee "$logfile"; then
         PASSED=1
     else
         FAILED=1
