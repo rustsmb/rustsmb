@@ -292,6 +292,9 @@ docker build -f tests/Dockerfile.smbtorture \
 docker run --rm rustsmb-smbtorture              # Run all test suites
 docker run --rm rustsmb-smbtorture smb2.session # Run specific suite
 docker run --rm -e RUST_LOG=debug rustsmb-smbtorture smb2.connect  # With debug output
+
+# Run Python smbprotocol tests (requires python3.10 + pytest)
+./tests/scripts/run_python_tests.sh            # Run all Python tests
 ```
 
 ## Development Workflow
