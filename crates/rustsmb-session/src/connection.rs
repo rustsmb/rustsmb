@@ -145,6 +145,19 @@ impl Connection {
         )
     }
 
+    /// Check if connection supports multi-channel operations.
+    ///
+    /// Multi-channel is available in SMB 3.x dialects only.
+    /// Per MS-SMB2 3.3.5.5 line 14522, session binding requires
+    /// IsMultiChannelCapable = TRUE, which is only for SMB 3.x.
+    #[inline]
+    pub fn is_multi_channel_capable(&self) -> bool {
+        matches!(
+            self.dialect,
+            Some(SmbDialect::Smb300 | SmbDialect::Smb302 | SmbDialect::Smb311)
+        )
+    }
+
     /// Get client GUID as hex string (for lease tracking).
     #[inline]
     pub fn client_guid_string(&self) -> String {

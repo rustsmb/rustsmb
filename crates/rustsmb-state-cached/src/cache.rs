@@ -277,6 +277,7 @@ mod tests {
             signing_required: false,
             encryption_required: false,
             is_guest: false,
+            is_anonymous: false,
             created_at: 0,
             last_access: 0,
             expires_at: 0,

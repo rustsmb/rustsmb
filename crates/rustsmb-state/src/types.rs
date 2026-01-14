@@ -22,6 +22,10 @@ pub struct SessionState {
     pub encryption_required: bool,
     /// Whether this is a guest session.
     pub is_guest: bool,
+    /// Whether this is an anonymous session.
+    /// Per MS-SMB2 3.3.5.5 line 14504, anonymous sessions cannot bind.
+    #[serde(default)]
+    pub is_anonymous: bool,
     /// Creation timestamp (Unix epoch seconds).
     pub created_at: u64,
     /// Last access timestamp (Unix epoch seconds).
@@ -50,6 +54,7 @@ impl Default for SessionState {
             signing_required: false,
             encryption_required: false,
             is_guest: false,
+            is_anonymous: false,
             created_at: now,
             last_access: now,
             expires_at: now + 3600, // 1 hour default

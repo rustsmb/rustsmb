@@ -1436,9 +1436,12 @@ where
             "SESSION_SETUP request"
         );
 
-        // Check for session binding request (HA failover)
+        // Check for session binding request (multi-channel)
+        // Per MS-SMB2 3.3.5.5 Step 4, binding requires full validation
         if request.flags.is_binding() {
-            return self.handle_session_binding(header, &request).await;
+            return self
+                .handle_session_binding(header, &request, full_message)
+                .await;
         }
 
         // Per MS-SMB2 3.3.5.5.2: Reauthenticating an Existing Session
@@ -1588,6 +1591,7 @@ where
                         signing_required: self.connection.signing_required,
                         encryption_required: self.connection.encryption_required,
                         is_guest: user.is_guest,
+                        is_anonymous: user.is_anonymous,
                         created_at: now,
                         last_access: now,
                         expires_at: now + 3600, // 1 hour
@@ -1844,40 +1848,97 @@ where
         }
     }
 
-    /// Handle session binding for HA failover.
+    /// Handle session binding per MS-SMB2 3.3.5.5 Step 4.
     ///
-    /// When a client reconnects to a different server after failover, it sends
-    /// SESSION_SETUP with the SESSION_BINDING flag to bind to an existing session.
-    /// The server looks up the session in the shared StateStore.
+    /// Session binding is used for multi-channel operations where a client
+    /// binds an existing session to a new connection. This enables parallel
+    /// I/O across multiple network paths for improved performance.
+    ///
+    /// Per MS-SMB2 3.3.5.5, the server must validate:
+    /// - Connection dialect supports multi-channel (SMB 3.x only)
+    /// - Session exists and is not expired
+    /// - Dialect matches between connection and session
+    /// - Request is signed
+    /// - Session is not guest/anonymous
+    /// - Session is not already bound to this connection
+    /// - Signature is valid
     async fn handle_session_binding(
         &mut self,
         header: &Smb2Header,
-        request: &rustsmb_protocol::session_setup::SessionSetupRequest,
+        _request: &rustsmb_protocol::session_setup::SessionSetupRequest,
+        full_message: &[u8],
     ) -> Result<Vec<u8>, HandlerError> {
         use rustsmb_protocol::session_setup::{SessionFlags, SessionSetupResponse};
 
-        let previous_session_id = request.previous_session_id;
+        // Per MS-SMB2 3.3.5.5 line 14492, use SessionId from header for binding
+        let session_id = header.session_id;
 
         debug!(
             conn_id = self.connection.id,
-            previous_session_id, "SESSION_SETUP binding request (HA failover)"
+            session_id, "SESSION_SETUP binding request"
         );
 
-        // Look up existing session in StateStore
+        // MS-SMB2 3.3.5.5 line 14522:
+        // "If the server implements the SMB 3.x dialect family, and Connection.Dialect
+        // is equal to '2.0.2' or '2.1' or IsMultiChannelCapable is FALSE, and
+        // SMB2_SESSION_FLAG_BINDING bit is set in the Flags field of the request,
+        // the server SHOULD fail the session setup request with STATUS_REQUEST_NOT_ACCEPTED."
+        if !self.connection.is_multi_channel_capable() {
+            warn!(
+                conn_id = self.connection.id,
+                dialect = ?self.connection.dialect,
+                "Session binding rejected: multi-channel not supported for this dialect"
+            );
+            return Err(HandlerError::Status(NtStatus::RequestNotAccepted));
+        }
+
+        // MS-SMB2 3.3.5.5 line 14492:
+        // "The server MUST look up the session in GlobalSessionTable using the SessionId
+        // from the SMB2 header. If the session is not found, the server MUST fail the
+        // session setup request with STATUS_USER_SESSION_DELETED."
         let session = self
             .session_manager
-            .get_session(previous_session_id)
+            .get_session(session_id)
             .await
             .map_err(|e| HandlerError::Internal(e.to_string()))?
             .ok_or_else(|| {
                 warn!(
                     conn_id = self.connection.id,
-                    previous_session_id, "Session binding failed: session not found"
+                    session_id, "Session binding failed: session not found"
                 );
                 HandlerError::Status(NtStatus::UserSessionDeleted)
             })?;
 
-        // Verify session hasn't expired
+        // MS-SMB2 3.3.5.5 line 14494:
+        // "If Connection.Dialect is not the same as Session.Connection.Dialect,
+        // the server MUST fail the request with STATUS_INVALID_PARAMETER."
+        if let Some(conn_dialect) = self.connection.dialect {
+            if conn_dialect != session.dialect {
+                warn!(
+                    conn_id = self.connection.id,
+                    session_id,
+                    conn_dialect = ?conn_dialect,
+                    session_dialect = ?session.dialect,
+                    "Session binding failed: dialect mismatch"
+                );
+                return Err(HandlerError::Status(NtStatus::InvalidParameter));
+            }
+        }
+
+        // MS-SMB2 3.3.5.5 line 14496:
+        // "If the SMB2_FLAGS_SIGNED bit is not set in the Flags field in the header,
+        // the server MUST fail the request with error STATUS_INVALID_PARAMETER."
+        if !header.flags.is_signed() {
+            warn!(
+                conn_id = self.connection.id,
+                session_id, "Session binding failed: request not signed"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // MS-SMB2 3.3.5.5 line 14502:
+        // "If Session.State is Expired, the server MUST fail the request with
+        // STATUS_NETWORK_SESSION_EXPIRED."
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1886,42 +1947,76 @@ where
         if now > session.expires_at {
             warn!(
                 conn_id = self.connection.id,
-                previous_session_id,
+                session_id,
                 expires_at = session.expires_at,
                 now,
                 "Session binding failed: session expired"
             );
-            return Err(HandlerError::Status(NtStatus::UserSessionDeleted));
+            return Err(HandlerError::Status(NtStatus::NetworkSessionExpired));
         }
 
-        // Bind session to this connection
-        self.connection.add_session(previous_session_id);
+        // MS-SMB2 3.3.5.5 line 14504:
+        // "If Session.IsAnonymous or Session.IsGuest is TRUE, the server MUST fail
+        // the request with STATUS_NOT_SUPPORTED."
+        if session.is_guest || session.is_anonymous {
+            warn!(
+                conn_id = self.connection.id,
+                session_id,
+                is_guest = session.is_guest,
+                is_anonymous = session.is_anonymous,
+                "Session binding failed: guest/anonymous sessions cannot bind"
+            );
+            return Err(HandlerError::Status(NtStatus::NotSupported));
+        }
 
-        // Restore negotiated dialect from session
-        if self.connection.dialect.is_none() {
-            self.connection.negotiate(session.dialect);
+        // MS-SMB2 3.3.5.5 line 14506:
+        // "If there is a session in Connection.SessionTable identified by the SessionId
+        // in the request, the server MUST fail the request with STATUS_REQUEST_NOT_ACCEPTED."
+        if self.connection.has_session(session_id) {
+            warn!(
+                conn_id = self.connection.id,
+                session_id, "Session binding failed: session already bound to this connection"
+            );
+            return Err(HandlerError::Status(NtStatus::RequestNotAccepted));
+        }
+
+        // MS-SMB2 3.3.5.5 line 14508:
+        // "The server MUST verify the signature as specified in section 3.3.5.2.4,
+        // using the Session.SigningKey."
+        if !session.session_key.is_empty() {
+            let dialect = self.connection.dialect.unwrap_or(session.dialect);
+            self.verify_request_signature(full_message, &session.session_key, dialect)?;
+        }
+
+        // All validations passed - bind session to this connection
+        self.connection.add_session(session_id);
+
+        // Store signing key for this session
+        if !session.session_key.is_empty() {
+            self.signing_keys
+                .insert(session_id, session.session_key.clone());
         }
 
         info!(
             conn_id = self.connection.id,
-            session_id = previous_session_id,
+            session_id,
             user = %session.user_id,
-            "Session bound (HA failover)"
+            "Session bound successfully"
         );
 
         // Refresh session TTL
-        let _ = self
-            .session_manager
-            .refresh_session(previous_session_id)
-            .await;
+        let _ = self.session_manager.refresh_session(session_id).await;
 
         // Build success response
         let mut resp_header = self.build_response_header(header, NtStatus::Success);
-        resp_header.session_id = previous_session_id;
+        resp_header.session_id = session_id;
 
         let mut session_flags = 0u16;
         if session.is_guest {
             session_flags |= SessionFlags::IS_GUEST;
+        }
+        if session.is_anonymous {
+            session_flags |= SessionFlags::IS_NULL;
         }
 
         let response = SessionSetupResponse {
@@ -5386,6 +5481,50 @@ where
         Ok(response)
     }
 
+    /// Verify the signature of an incoming SMB2 request.
+    ///
+    /// Per MS-SMB2 3.3.5.2.4: The server MUST verify the signature as follows:
+    /// 1. The server MUST compute the signature using the signing key
+    /// 2. The server MUST compare the signature in the request with the computed signature
+    /// 3. If they don't match, fail with STATUS_ACCESS_DENIED
+    fn verify_request_signature(
+        &self,
+        message: &[u8],
+        signing_key: &[u8],
+        dialect: SmbDialect,
+    ) -> Result<(), HandlerError> {
+        if message.len() < SMB2_HEADER_SIZE {
+            return Err(HandlerError::Protocol("Message too short to verify".into()));
+        }
+
+        // Extract the signature from the message (bytes 48-63)
+        let mut provided_signature = [0u8; 16];
+        provided_signature.copy_from_slice(&message[48..64]);
+
+        // Zero the signature field for verification
+        let mut message_copy = message.to_vec();
+        message_copy[48..64].fill(0);
+
+        // Compute expected signature
+        let expected_signature = Self::compute_signature(signing_key, dialect, &message_copy)?;
+
+        // Constant-time comparison to prevent timing attacks
+        let mut diff = 0u8;
+        for (a, b) in expected_signature.iter().zip(provided_signature.iter()) {
+            diff |= a ^ b;
+        }
+
+        if diff != 0 {
+            warn!(
+                conn_id = self.connection.id,
+                "Signature verification failed"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
+
+        Ok(())
+    }
+
     /// Compute SMB signing MAC for the provided message bytes.
     ///
     /// The caller is responsible for zeroing the signature field in `message`
@@ -5518,6 +5657,7 @@ fn has_lease_conflict(existing_state: u32, requested_state: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustsmb_state::StateStore;
     use tokio::io::DuplexStream;
 
     // ==========================================================================
@@ -6853,6 +6993,445 @@ mod tests {
         assert!(s1.is_some() && s2.is_some());
         assert_eq!(s1.unwrap().session_key, key1);
         assert_eq!(s2.unwrap().session_key, key2);
+    }
+
+    // ==========================================================================
+    // 3.3.5.5 Step 4 - SESSION_SETUP Binding (Multi-Channel)
+    // ==========================================================================
+    //
+    // These tests verify compliance with MS-SMB2 section 3.3.5.5 Step 4:
+    // "If Connection.Dialect belongs to the SMB 3.x dialect family,
+    // IsMultiChannelCapable is TRUE, and the SMB2_SESSION_FLAG_BINDING bit
+    // is set in the Flags field of the request..."
+    //
+    // Key requirements tested:
+    // - SMB 2.x dialects reject binding with STATUS_REQUEST_NOT_ACCEPTED (line 14522)
+    // - Dialect mismatch returns STATUS_INVALID_PARAMETER (line 14494)
+    // - Unsigned request returns STATUS_INVALID_PARAMETER (line 14496)
+    // - Expired session returns STATUS_NETWORK_SESSION_EXPIRED (line 14502)
+    // - Guest/Anonymous returns STATUS_NOT_SUPPORTED (line 14504)
+    // - Already bound returns STATUS_REQUEST_NOT_ACCEPTED (line 14506)
+    // ==========================================================================
+
+    const STATUS_REQUEST_NOT_ACCEPTED: u32 = 0xC00000D0;
+    const STATUS_INVALID_PARAMETER: u32 = 0xC000000D;
+    const STATUS_NETWORK_SESSION_EXPIRED: u32 = 0xC000035C;
+    const STATUS_NOT_SUPPORTED: u32 = 0xC00000BB;
+
+    /// Helper to create a test handler with a shared state store reference.
+    /// Returns both the handler and the state store for test setup.
+    async fn create_test_handler_with_store(
+        auth_provider: impl AuthProvider,
+    ) -> (ConnectionHandler<DuplexStream>, Arc<MemoryStateStore>) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let _ = client;
+
+        let state_store = Arc::new(MemoryStateStore::new());
+        let session_manager = Arc::new(SessionManager::new(
+            state_store.clone(),
+            rustsmb_session::SessionManagerConfig::default(),
+        ));
+        let config = Arc::new(ServerConfig::default());
+        let shares = Arc::new(ShareManager::new());
+        let lease_registry = Arc::new(LeaseBreakRegistry::new());
+
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
+
+        let handler = ConnectionHandler::new(
+            server,
+            peer_addr,
+            config,
+            session_manager,
+            Arc::new(auth_provider),
+            shares,
+            "test-server-1".to_string(),
+            lease_registry,
+        );
+
+        (handler, state_store)
+    }
+
+    /// Build a SESSION_SETUP binding request message.
+    fn build_session_binding_request(session_id: u64, signed: bool) -> (Smb2Header, Vec<u8>) {
+        use rustsmb_protocol::session_setup::{
+            SessionCapabilities, SessionSecurityMode, SessionSetupFlags, SessionSetupRequest,
+        };
+
+        let header = Smb2Header {
+            structure_size: 64,
+            credit_charge: 1,
+            status: 0,
+            command: Smb2Command::SessionSetup,
+            credits: 1,
+            flags: Smb2Flags(if signed { Smb2Flags::SIGNED } else { 0 }),
+            next_command: 0,
+            message_id: 1,
+            async_id: 0,
+            tree_id: 0,
+            session_id,
+            signature: [0u8; 16],
+        };
+
+        let request = SessionSetupRequest {
+            structure_size: 25,
+            flags: SessionSetupFlags::new(SessionSetupFlags::SESSION_BINDING),
+            security_mode: SessionSecurityMode::new(0),
+            capabilities: SessionCapabilities::new(0),
+            channel: 0,
+            previous_session_id: 0,
+            security_buffer_offset: 88,
+            security_buffer_length: 0,
+        };
+
+        let mut header_buf = Vec::with_capacity(64);
+        header
+            .write(&mut Cursor::new(&mut header_buf))
+            .expect("header serialization");
+        let mut body_buf = Vec::new();
+        request
+            .write(&mut Cursor::new(&mut body_buf))
+            .expect("body serialization");
+
+        let mut full_buf = header_buf;
+        full_buf.extend_from_slice(&body_buf);
+
+        (header, full_buf)
+    }
+
+    /// MS-SMB2 3.3.5.5 line 14522: SMB 2.x dialects reject session binding
+    #[tokio::test]
+    async fn test_session_binding_smb2x_rejected() {
+        let (mut handler, _store) =
+            create_test_handler_with_store(MockMultiRoundAuthProvider::single_round()).await;
+
+        // Set SMB 2.1 dialect (should reject binding - not multi-channel capable)
+        handler.connection.negotiate(SmbDialect::Smb210);
+
+        let (header, full_buf) = build_session_binding_request(12345, true);
+
+        let result = handler
+            .handle_session_setup(&header, &full_buf[64..], &full_buf)
+            .await;
+
+        assert!(result.is_err());
+        let status = result.unwrap_err().status();
+        assert_eq!(
+            status.code(),
+            STATUS_REQUEST_NOT_ACCEPTED,
+            "MS-SMB2 3.3.5.5 line 14522: SMB 2.x dialect SHOULD reject binding"
+        );
+    }
+
+    /// MS-SMB2 3.3.5.5 line 14504: Guest session binding rejected
+    #[tokio::test]
+    async fn test_session_binding_guest_rejected() {
+        use rustsmb_state::types::SessionState;
+
+        let (mut handler, store) =
+            create_test_handler_with_store(MockMultiRoundAuthProvider::single_round()).await;
+
+        // Set SMB 3.0.2 dialect (supports multi-channel)
+        handler.connection.negotiate(SmbDialect::Smb302);
+
+        // Create a guest session in the store
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session_id = 12345u64;
+        let session_state = SessionState {
+            session_id,
+            user_id: "guest".to_string(),
+            domain: None,
+            session_key: vec![0u8; 16],
+            dialect: SmbDialect::Smb302,
+            signing_required: false,
+            encryption_required: false,
+            is_guest: true,
+            is_anonymous: false,
+            created_at: now,
+            last_access: now,
+            expires_at: now + 3600,
+            bound_server_id: None,
+        };
+        store
+            .create_session(&session_state)
+            .await
+            .expect("create session");
+
+        let (header, full_buf) = build_session_binding_request(session_id, true);
+
+        let result = handler
+            .handle_session_setup(&header, &full_buf[64..], &full_buf)
+            .await;
+
+        assert!(result.is_err());
+        let status = result.unwrap_err().status();
+        assert_eq!(
+            status.code(),
+            STATUS_NOT_SUPPORTED,
+            "MS-SMB2 3.3.5.5 line 14504: Guest session binding MUST return NOT_SUPPORTED"
+        );
+    }
+
+    /// MS-SMB2 3.3.5.5 line 14504: Anonymous session binding rejected
+    #[tokio::test]
+    async fn test_session_binding_anonymous_rejected() {
+        use rustsmb_state::types::SessionState;
+
+        let (mut handler, store) =
+            create_test_handler_with_store(MockMultiRoundAuthProvider::single_round()).await;
+
+        handler.connection.negotiate(SmbDialect::Smb302);
+
+        // Create an anonymous session
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session_id = 12346u64;
+        let session_state = SessionState {
+            session_id,
+            user_id: "anonymous".to_string(),
+            domain: None,
+            session_key: vec![0u8; 16],
+            dialect: SmbDialect::Smb302,
+            signing_required: false,
+            encryption_required: false,
+            is_guest: false,
+            is_anonymous: true,
+            created_at: now,
+            last_access: now,
+            expires_at: now + 3600,
+            bound_server_id: None,
+        };
+        store
+            .create_session(&session_state)
+            .await
+            .expect("create session");
+
+        let (header, full_buf) = build_session_binding_request(session_id, true);
+
+        let result = handler
+            .handle_session_setup(&header, &full_buf[64..], &full_buf)
+            .await;
+
+        assert!(result.is_err());
+        let status = result.unwrap_err().status();
+        assert_eq!(
+            status.code(),
+            STATUS_NOT_SUPPORTED,
+            "MS-SMB2 3.3.5.5 line 14504: Anonymous session binding MUST return NOT_SUPPORTED"
+        );
+    }
+
+    /// MS-SMB2 3.3.5.5 line 14496: Unsigned binding request rejected
+    #[tokio::test]
+    async fn test_session_binding_unsigned_rejected() {
+        use rustsmb_state::types::SessionState;
+
+        let (mut handler, store) =
+            create_test_handler_with_store(MockMultiRoundAuthProvider::single_round()).await;
+
+        handler.connection.negotiate(SmbDialect::Smb302);
+
+        // Create a valid session
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session_id = 12347u64;
+        let session_state = SessionState {
+            session_id,
+            user_id: "testuser".to_string(),
+            domain: None,
+            session_key: vec![0u8; 16],
+            dialect: SmbDialect::Smb302,
+            signing_required: false,
+            encryption_required: false,
+            is_guest: false,
+            is_anonymous: false,
+            created_at: now,
+            last_access: now,
+            expires_at: now + 3600,
+            bound_server_id: None,
+        };
+        store
+            .create_session(&session_state)
+            .await
+            .expect("create session");
+
+        // Build request WITHOUT signed flag
+        let (header, full_buf) = build_session_binding_request(session_id, false);
+
+        let result = handler
+            .handle_session_setup(&header, &full_buf[64..], &full_buf)
+            .await;
+
+        assert!(result.is_err());
+        let status = result.unwrap_err().status();
+        assert_eq!(
+            status.code(),
+            STATUS_INVALID_PARAMETER,
+            "MS-SMB2 3.3.5.5 line 14496: Unsigned binding request MUST return INVALID_PARAMETER"
+        );
+    }
+
+    /// MS-SMB2 3.3.5.5 line 14502: Expired session binding rejected
+    #[tokio::test]
+    async fn test_session_binding_expired_rejected() {
+        use rustsmb_state::types::SessionState;
+
+        let (mut handler, store) =
+            create_test_handler_with_store(MockMultiRoundAuthProvider::single_round()).await;
+
+        handler.connection.negotiate(SmbDialect::Smb302);
+
+        // Create an expired session
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session_id = 12348u64;
+        let session_state = SessionState {
+            session_id,
+            user_id: "testuser".to_string(),
+            domain: None,
+            session_key: vec![0u8; 16],
+            dialect: SmbDialect::Smb302,
+            signing_required: false,
+            encryption_required: false,
+            is_guest: false,
+            is_anonymous: false,
+            created_at: now - 7200,
+            last_access: now - 7200,
+            expires_at: now - 3600, // Expired 1 hour ago
+            bound_server_id: None,
+        };
+        store
+            .create_session(&session_state)
+            .await
+            .expect("create session");
+
+        let (header, full_buf) = build_session_binding_request(session_id, true);
+
+        let result = handler
+            .handle_session_setup(&header, &full_buf[64..], &full_buf)
+            .await;
+
+        assert!(result.is_err());
+        let status = result.unwrap_err().status();
+        assert_eq!(
+            status.code(),
+            STATUS_NETWORK_SESSION_EXPIRED,
+            "MS-SMB2 3.3.5.5 line 14502: Expired session MUST return NETWORK_SESSION_EXPIRED"
+        );
+    }
+
+    /// MS-SMB2 3.3.5.5 line 14506: Already bound session rejected
+    #[tokio::test]
+    async fn test_session_binding_already_bound_rejected() {
+        use rustsmb_state::types::SessionState;
+
+        let (mut handler, store) =
+            create_test_handler_with_store(MockMultiRoundAuthProvider::single_round()).await;
+
+        handler.connection.negotiate(SmbDialect::Smb302);
+
+        // Create a valid session
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session_id = 12349u64;
+        let session_state = SessionState {
+            session_id,
+            user_id: "testuser".to_string(),
+            domain: None,
+            session_key: vec![0u8; 16],
+            dialect: SmbDialect::Smb302,
+            signing_required: false,
+            encryption_required: false,
+            is_guest: false,
+            is_anonymous: false,
+            created_at: now,
+            last_access: now,
+            expires_at: now + 3600,
+            bound_server_id: None,
+        };
+        store
+            .create_session(&session_state)
+            .await
+            .expect("create session");
+
+        // Pre-bind the session to this connection
+        handler.connection.add_session(session_id);
+
+        let (header, full_buf) = build_session_binding_request(session_id, true);
+
+        let result = handler
+            .handle_session_setup(&header, &full_buf[64..], &full_buf)
+            .await;
+
+        assert!(result.is_err());
+        let status = result.unwrap_err().status();
+        assert_eq!(
+            status.code(),
+            STATUS_REQUEST_NOT_ACCEPTED,
+            "MS-SMB2 3.3.5.5 line 14506: Already bound session MUST return REQUEST_NOT_ACCEPTED"
+        );
+    }
+
+    /// MS-SMB2 3.3.5.5 line 14494: Dialect mismatch rejected
+    #[tokio::test]
+    async fn test_session_binding_dialect_mismatch_rejected() {
+        use rustsmb_state::types::SessionState;
+
+        let (mut handler, store) =
+            create_test_handler_with_store(MockMultiRoundAuthProvider::single_round()).await;
+
+        // Connection uses SMB 3.0.2
+        handler.connection.negotiate(SmbDialect::Smb302);
+
+        // Create session with SMB 3.0 dialect (different from connection)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session_id = 12350u64;
+        let session_state = SessionState {
+            session_id,
+            user_id: "testuser".to_string(),
+            domain: None,
+            session_key: vec![0u8; 16],
+            dialect: SmbDialect::Smb300, // Session uses SMB 3.0
+            signing_required: false,
+            encryption_required: false,
+            is_guest: false,
+            is_anonymous: false,
+            created_at: now,
+            last_access: now,
+            expires_at: now + 3600,
+            bound_server_id: None,
+        };
+        store
+            .create_session(&session_state)
+            .await
+            .expect("create session");
+
+        let (header, full_buf) = build_session_binding_request(session_id, true);
+
+        let result = handler
+            .handle_session_setup(&header, &full_buf[64..], &full_buf)
+            .await;
+
+        assert!(result.is_err());
+        let status = result.unwrap_err().status();
+        assert_eq!(
+            status.code(),
+            STATUS_INVALID_PARAMETER,
+            "MS-SMB2 3.3.5.5 line 14494: Dialect mismatch MUST return INVALID_PARAMETER"
+        );
     }
 
     // ==========================================================================

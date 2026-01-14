@@ -884,6 +884,37 @@ Implement proper SMB2 lock semantics per MS-SMB2 3.3.5.14, including lock stacki
   - test_lock_conflict_shared_vs_exclusive
   - test_lock_no_conflict_non_overlapping_ranges
 
+### Phase 27: Session Binding Validations - COMPLETED
+
+Implement session binding validations per MS-SMB2 3.3.5.5 Step 4.
+
+- [x] Phase 27A: Add `is_anonymous` field to SessionState
+  - Track anonymous sessions for binding rejection
+  - Per MS-SMB2 3.3.5.5 line 14504
+- [x] Phase 27B: Store `is_anonymous` in SESSION_SETUP handler
+- [x] Phase 27C: Add `is_multi_channel_capable()` helper to Connection
+  - Returns true only for SMB 3.x dialects
+- [x] Phase 27D: Implement session binding validations per MS-SMB2 3.3.5.5
+  - SMB 2.x dialect rejection (line 14522) → STATUS_REQUEST_NOT_ACCEPTED
+  - Dialect mismatch check (line 14494) → STATUS_INVALID_PARAMETER
+  - Unsigned request rejection (line 14496) → STATUS_INVALID_PARAMETER
+  - Session expiration check (line 14502) → STATUS_NETWORK_SESSION_EXPIRED
+  - Guest/Anonymous rejection (line 14504) → STATUS_NOT_SUPPORTED
+  - Already bound check (line 14506) → STATUS_REQUEST_NOT_ACCEPTED
+  - Signature verification (line 14508) → STATUS_ACCESS_DENIED
+- [x] Phase 27E: Add `verify_request_signature()` helper
+- [x] Phase 27F: Update call site to pass full_message
+- [x] Phase 27G: Add unit tests for session binding (7 tests)
+  - test_session_binding_smb2x_rejected
+  - test_session_binding_guest_rejected
+  - test_session_binding_anonymous_rejected
+  - test_session_binding_unsigned_rejected
+  - test_session_binding_expired_rejected
+  - test_session_binding_already_bound_rejected
+  - test_session_binding_dialect_mismatch_rejected
+
+**Note:** The bind_negative_* smbtorture tests still fail because they test multi-dialect binding which requires dialect-aware signing key derivation. When connecting with SMB 2.x and trying to bind to an SMB 3.x session (or vice versa), the signing algorithms differ (HMAC-SHA-256 vs AES-CMAC), causing signature verification to fail before the dialect-specific error can be returned. This is documented in the plan as out of scope.
+
 ## smbtorture Test Analysis
 
 ### Test Results Summary (January 2026)
@@ -891,7 +922,7 @@ Implement proper SMB2 lock semantics per MS-SMB2 3.3.5.14, including lock stacki
 | Suite | Status | Key Issues |
 |-------|--------|------------|
 | smb2.connect | **PASS** | - |
-| smb2.session | **FAIL** | reauth5/6, bind_negative_* (multi-dialect signing) |
+| smb2.session | **PARTIAL (8/17)** | reauth5/6 (multi-dialect), bind_negative_* (multi-dialect signing) |
 | smb2.tcon | **PASS** | - |
 | smb2.create | **FAIL** | gentest, blob, aclfile, acldir, nulldacl |
 | smb2.read | **PASS** | All tests pass (eof, position, dir, access) - Fixed in Phase 23 |
@@ -916,6 +947,7 @@ Implement proper SMB2 lock semantics per MS-SMB2 3.3.5.14, including lock stacki
 | Read directory → STATUS_INVALID_DEVICE_REQUEST | ✅ | ✅ | - |
 | File position tracking | ✅ | ✅ | - |
 | Attributes-only opens (no oplock break) | ✅ | ❌ | P3 |
+| Session binding validations | ✅ | ✅ (same-dialect) | Phase 27 |
 | SMB2_CAP_MULTI_CHANNEL | ⚠️ Experimental | ❌ | P3 |
 | SMB Direct (RDMA) | ✅ | ❌ | - |
 | POSIX extensions | ✅ | ❌ | - |
