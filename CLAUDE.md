@@ -915,6 +915,37 @@ Implement session binding validations per MS-SMB2 3.3.5.5 Step 4.
 
 **Note:** The bind_negative_* smbtorture tests still fail because they test multi-dialect binding which requires dialect-aware signing key derivation. When connecting with SMB 2.x and trying to bind to an SMB 3.x session (or vice versa), the signing algorithms differ (HMAC-SHA-256 vs AES-CMAC), causing signature verification to fail before the dialect-specific error can be returned. This is documented in the plan as out of scope.
 
+### Phase 28: IOCTL FSCTL_SRV_COPYCHUNK - COMPLETED
+
+Implement server-side file copy via FSCTL_SRV_COPYCHUNK per MS-SMB2 3.3.5.15.5-6.
+
+- [x] Phase 28.1: Protocol structures (ioctl.rs)
+  - SrvRequestResumeKeyResponse (32 bytes: 24-byte key + context_length + reserved)
+  - SrvCopychunkCopy (source_key, chunk_count, chunks)
+  - SrvCopychunkCopyChunk (source_offset, target_offset, length)
+  - SrvCopychunkResponse (chunks_written, chunk_bytes_written, total_bytes_written)
+- [x] Phase 28.2: Server limits configuration (config.rs)
+  - ServerSideCopyConfig: max_chunk_size (1MB), max_data_size (16MB), max_number_of_chunks (256)
+- [x] Phase 28.3: handle_request_resume_key() per MS-SMB2 3.3.5.15.5
+  - Resume key = persistent_id (16 bytes) + session_id (8 bytes)
+  - Validate MaxOutputResponse >= 32
+- [x] Phase 28.4: handle_copychunk() per MS-SMB2 3.3.5.15.6
+  - Parse and validate COPYCHUNK request
+  - Validate source and dest handles
+  - Access rights validation (FILE_READ_DATA or FILE_EXECUTE on source, FILE_WRITE_DATA on dest)
+  - Lock conflict detection for source and dest ranges
+  - Perform chunk copies via backend
+  - Return proper response (chunk_bytes_written = 0 for success)
+- [x] Phase 28.5: Wire up IOCTL dispatch for SrvRequestResumeKey, SrvCopychunk, SrvCopychunkWrite
+- [x] Phase 28.6: Lock conflict error handling with proper IOCTL response body
+
+**Results:** 21+ smb2.ioctl tests pass including:
+- req_resume_key, req_two_resume_keys
+- copy_chunk_simple, copy_chunk_multi, copy_chunk_tiny
+- copy_chunk_src_lock, copy_chunk_dest_lock
+- copy_chunk_bad_access, copy_chunk_bad_key
+- copy_chunk_limits, copy_chunk_across_shares*, etc.
+
 ## smbtorture Test Analysis
 
 ### Test Results Summary (January 2026)
@@ -1130,12 +1161,12 @@ Implement session binding validations per MS-SMB2 3.3.5.5 Step 4.
 | Test | Status | Issue |
 |------|--------|-------|
 | related1 | PASS | - |
-| related2-9 | FAIL | Requires IOCTL support |
-| unrelated1 | FAIL | Requires IOCTL support |
-| invalid1-4 | FAIL | Error handling edge cases |
-| interim1-2 | FAIL | Async interim responses |
+| related2-9 | FAIL | Compound response signing - client sees "Bad SMB2 signature" |
+| unrelated1 | FAIL | Compound response signing - client sees "Bad SMB2 signature" |
+| invalid1-4 | FAIL | Compound response signing issues |
+| interim1-2 | FAIL | Async interim responses not implemented |
 | compound-break | PASS | - |
-| compound-padding | FAIL | Padding validation |
+| compound-padding | FAIL | Compound padding validation |
 | create-write-close | PASS | - |
 
 #### smb2.credits (0/3 FAIL)
@@ -1165,16 +1196,25 @@ Implement session binding validations per MS-SMB2 3.3.5.5 Step 4.
 |------|--------|-------|
 | setinfo | FAIL | Set info operations |
 
-#### smb2.ioctl (0/N FAIL, many SKIP)
+#### smb2.ioctl (21/73 PASS, 44 SKIP, 8 FAIL)
 
 | Test | Status | Issue |
 |------|--------|-------|
+| req_resume_key | PASS | Phase 28 |
+| req_two_resume_keys | PASS | Phase 28 |
+| copy_chunk_simple | PASS | Phase 28 |
+| copy_chunk_multi | PASS | Phase 28 |
+| copy_chunk_*_lock | PASS | Phase 28 (lock conflict detection) |
+| copy_chunk_bad_access | PASS | Phase 28 (access rights) |
+| copy_chunk_limits | PASS | Phase 28 (server limits) |
+| copy_chunk_across_shares* | PASS | Phase 28 |
+| copy_chunk_src_exceed | FAIL | Source file size validation needed |
+| copy_chunk_max_output_sz | FAIL | Output buffer size validation |
 | shadow_copy | SKIP | VSS not implemented |
-| req_resume_key | FAIL | Resume key not implemented |
-| copy_chunk_* | FAIL | Server-side copy not implemented |
 | compress_* | SKIP/FAIL | Compression not implemented |
 | network_interface_info | SKIP | Multi-channel not implemented |
 | sparse_* | SKIP | Sparse files not implemented |
+| dup_extents_* | SKIP | Deduplication not implemented |
 
 #### smb2.rename (0/11 FAIL)
 

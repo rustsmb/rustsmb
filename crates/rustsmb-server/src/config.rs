@@ -41,6 +41,8 @@ pub struct ServerConfig {
     pub dialects: Vec<String>,
     /// Coordination configuration (for multi-server deployments).
     pub coordination: CoordinationConfig,
+    /// Server-side copy configuration (FSCTL_SRV_COPYCHUNK).
+    pub server_side_copy: ServerSideCopyConfig,
 }
 
 /// Session configuration.
@@ -59,6 +61,35 @@ pub struct SessionConfig {
     /// Idle timeout in seconds.
     #[serde(with = "duration_secs_serde")]
     pub idle_timeout: Duration,
+}
+
+/// Server-side copy configuration (FSCTL_SRV_COPYCHUNK).
+///
+/// Per MS-SMB2 2.2.32.1, when a COPYCHUNK request exceeds server limits,
+/// the server returns STATUS_INVALID_PARAMETER with a response containing
+/// these limits so the client can adjust.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerSideCopyConfig {
+    /// Maximum size of a single chunk in bytes.
+    /// Default: 1MB (1,048,576 bytes).
+    pub max_chunk_size: u32,
+    /// Maximum total data size per COPYCHUNK request in bytes.
+    /// Default: 16MB (16,777,216 bytes).
+    pub max_data_size: u32,
+    /// Maximum number of chunks per COPYCHUNK request.
+    /// Default: 256.
+    pub max_number_of_chunks: u32,
+}
+
+impl Default for ServerSideCopyConfig {
+    fn default() -> Self {
+        Self {
+            max_chunk_size: 1_048_576, // 1MB
+            max_data_size: 16_777_216, // 16MB
+            max_number_of_chunks: 256,
+        }
+    }
 }
 
 /// Coordination configuration for multi-server deployments.
@@ -152,6 +183,7 @@ impl Default for ServerConfig {
                 "SMB 2.0.2".to_string(),
             ],
             coordination: CoordinationConfig::default(),
+            server_side_copy: ServerSideCopyConfig::default(),
         }
     }
 }

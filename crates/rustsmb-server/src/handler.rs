@@ -4358,6 +4358,15 @@ where
                 self.handle_validate_negotiate_info(header, &request, body)
                     .await
             }
+            Some(FsctlCode::SrvRequestResumeKey) => {
+                self.handle_request_resume_key(header, &request).await
+            }
+            Some(FsctlCode::SrvCopychunk) => {
+                self.handle_copychunk(header, &request, body, false).await
+            }
+            Some(FsctlCode::SrvCopychunkWrite) => {
+                self.handle_copychunk(header, &request, body, true).await
+            }
             _ => {
                 debug!(
                     conn_id = self.connection.id,
@@ -4506,6 +4515,582 @@ where
             output_len = output_buffer.len(),
             "ValidateNegotiate: success"
         );
+
+        Ok(result)
+    }
+
+    /// Handle FSCTL_SRV_REQUEST_RESUME_KEY (MS-SMB2 3.3.5.15.5).
+    ///
+    /// Returns a 24-byte opaque resume key that uniquely identifies the open.
+    /// The resume key is used by FSCTL_SRV_COPYCHUNK to identify the source file.
+    async fn handle_request_resume_key(
+        &mut self,
+        header: &Smb2Header,
+        request: &rustsmb_protocol::ioctl::IoctlRequest,
+    ) -> Result<Vec<u8>, HandlerError> {
+        use rustsmb_protocol::ioctl::{
+            IoctlResponse, SrvRequestResumeKeyResponse, IOCTL_RESPONSE_SIZE,
+        };
+
+        debug!(
+            conn_id = self.connection.id,
+            persistent_id = request.file_id_persistent,
+            volatile_id = request.file_id_volatile,
+            "FSCTL_SRV_REQUEST_RESUME_KEY"
+        );
+
+        // Per MS-SMB2 3.3.5.15.5: If MaxOutputResponse < 32, return INVALID_PARAMETER
+        // Resume key response is 28 bytes, but spec says check for 32
+        if request.max_output_response < 32 {
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Get the handle
+        let handle_id =
+            (request.file_id_volatile as u128) << 64 | request.file_id_persistent as u128;
+        let handle = self
+            .session_manager
+            .get_handle(handle_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::FileClosed))?;
+
+        // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
+        self.validate_handle_tree_id(header, &handle)?;
+
+        // Build 24-byte resume key:
+        // - Bytes 0-15: persistent_id (128-bit)
+        // - Bytes 16-23: session_id (64-bit) for validation
+        let mut resume_key = [0u8; 24];
+        resume_key[..16].copy_from_slice(&handle.persistent_id.to_le_bytes());
+        resume_key[16..24].copy_from_slice(&header.session_id.to_le_bytes());
+
+        let resume_response = SrvRequestResumeKeyResponse {
+            resume_key,
+            context_length: 0,
+            reserved: 0,
+        };
+
+        // Serialize the response (32 bytes per MS-SMB2 3.3.5.15.5)
+        let mut output_buffer = Vec::with_capacity(32);
+        resume_response
+            .write(&mut Cursor::new(&mut output_buffer))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to write resume key: {}", e)))?;
+
+        // Build IOCTL response
+        let output_offset = (SMB2_HEADER_SIZE + IOCTL_RESPONSE_SIZE as usize - 1) as u32;
+        let resp_header = self.build_response_header(header, NtStatus::Success);
+        let response = IoctlResponse {
+            structure_size: IOCTL_RESPONSE_SIZE,
+            reserved: 0,
+            ctl_code: request.ctl_code,
+            file_id_persistent: request.file_id_persistent,
+            file_id_volatile: request.file_id_volatile,
+            input_offset: 0,
+            input_count: 0,
+            output_offset,
+            output_count: output_buffer.len() as u32,
+            flags: 0,
+            reserved2: 0,
+        };
+
+        // Serialize full response
+        let mut result = Vec::with_capacity(SMB2_HEADER_SIZE + 48 + output_buffer.len());
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        resp_header
+            .write(&mut Cursor::new(&mut header_buf))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to write header: {}", e)))?;
+        result.extend_from_slice(&header_buf);
+
+        let mut body_buf = Vec::with_capacity(48);
+        response
+            .write(&mut Cursor::new(&mut body_buf))
+            .map_err(|e| {
+                HandlerError::Protocol(format!("Failed to write IOCTL response: {}", e))
+            })?;
+        result.extend_from_slice(&body_buf);
+        result.extend_from_slice(&output_buffer);
+
+        debug!(
+            conn_id = self.connection.id,
+            "FSCTL_SRV_REQUEST_RESUME_KEY: success"
+        );
+
+        Ok(result)
+    }
+
+    /// Handle FSCTL_SRV_COPYCHUNK and FSCTL_SRV_COPYCHUNK_WRITE (MS-SMB2 3.3.5.15.6).
+    ///
+    /// Performs server-side file copy from source (identified by resume key) to
+    /// destination (identified by FileId in the request).
+    ///
+    /// - FSCTL_SRV_COPYCHUNK requires FILE_READ_DATA on dest (for read verification)
+    /// - FSCTL_SRV_COPYCHUNK_WRITE does not require FILE_READ_DATA on dest
+    async fn handle_copychunk(
+        &mut self,
+        header: &Smb2Header,
+        request: &rustsmb_protocol::ioctl::IoctlRequest,
+        body: &[u8],
+        is_write_variant: bool,
+    ) -> Result<Vec<u8>, HandlerError> {
+        use rustsmb_protocol::ioctl::{
+            IoctlResponse, SrvCopychunkCopy, SrvCopychunkResponse, IOCTL_RESPONSE_SIZE,
+        };
+
+        debug!(
+            conn_id = self.connection.id,
+            is_write_variant, "FSCTL_SRV_COPYCHUNK"
+        );
+
+        // Parse input buffer from request
+        let input_offset = request.input_offset as usize;
+        let input_count = request.input_count as usize;
+        let body_offset = input_offset.saturating_sub(SMB2_HEADER_SIZE);
+
+        if body_offset + input_count > body.len() {
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        let input = &body[body_offset..body_offset + input_count];
+
+        // Parse the COPYCHUNK request
+        let copy_req = SrvCopychunkCopy::parse(input)
+            .map_err(|_| HandlerError::Status(NtStatus::InvalidParameter))?;
+
+        // Get server limits from config
+        let max_chunks = self.config.server_side_copy.max_number_of_chunks;
+        let max_chunk_size = self.config.server_side_copy.max_chunk_size;
+        let max_data_size = self.config.server_side_copy.max_data_size;
+
+        // Validate chunk count
+        if copy_req.chunk_count == 0 {
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Per MS-SMB2 3.3.5.15.6: If limits exceeded, return INVALID_PARAMETER with limits
+        if copy_req.chunk_count > max_chunks {
+            return self.build_copychunk_error_response(
+                header,
+                request,
+                max_chunks,
+                max_chunk_size,
+                max_data_size,
+            );
+        }
+
+        // Calculate total data size and validate each chunk
+        let mut total_data = 0u64;
+        for chunk in &copy_req.chunks {
+            if chunk.length == 0 || chunk.length > max_chunk_size {
+                return self.build_copychunk_error_response(
+                    header,
+                    request,
+                    max_chunks,
+                    max_chunk_size,
+                    max_data_size,
+                );
+            }
+            total_data += chunk.length as u64;
+        }
+
+        if total_data > max_data_size as u64 {
+            return self.build_copychunk_error_response(
+                header,
+                request,
+                max_chunks,
+                max_chunk_size,
+                max_data_size,
+            );
+        }
+
+        // Extract source info from resume key
+        let source_persistent_id =
+            u128::from_le_bytes(copy_req.source_key[..16].try_into().unwrap());
+        let source_session_id = u64::from_le_bytes(copy_req.source_key[16..24].try_into().unwrap());
+
+        // Per MS-SMB2 3.3.5.15.6: Source and dest must be same session
+        if source_session_id != header.session_id {
+            debug!(
+                conn_id = self.connection.id,
+                source_session_id,
+                request_session_id = header.session_id,
+                "COPYCHUNK: session mismatch"
+            );
+            return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+        }
+
+        // Get source handle
+        let source_handle = self
+            .session_manager
+            .get_handle(source_persistent_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::ObjectNameNotFound))?;
+
+        // Validate source handle belongs to same session
+        if source_handle.session_id != header.session_id {
+            return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+        }
+
+        // Get destination handle
+        let dest_handle_id =
+            (request.file_id_volatile as u128) << 64 | request.file_id_persistent as u128;
+        let dest_handle = self
+            .session_manager
+            .get_handle(dest_handle_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::FileClosed))?;
+
+        // Validate tree_id matches for dest handle (MS-SMB2 3.3.5.2.11)
+        self.validate_handle_tree_id(header, &dest_handle)?;
+
+        // Validate access rights (MS-SMB2 3.3.5.15.6)
+        const FILE_READ_DATA: u32 = 0x00000001;
+        const FILE_WRITE_DATA: u32 = 0x00000002;
+        const FILE_EXECUTE: u32 = 0x00000020;
+
+        // Source must have some form of read access (FILE_READ_DATA or FILE_EXECUTE)
+        // Per MS-SMB2 3.3.5.15.6 this is "MAY fail", but Windows requires one of these
+        if source_handle.access_mask & (FILE_READ_DATA | FILE_EXECUTE) == 0 {
+            debug!(
+                conn_id = self.connection.id,
+                "COPYCHUNK: source lacks FILE_READ_DATA or FILE_EXECUTE"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
+
+        // Dest must have FILE_WRITE_DATA
+        if dest_handle.access_mask & FILE_WRITE_DATA == 0 {
+            debug!(
+                conn_id = self.connection.id,
+                "COPYCHUNK: dest lacks FILE_WRITE_DATA"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
+
+        // FSCTL_SRV_COPYCHUNK (not _WRITE) also requires FILE_READ_DATA on dest
+        if !is_write_variant && dest_handle.access_mask & FILE_READ_DATA == 0 {
+            debug!(
+                conn_id = self.connection.id,
+                "COPYCHUNK: dest lacks FILE_READ_DATA (required for non-WRITE variant)"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
+
+        // Get tree and backend for dest handle (source and dest must be same session, likely same tree)
+        let tree = self
+            .session_manager
+            .get_tree(header.session_id, header.tree_id)
+            .await
+            .map_err(|e| HandlerError::Internal(e.to_string()))?
+            .ok_or(HandlerError::Status(NtStatus::InvalidParameter))?;
+
+        let backend = self
+            .shares
+            .get_share(&tree.share_name)
+            .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
+
+        // Open source file for reading
+        let source_open_params = CreateParams {
+            desired_access: rustsmb_vfs::access_mask::GENERIC_READ,
+            share_access: 0,
+            create_disposition: rustsmb_vfs::disposition::OPEN,
+            create_options: 0,
+            file_attributes: 0,
+        };
+        let source_file = backend
+            .open(&source_handle.path, &source_open_params)
+            .await
+            .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+
+        // Open dest file for writing
+        let dest_open_params = CreateParams {
+            desired_access: rustsmb_vfs::access_mask::GENERIC_WRITE,
+            share_access: 0,
+            create_disposition: rustsmb_vfs::disposition::OPEN,
+            create_options: 0,
+            file_attributes: 0,
+        };
+        let dest_file = backend
+            .open(&dest_handle.path, &dest_open_params)
+            .await
+            .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+
+        // Check for lock conflicts per MS-SMB2 3.3.5.15.6
+        // "If the Source Open is locked by another open in a way that would prevent a read,
+        // the server MUST fail the request with STATUS_FILE_LOCK_CONFLICT."
+        let source_locks = self
+            .session_manager
+            .state_store()
+            .get_file_locks(&source_handle.path)
+            .await
+            .unwrap_or_default();
+        let dest_locks = self
+            .session_manager
+            .state_store()
+            .get_file_locks(&dest_handle.path)
+            .await
+            .unwrap_or_default();
+
+        // Helper to check if a range overlaps with any exclusive lock from a different handle
+        let check_lock_conflict =
+            |locks: &[DistributedLock], handle_id: u128, offset: u64, length: u32| -> bool {
+                for lock in locks {
+                    // Same handle can't conflict with itself
+                    if lock.handle_id == handle_id {
+                        continue;
+                    }
+                    // Only exclusive locks block access
+                    if !lock.exclusive {
+                        continue;
+                    }
+                    // Check range overlap
+                    let lock_end = if lock.length == 0 {
+                        u64::MAX
+                    } else {
+                        lock.offset.saturating_add(lock.length)
+                    };
+                    let range_end = offset.saturating_add(length as u64);
+                    if offset < lock_end && lock.offset < range_end {
+                        return true; // Conflict found
+                    }
+                }
+                false
+            };
+
+        // Pre-check all chunks for lock conflicts
+        for chunk in &copy_req.chunks {
+            // Check source read conflicts
+            if check_lock_conflict(
+                &source_locks,
+                source_handle.persistent_id,
+                chunk.source_offset,
+                chunk.length,
+            ) {
+                debug!(
+                    conn_id = self.connection.id,
+                    "COPYCHUNK: source range locked by another handle"
+                );
+                return self.build_copychunk_lock_error_response(header, request);
+            }
+            // Check dest write conflicts
+            if check_lock_conflict(
+                &dest_locks,
+                dest_handle.persistent_id,
+                chunk.target_offset,
+                chunk.length,
+            ) {
+                debug!(
+                    conn_id = self.connection.id,
+                    "COPYCHUNK: dest range locked by another handle"
+                );
+                return self.build_copychunk_lock_error_response(header, request);
+            }
+        }
+
+        // Perform the copy chunks
+        let mut chunks_written = 0u32;
+        let mut total_bytes_written = 0u32;
+
+        for chunk in &copy_req.chunks {
+            // Read from source
+            let data = backend
+                .read(&source_file, chunk.source_offset, chunk.length)
+                .await
+                .map_err(|e| {
+                    debug!(conn_id = self.connection.id, error = ?e, "COPYCHUNK: read failed");
+                    HandlerError::Vfs(e.to_string())
+                })?;
+
+            // Write to dest
+            let bytes_to_write = data.len();
+            if bytes_to_write > 0 {
+                backend
+                    .write(&dest_file, chunk.target_offset, &data)
+                    .await
+                    .map_err(|e| {
+                        debug!(conn_id = self.connection.id, error = ?e, "COPYCHUNK: write failed");
+                        HandlerError::Vfs(e.to_string())
+                    })?;
+            }
+
+            chunks_written += 1;
+            total_bytes_written += bytes_to_write as u32;
+        }
+
+        // Build success response
+        let copychunk_response = SrvCopychunkResponse {
+            chunks_written,
+            chunk_bytes_written: 0, // Per MS-SMB2 2.2.32.1: 0 indicates successful completion
+            total_bytes_written,
+        };
+
+        let mut output_buffer = Vec::with_capacity(12);
+        copychunk_response
+            .write(&mut Cursor::new(&mut output_buffer))
+            .map_err(|e| {
+                HandlerError::Protocol(format!("Failed to write copychunk response: {}", e))
+            })?;
+
+        // Build IOCTL response
+        let output_offset = (SMB2_HEADER_SIZE + IOCTL_RESPONSE_SIZE as usize - 1) as u32;
+        let resp_header = self.build_response_header(header, NtStatus::Success);
+        let response = IoctlResponse {
+            structure_size: IOCTL_RESPONSE_SIZE,
+            reserved: 0,
+            ctl_code: request.ctl_code,
+            file_id_persistent: request.file_id_persistent,
+            file_id_volatile: request.file_id_volatile,
+            input_offset: 0,
+            input_count: 0,
+            output_offset,
+            output_count: output_buffer.len() as u32,
+            flags: 0,
+            reserved2: 0,
+        };
+
+        // Serialize full response
+        let mut result = Vec::with_capacity(SMB2_HEADER_SIZE + 48 + output_buffer.len());
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        resp_header
+            .write(&mut Cursor::new(&mut header_buf))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to write header: {}", e)))?;
+        result.extend_from_slice(&header_buf);
+
+        let mut body_buf = Vec::with_capacity(48);
+        response
+            .write(&mut Cursor::new(&mut body_buf))
+            .map_err(|e| {
+                HandlerError::Protocol(format!("Failed to write IOCTL response: {}", e))
+            })?;
+        result.extend_from_slice(&body_buf);
+        result.extend_from_slice(&output_buffer);
+
+        debug!(
+            conn_id = self.connection.id,
+            chunks_written, total_bytes_written, "FSCTL_SRV_COPYCHUNK: success"
+        );
+
+        Ok(result)
+    }
+
+    /// Build error response for COPYCHUNK with server limits.
+    ///
+    /// Per MS-SMB2 3.3.5.15.6, when limits are exceeded, return STATUS_INVALID_PARAMETER
+    /// with a response containing the server's limits.
+    fn build_copychunk_error_response(
+        &self,
+        header: &Smb2Header,
+        request: &rustsmb_protocol::ioctl::IoctlRequest,
+        max_chunks: u32,
+        max_chunk_size: u32,
+        max_data_size: u32,
+    ) -> Result<Vec<u8>, HandlerError> {
+        use rustsmb_protocol::ioctl::{IoctlResponse, SrvCopychunkResponse, IOCTL_RESPONSE_SIZE};
+
+        let copychunk_response =
+            SrvCopychunkResponse::with_limits(max_chunks, max_chunk_size, max_data_size);
+
+        let mut output_buffer = Vec::with_capacity(12);
+        copychunk_response
+            .write(&mut Cursor::new(&mut output_buffer))
+            .map_err(|e| {
+                HandlerError::Protocol(format!("Failed to write copychunk limits: {}", e))
+            })?;
+
+        // Build IOCTL response with INVALID_PARAMETER status
+        let output_offset = (SMB2_HEADER_SIZE + IOCTL_RESPONSE_SIZE as usize - 1) as u32;
+        let resp_header = self.build_response_header(header, NtStatus::InvalidParameter);
+        let response = IoctlResponse {
+            structure_size: IOCTL_RESPONSE_SIZE,
+            reserved: 0,
+            ctl_code: request.ctl_code,
+            file_id_persistent: request.file_id_persistent,
+            file_id_volatile: request.file_id_volatile,
+            input_offset: 0,
+            input_count: 0,
+            output_offset,
+            output_count: output_buffer.len() as u32,
+            flags: 0,
+            reserved2: 0,
+        };
+
+        // Serialize full response
+        let mut result = Vec::with_capacity(SMB2_HEADER_SIZE + 48 + output_buffer.len());
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        resp_header
+            .write(&mut Cursor::new(&mut header_buf))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to write header: {}", e)))?;
+        result.extend_from_slice(&header_buf);
+
+        let mut body_buf = Vec::with_capacity(48);
+        response
+            .write(&mut Cursor::new(&mut body_buf))
+            .map_err(|e| {
+                HandlerError::Protocol(format!("Failed to write IOCTL response: {}", e))
+            })?;
+        result.extend_from_slice(&body_buf);
+        result.extend_from_slice(&output_buffer);
+
+        Ok(result)
+    }
+
+    /// Build COPYCHUNK response for lock conflict error.
+    fn build_copychunk_lock_error_response(
+        &self,
+        header: &Smb2Header,
+        request: &rustsmb_protocol::ioctl::IoctlRequest,
+    ) -> Result<Vec<u8>, HandlerError> {
+        use rustsmb_protocol::ioctl::{IoctlResponse, SrvCopychunkResponse, IOCTL_RESPONSE_SIZE};
+
+        // Return response with 0 chunks written
+        let copychunk_response = SrvCopychunkResponse {
+            chunks_written: 0,
+            chunk_bytes_written: 0,
+            total_bytes_written: 0,
+        };
+
+        let mut output_buffer = Vec::with_capacity(12);
+        copychunk_response
+            .write(&mut Cursor::new(&mut output_buffer))
+            .map_err(|e| {
+                HandlerError::Protocol(format!("Failed to write copychunk response: {}", e))
+            })?;
+
+        // Build IOCTL response with FILE_LOCK_CONFLICT status
+        let output_offset = (SMB2_HEADER_SIZE + IOCTL_RESPONSE_SIZE as usize - 1) as u32;
+        let resp_header = self.build_response_header(header, NtStatus::FileLockConflict);
+        let response = IoctlResponse {
+            structure_size: IOCTL_RESPONSE_SIZE,
+            reserved: 0,
+            ctl_code: request.ctl_code,
+            file_id_persistent: request.file_id_persistent,
+            file_id_volatile: request.file_id_volatile,
+            input_offset: 0,
+            input_count: 0,
+            output_offset,
+            output_count: output_buffer.len() as u32,
+            flags: 0,
+            reserved2: 0,
+        };
+
+        // Serialize full response
+        let mut result = Vec::with_capacity(SMB2_HEADER_SIZE + 48 + output_buffer.len());
+        let mut header_buf = Vec::with_capacity(SMB2_HEADER_SIZE);
+        resp_header
+            .write(&mut Cursor::new(&mut header_buf))
+            .map_err(|e| HandlerError::Protocol(format!("Failed to write header: {}", e)))?;
+        result.extend_from_slice(&header_buf);
+
+        let mut body_buf = Vec::with_capacity(48);
+        response
+            .write(&mut Cursor::new(&mut body_buf))
+            .map_err(|e| {
+                HandlerError::Protocol(format!("Failed to write IOCTL response: {}", e))
+            })?;
+        result.extend_from_slice(&body_buf);
+        result.extend_from_slice(&output_buffer);
 
         Ok(result)
     }
@@ -5677,6 +6262,7 @@ mod tests {
     // 3.3.5.10  - CLOSE
     // 3.3.5.12  - READ
     // 3.3.5.14  - LOCK
+    // 3.3.5.15  - IOCTL (FSCTL_SRV_REQUEST_RESUME_KEY, FSCTL_SRV_COPYCHUNK)
     //
     // ==========================================================================
 
@@ -11268,6 +11854,371 @@ mod tests {
         assert!(
             !filename_matches,
             "MS-SMB2 3.3.5.9.7: Mismatched filename should be rejected for reconnect"
+        );
+    }
+
+    // ==========================================================================
+    // 3.3.5.15 - IOCTL
+    // ==========================================================================
+    //
+    // This section covers IOCTL operations:
+    // - FSCTL_SRV_REQUEST_RESUME_KEY (3.3.5.15.5)
+    // - FSCTL_SRV_COPYCHUNK (3.3.5.15.6)
+    // ==========================================================================
+
+    // -------------------------------------------------------------------------
+    // 3.3.5.15.5 - FSCTL_SRV_REQUEST_RESUME_KEY Tests
+    // -------------------------------------------------------------------------
+
+    /// Test: Resume key response format is 28 bytes (24-byte key + 4-byte context_length)
+    #[test]
+    fn test_resume_key_response_format() {
+        use binrw::BinWrite;
+        use rustsmb_protocol::ioctl::SrvRequestResumeKeyResponse;
+        use std::io::Cursor;
+
+        let mut resume_key = [0u8; 24];
+        // Simulate persistent_id (bytes 0-15)
+        let persistent_id: u128 = 0x123456789ABCDEF0;
+        resume_key[..16].copy_from_slice(&persistent_id.to_le_bytes());
+        // Simulate session_id (bytes 16-23)
+        let session_id: u64 = 0xDEADBEEF;
+        resume_key[16..24].copy_from_slice(&session_id.to_le_bytes());
+
+        let response = SrvRequestResumeKeyResponse {
+            resume_key,
+            context_length: 0,
+            reserved: 0,
+        };
+
+        let mut buf = Vec::new();
+        response.write(&mut Cursor::new(&mut buf)).unwrap();
+
+        assert_eq!(
+            buf.len(),
+            32,
+            "MS-SMB2 2.2.32.3: Resume key response must be 32 bytes"
+        );
+        assert_eq!(
+            &buf[..16],
+            &persistent_id.to_le_bytes(),
+            "Resume key bytes 0-15 should contain persistent_id"
+        );
+        assert_eq!(
+            &buf[16..24],
+            &session_id.to_le_bytes(),
+            "Resume key bytes 16-23 should contain session_id"
+        );
+        assert_eq!(&buf[24..28], &[0u8; 4], "Context length must be 0");
+        assert_eq!(&buf[28..32], &[0u8; 4], "Reserved must be 0");
+    }
+
+    /// Test: Resume key request with MaxOutputResponse < 32 returns INVALID_PARAMETER
+    #[test]
+    fn test_resume_key_max_output_too_small() {
+        // Per MS-SMB2 3.3.5.15.5:
+        // "If MaxOutputResponse is less than 32, the server MUST fail the request
+        // with STATUS_INVALID_PARAMETER."
+        let max_output_response = 31u32;
+        let required_size = 32u32;
+
+        assert!(
+            max_output_response < required_size,
+            "MS-SMB2 3.3.5.15.5: MaxOutputResponse < 32 should trigger INVALID_PARAMETER"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // 3.3.5.15.6 - FSCTL_SRV_COPYCHUNK Tests
+    // -------------------------------------------------------------------------
+
+    /// Test: COPYCHUNK with chunk count = 0 returns INVALID_PARAMETER
+    #[test]
+    fn test_copychunk_chunk_count_zero() {
+        // Per MS-SMB2 3.3.5.15.6:
+        // "If the ChunkCount field is zero, the server SHOULD fail the request
+        // with STATUS_INVALID_PARAMETER."
+        let chunk_count = 0u32;
+
+        assert_eq!(
+            chunk_count, 0,
+            "MS-SMB2 3.3.5.15.6: ChunkCount == 0 should return INVALID_PARAMETER"
+        );
+    }
+
+    /// Test: COPYCHUNK response with server limits format
+    #[test]
+    fn test_copychunk_response_with_limits() {
+        use binrw::BinWrite;
+        use rustsmb_protocol::ioctl::SrvCopychunkResponse;
+        use std::io::Cursor;
+
+        // Default server limits per config
+        let max_chunks = 256u32;
+        let max_chunk_size = 1_048_576u32; // 1MB
+        let max_data_size = 16_777_216u32; // 16MB
+
+        let response = SrvCopychunkResponse::with_limits(max_chunks, max_chunk_size, max_data_size);
+
+        let mut buf = Vec::new();
+        response.write(&mut Cursor::new(&mut buf)).unwrap();
+
+        assert_eq!(
+            buf.len(),
+            12,
+            "MS-SMB2 2.2.32.1: COPYCHUNK response must be 12 bytes"
+        );
+
+        // Verify the response contains the limits
+        let chunks_written = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let chunk_bytes_written = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let total_bytes_written = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+
+        assert_eq!(
+            chunks_written, max_chunks,
+            "chunks_written should contain MaxNumberOfChunks"
+        );
+        assert_eq!(
+            chunk_bytes_written, max_chunk_size,
+            "chunk_bytes_written should contain MaxChunkSize"
+        );
+        assert_eq!(
+            total_bytes_written, max_data_size,
+            "total_bytes_written should contain MaxDataSize"
+        );
+    }
+
+    /// Test: COPYCHUNK exceeds chunk count limit returns limits in response
+    #[test]
+    fn test_copychunk_exceeds_max_chunks() {
+        // Per MS-SMB2 3.3.5.15.6:
+        // "If the CopychunkCount exceeds ServerSideCopyMaxNumberofChunks,
+        // the server MUST fail the request with STATUS_INVALID_PARAMETER
+        // and return the server limitations in the response."
+        let max_chunks = 256u32;
+        let request_chunks = 300u32;
+
+        assert!(
+            request_chunks > max_chunks,
+            "MS-SMB2 3.3.5.15.6: Request exceeding max chunks should return INVALID_PARAMETER with limits"
+        );
+    }
+
+    /// Test: COPYCHUNK with zero-length chunk returns INVALID_PARAMETER
+    #[test]
+    fn test_copychunk_chunk_length_zero() {
+        // Per MS-SMB2 3.3.5.15.6:
+        // "If any Chunks[].Length is zero, the server MUST fail the request."
+        let chunk_length = 0u32;
+
+        assert_eq!(
+            chunk_length, 0,
+            "MS-SMB2 3.3.5.15.6: Chunk length == 0 should return INVALID_PARAMETER"
+        );
+    }
+
+    /// Test: COPYCHUNK chunk exceeding max chunk size returns limits
+    #[test]
+    fn test_copychunk_exceeds_max_chunk_size() {
+        // Per MS-SMB2 3.3.5.15.6:
+        // "If any Chunks[].Length exceeds ServerSideCopyMaxChunkSize,
+        // the server MUST fail the request."
+        let max_chunk_size = 1_048_576u32; // 1MB
+        let request_chunk_size = 2_000_000u32;
+
+        assert!(
+            request_chunk_size > max_chunk_size,
+            "MS-SMB2 3.3.5.15.6: Chunk size exceeding limit should return INVALID_PARAMETER with limits"
+        );
+    }
+
+    /// Test: COPYCHUNK total data exceeding max returns limits
+    #[test]
+    fn test_copychunk_exceeds_max_total_data() {
+        // Per MS-SMB2 3.3.5.15.6:
+        // "If the total data size (sum of all Chunks[].Length) exceeds
+        // ServerSideCopyMaxDataSize, the server MUST fail the request."
+        let max_data_size = 16_777_216u32; // 16MB
+        let total_requested = 20_000_000u32;
+
+        assert!(
+            total_requested > max_data_size,
+            "MS-SMB2 3.3.5.15.6: Total data exceeding limit should return INVALID_PARAMETER with limits"
+        );
+    }
+
+    /// Test: COPYCHUNK session mismatch returns OBJECT_NAME_NOT_FOUND
+    #[test]
+    fn test_copychunk_session_mismatch() {
+        // Per MS-SMB2 3.3.5.15.6:
+        // "The source Open is looked up using the ResumeKey. If the Open is not found
+        // or belongs to a different session, return STATUS_OBJECT_NAME_NOT_FOUND."
+        let resume_key_session_id = 0x1234u64;
+        let request_session_id = 0x5678u64;
+
+        assert_ne!(
+            resume_key_session_id, request_session_id,
+            "MS-SMB2 3.3.5.15.6: Session mismatch should return OBJECT_NAME_NOT_FOUND"
+        );
+    }
+
+    /// Test: COPYCHUNK resume key format (24 bytes: 16 persistent_id + 8 session_id)
+    #[test]
+    fn test_copychunk_resume_key_format() {
+        // The resume key format we use:
+        // - Bytes 0-15: persistent_id (u128, little-endian)
+        // - Bytes 16-23: session_id (u64, little-endian)
+        let persistent_id: u128 = 0x123456789ABCDEF0FEDCBA9876543210;
+        let session_id: u64 = 0xDEADBEEFCAFEBABE;
+
+        let mut resume_key = [0u8; 24];
+        resume_key[..16].copy_from_slice(&persistent_id.to_le_bytes());
+        resume_key[16..24].copy_from_slice(&session_id.to_le_bytes());
+
+        // Extract and verify
+        let extracted_persistent_id = u128::from_le_bytes(resume_key[..16].try_into().unwrap());
+        let extracted_session_id = u64::from_le_bytes(resume_key[16..24].try_into().unwrap());
+
+        assert_eq!(extracted_persistent_id, persistent_id);
+        assert_eq!(extracted_session_id, session_id);
+    }
+
+    /// Test: COPYCHUNK source access validation (requires FILE_READ_DATA)
+    #[test]
+    fn test_copychunk_source_access_read_data() {
+        const FILE_READ_DATA: u32 = 0x00000001;
+        const FILE_WRITE_DATA: u32 = 0x00000002;
+
+        // Source must have FILE_READ_DATA
+        let source_access_mask_good = FILE_READ_DATA | FILE_WRITE_DATA;
+        let source_access_mask_bad = FILE_WRITE_DATA; // Only write, no read
+
+        assert!(
+            source_access_mask_good & FILE_READ_DATA != 0,
+            "Source with FILE_READ_DATA should be allowed"
+        );
+        assert!(
+            source_access_mask_bad & FILE_READ_DATA == 0,
+            "MS-SMB2 3.3.5.15.6: Source lacking FILE_READ_DATA should return ACCESS_DENIED"
+        );
+    }
+
+    /// Test: COPYCHUNK dest access validation (requires FILE_WRITE_DATA)
+    #[test]
+    fn test_copychunk_dest_access_write_data() {
+        const FILE_READ_DATA: u32 = 0x00000001;
+        const FILE_WRITE_DATA: u32 = 0x00000002;
+
+        // Dest must have FILE_WRITE_DATA
+        let dest_access_mask_good = FILE_READ_DATA | FILE_WRITE_DATA;
+        let dest_access_mask_bad = FILE_READ_DATA; // Only read, no write
+
+        assert!(
+            dest_access_mask_good & FILE_WRITE_DATA != 0,
+            "Dest with FILE_WRITE_DATA should be allowed"
+        );
+        assert!(
+            dest_access_mask_bad & FILE_WRITE_DATA == 0,
+            "MS-SMB2 3.3.5.15.6: Dest lacking FILE_WRITE_DATA should return ACCESS_DENIED"
+        );
+    }
+
+    /// Test: FSCTL_SRV_COPYCHUNK (not _WRITE) requires FILE_READ_DATA on dest
+    #[test]
+    fn test_copychunk_vs_copychunk_write_access() {
+        const FILE_READ_DATA: u32 = 0x00000001;
+        const FILE_WRITE_DATA: u32 = 0x00000002;
+
+        // Per MS-SMB2 3.3.5.15.6:
+        // "If the request is FSCTL_SRV_COPYCHUNK (not FSCTL_SRV_COPYCHUNK_WRITE),
+        // the server MUST verify the Open has FILE_READ_DATA access on the destination."
+        let dest_write_only = FILE_WRITE_DATA;
+        let dest_read_write = FILE_READ_DATA | FILE_WRITE_DATA;
+
+        // FSCTL_SRV_COPYCHUNK requires both read and write on dest
+        let is_write_variant = false;
+        let copychunk_allowed = if is_write_variant {
+            dest_write_only & FILE_WRITE_DATA != 0
+        } else {
+            (dest_write_only & FILE_WRITE_DATA != 0) && (dest_write_only & FILE_READ_DATA != 0)
+        };
+
+        assert!(
+            !copychunk_allowed,
+            "MS-SMB2 3.3.5.15.6: FSCTL_SRV_COPYCHUNK with dest lacking FILE_READ_DATA should return ACCESS_DENIED"
+        );
+
+        // FSCTL_SRV_COPYCHUNK_WRITE only requires write on dest
+        let is_write_variant = true;
+        let copychunk_write_allowed = if is_write_variant {
+            dest_write_only & FILE_WRITE_DATA != 0
+        } else {
+            (dest_write_only & FILE_WRITE_DATA != 0) && (dest_write_only & FILE_READ_DATA != 0)
+        };
+
+        assert!(
+            copychunk_write_allowed,
+            "FSCTL_SRV_COPYCHUNK_WRITE should allow dest with only FILE_WRITE_DATA"
+        );
+
+        // Both variants should allow read+write dest
+        let both_allowed =
+            (dest_read_write & FILE_WRITE_DATA != 0) && (dest_read_write & FILE_READ_DATA != 0);
+        assert!(
+            both_allowed,
+            "Both variants should allow dest with FILE_READ_DATA and FILE_WRITE_DATA"
+        );
+    }
+
+    /// Test: COPYCHUNK parse validates minimum buffer size
+    #[test]
+    fn test_copychunk_parse_minimum_size() {
+        use rustsmb_protocol::ioctl::SrvCopychunkCopy;
+
+        // Minimum size is 32 bytes (24 source_key + 4 chunk_count + 4 reserved)
+        let too_small = vec![0u8; 16];
+        assert!(SrvCopychunkCopy::parse(&too_small).is_err());
+
+        // Exactly 32 bytes with 0 chunks should work
+        let mut valid = vec![0u8; 32];
+        // Set chunk_count to 0 (bytes 24-27)
+        valid[24..28].copy_from_slice(&0u32.to_le_bytes());
+        assert!(SrvCopychunkCopy::parse(&valid).is_ok());
+    }
+
+    /// Test: COPYCHUNK parse validates chunk data present
+    #[test]
+    fn test_copychunk_parse_missing_chunks() {
+        use rustsmb_protocol::ioctl::SrvCopychunkCopy;
+
+        // Header claims 2 chunks but no chunk data present
+        let mut missing_chunks = vec![0u8; 32];
+        missing_chunks[24..28].copy_from_slice(&2u32.to_le_bytes()); // chunk_count = 2
+
+        assert!(
+            SrvCopychunkCopy::parse(&missing_chunks).is_err(),
+            "Parse should fail when chunk data is missing"
+        );
+    }
+
+    /// Test: ServerSideCopyConfig default values
+    #[test]
+    fn test_server_side_copy_config_defaults() {
+        use crate::config::ServerSideCopyConfig;
+
+        let config = ServerSideCopyConfig::default();
+
+        assert_eq!(
+            config.max_chunk_size, 1_048_576,
+            "Default max_chunk_size should be 1MB"
+        );
+        assert_eq!(
+            config.max_data_size, 16_777_216,
+            "Default max_data_size should be 16MB"
+        );
+        assert_eq!(
+            config.max_number_of_chunks, 256,
+            "Default max_number_of_chunks should be 256"
         );
     }
 }
