@@ -52,6 +52,8 @@ pub enum NtStatus {
     SharingViolation = 0xC0000043,
     /// A file lock conflict occurred.
     FileLockConflict = 0xC0000054,
+    /// A requested read/write lock cannot be granted (FAIL_IMMEDIATELY).
+    LockNotGranted = 0xC0000055,
     /// The lock range is invalid.
     InvalidLockRange = 0xC00001A1,
     /// The disk is full.
@@ -156,6 +158,7 @@ impl NtStatus {
             0xC000003B => Self::ObjectPathSyntaxBad,
             0xC0000043 => Self::SharingViolation,
             0xC0000054 => Self::FileLockConflict,
+            0xC0000055 => Self::LockNotGranted,
             0xC00001A1 => Self::InvalidLockRange,
             0xC000007F => Self::DiskFull,
             0xC00000BB => Self::NotSupported,

@@ -29,7 +29,7 @@ use rustsmb_session::compound::{
     FileId as CompoundFileId,
 };
 use rustsmb_session::{Connection, SessionManager};
-use rustsmb_state::{HandleState, LeaseEntry, SessionState, TreeState};
+use rustsmb_state::{DistributedLock, HandleState, LeaseEntry, SessionState, TreeState};
 use rustsmb_vfs::{CreateParams, FileHandle, FileLock, LockType};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -3594,6 +3594,20 @@ where
             self.lease_registry.unregister_oplock(handle_id);
         }
 
+        // Release all locks held by this handle (MS-SMB2 3.3.5.14)
+        if let Err(e) = self
+            .session_manager
+            .state_store()
+            .release_file_locks_for_handle(handle_id)
+            .await
+        {
+            debug!(
+                error = %e,
+                handle_id = handle_id,
+                "Failed to release file locks on close"
+            );
+        }
+
         // Handle delete-on-close: delete file if flag was set via SET_INFO
         if handle.delete_on_close {
             debug!(
@@ -3948,6 +3962,20 @@ where
             locks.push(elem);
         }
 
+        // MS-SMB2 3.3.5.14.2: If the Locks array has more than one entry and any entry
+        // does not have SMB2_LOCKFLAG_FAIL_IMMEDIATELY set, fail with INVALID_PARAMETER
+        if request.lock_count > 1 {
+            for lock in &locks {
+                if !lock.flags.is_unlock() && !lock.flags.fail_immediately() {
+                    debug!(
+                        conn_id = self.connection.id,
+                        "LOCK failed: multi-lock without FAIL_IMMEDIATELY"
+                    );
+                    return Err(HandlerError::Status(NtStatus::InvalidParameter));
+                }
+            }
+        }
+
         // Get backend for file locking
         let tree = self
             .session_manager
@@ -3967,11 +3995,15 @@ where
             volatile_id: handle_id,
         };
 
+        // Track successfully acquired locks for rollback on failure
+        let mut acquired_lock_ids: Vec<u64> = Vec::new();
+
         // Process each lock
         for lock in &locks {
             let is_unlock = lock.flags.is_unlock();
             let is_shared = lock.flags.is_shared();
             let is_exclusive = lock.flags.is_exclusive();
+            let fail_immediately = lock.flags.fail_immediately();
 
             // MS-SMB2 3.3.5.14: Validate lock flags
             // Must have exactly one of SHARED, EXCLUSIVE, or UNLOCK
@@ -4030,7 +4062,37 @@ where
             };
 
             if is_unlock {
-                // Unlock operation
+                // MS-SMB2 3.3.5.14.1: Unlock operation
+                // First, find and remove the lock from StateStore
+                let existing_locks = self
+                    .session_manager
+                    .state_store()
+                    .get_file_locks(&handle.path)
+                    .await
+                    .unwrap_or_default();
+
+                let mut found_lock_id: Option<u64> = None;
+                for existing in &existing_locks {
+                    // Lock must match exactly: same handle, same range
+                    if existing.handle_id == handle_id
+                        && existing.offset == lock.offset
+                        && existing.length == lock.length
+                    {
+                        found_lock_id = Some(existing.lock_id);
+                        break;
+                    }
+                }
+
+                if let Some(lock_id) = found_lock_id {
+                    // Remove from StateStore
+                    let _ = self
+                        .session_manager
+                        .state_store()
+                        .release_file_lock(lock_id)
+                        .await;
+                }
+
+                // Call backend unlock
                 match backend.unlock(&file_handle, file_lock).await {
                     Ok(_) => {}
                     Err(VfsError::LockConflict) => {
@@ -4046,13 +4108,107 @@ where
                     }
                 }
             } else {
-                // Lock operation
+                // MS-SMB2 3.3.5.14.2: Lock operation
+                // First, check for conflicts via StateStore
+                let existing_locks = self
+                    .session_manager
+                    .state_store()
+                    .get_file_locks(&handle.path)
+                    .await
+                    .unwrap_or_default();
+
+                // Build new lock for conflict checking
+                let new_lock = DistributedLock::new(
+                    0, // temporary ID
+                    handle_id,
+                    header.session_id,
+                    self.server_id.clone(),
+                    handle.path.clone(),
+                    lock.offset,
+                    lock.length,
+                    is_exclusive,
+                );
+
+                // Check for conflicts (lock stacking: same handle doesn't conflict)
+                for existing in &existing_locks {
+                    if new_lock.conflicts_with(existing) {
+                        debug!(
+                            conn_id = self.connection.id,
+                            existing_handle = existing.handle_id,
+                            new_handle = handle_id,
+                            "LOCK conflict detected"
+                        );
+
+                        // Rollback any locks acquired in this request
+                        for lock_id in &acquired_lock_ids {
+                            let _ = self
+                                .session_manager
+                                .state_store()
+                                .release_file_lock(*lock_id)
+                                .await;
+                        }
+
+                        // MS-SMB2 3.3.5.14.2: Return different error based on FAIL_IMMEDIATELY
+                        if fail_immediately {
+                            return Err(HandlerError::Status(NtStatus::LockNotGranted));
+                        } else {
+                            return Err(HandlerError::Status(NtStatus::FileLockConflict));
+                        }
+                    }
+                }
+
+                // No conflicts - call backend lock
                 match backend.lock(&file_handle, file_lock).await {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // Record lock in StateStore
+                        if let Ok(lock_id) =
+                            self.session_manager.state_store().next_file_lock_id().await
+                        {
+                            let distributed_lock = DistributedLock::new(
+                                lock_id,
+                                handle_id,
+                                header.session_id,
+                                self.server_id.clone(),
+                                handle.path.clone(),
+                                lock.offset,
+                                lock.length,
+                                is_exclusive,
+                            );
+                            let _ = self
+                                .session_manager
+                                .state_store()
+                                .acquire_file_lock(&distributed_lock)
+                                .await;
+                            acquired_lock_ids.push(lock_id);
+                        }
+                    }
                     Err(VfsError::LockConflict) => {
-                        return Err(HandlerError::Status(NtStatus::FileLockConflict));
+                        // Rollback any locks acquired in this request
+                        for lock_id in &acquired_lock_ids {
+                            let _ = self
+                                .session_manager
+                                .state_store()
+                                .release_file_lock(*lock_id)
+                                .await;
+                        }
+
+                        // Backend-level conflict
+                        if fail_immediately {
+                            return Err(HandlerError::Status(NtStatus::LockNotGranted));
+                        } else {
+                            return Err(HandlerError::Status(NtStatus::FileLockConflict));
+                        }
                     }
                     Err(e) => {
+                        // Rollback any locks acquired in this request
+                        for lock_id in &acquired_lock_ids {
+                            let _ = self
+                                .session_manager
+                                .state_store()
+                                .release_file_lock(*lock_id)
+                                .await;
+                        }
+
                         warn!(
                             conn_id = self.connection.id,
                             error = %e,
@@ -9168,6 +9324,320 @@ mod tests {
         } else {
             panic!("Expected HandlerError::Status, got {:?}", result);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.14.2 - Multi-lock requires FAIL_IMMEDIATELY
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.14.2: "If the Locks array has more than one entry and
+    // the Flags field in any of these entries does not have
+    // SMB2_LOCKFLAG_FAIL_IMMEDIATELY set, the server SHOULD fail the request
+    // with STATUS_INVALID_PARAMETER."
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_lock_requires_fail_immediately() {
+        use rustsmb_protocol::lock::LockFlags;
+
+        // Multi-lock array - each non-UNLOCK entry needs FAIL_IMMEDIATELY
+        let lock_count = 2;
+
+        // First lock: EXCLUSIVE_LOCK without FAIL_IMMEDIATELY (invalid in multi-lock)
+        let flags1 = LockFlags::new(LockFlags::EXCLUSIVE_LOCK);
+        // Second lock: EXCLUSIVE_LOCK with FAIL_IMMEDIATELY (valid)
+        let flags2 = LockFlags::new(LockFlags::EXCLUSIVE_LOCK | LockFlags::FAIL_IMMEDIATELY);
+
+        // Per MS-SMB2, if lock_count > 1 and any lock lacks FAIL_IMMEDIATELY, reject
+        let is_invalid = lock_count > 1 && (!flags1.is_unlock() && !flags1.fail_immediately())
+            || (!flags2.is_unlock() && !flags2.fail_immediately());
+
+        assert!(
+            is_invalid,
+            "MS-SMB2 3.3.5.14.2: Multi-lock without FAIL_IMMEDIATELY is invalid"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.14.2 - Error code differentiation
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.14.2:
+    // - FAIL_IMMEDIATELY set + conflict -> STATUS_LOCK_NOT_GRANTED
+    // - FAIL_IMMEDIATELY not set + conflict -> STATUS_FILE_LOCK_CONFLICT
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lock_error_code_differentiation() {
+        use rustsmb_protocol::lock::LockFlags;
+
+        // STATUS_LOCK_NOT_GRANTED = 0xC0000055 (when FAIL_IMMEDIATELY is set)
+        const STATUS_LOCK_NOT_GRANTED: u32 = 0xC0000055;
+
+        // STATUS_FILE_LOCK_CONFLICT = 0xC0000054 (when FAIL_IMMEDIATELY is not set)
+        const STATUS_FILE_LOCK_CONFLICT: u32 = 0xC0000054;
+
+        // Verify different status codes
+        assert_ne!(
+            STATUS_LOCK_NOT_GRANTED, STATUS_FILE_LOCK_CONFLICT,
+            "MS-SMB2 3.3.5.14.2: Different error codes for FAIL_IMMEDIATELY flag"
+        );
+
+        // Test flag detection
+        let flags_with_fail_immediately =
+            LockFlags::new(LockFlags::EXCLUSIVE_LOCK | LockFlags::FAIL_IMMEDIATELY);
+        let flags_without_fail_immediately = LockFlags::new(LockFlags::EXCLUSIVE_LOCK);
+
+        assert!(
+            flags_with_fail_immediately.fail_immediately(),
+            "Should detect FAIL_IMMEDIATELY flag"
+        );
+        assert!(
+            !flags_without_fail_immediately.fail_immediately(),
+            "Should detect missing FAIL_IMMEDIATELY flag"
+        );
+
+        // Decision logic:
+        // conflict + FAIL_IMMEDIATELY -> LOCK_NOT_GRANTED
+        // conflict + !FAIL_IMMEDIATELY -> FILE_LOCK_CONFLICT
+        let has_conflict = true;
+
+        let error_with_fail_immediately =
+            if has_conflict && flags_with_fail_immediately.fail_immediately() {
+                STATUS_LOCK_NOT_GRANTED
+            } else {
+                STATUS_FILE_LOCK_CONFLICT
+            };
+
+        let error_without_fail_immediately =
+            if has_conflict && flags_without_fail_immediately.fail_immediately() {
+                STATUS_LOCK_NOT_GRANTED
+            } else {
+                STATUS_FILE_LOCK_CONFLICT
+            };
+
+        assert_eq!(
+            error_with_fail_immediately, STATUS_LOCK_NOT_GRANTED,
+            "MS-SMB2 3.3.5.14.2: FAIL_IMMEDIATELY conflict returns LOCK_NOT_GRANTED"
+        );
+        assert_eq!(
+            error_without_fail_immediately, STATUS_FILE_LOCK_CONFLICT,
+            "MS-SMB2 3.3.5.14.2: Normal conflict returns FILE_LOCK_CONFLICT"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.14.2 - Lock stacking (same handle)
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2, the same Open (handle) can acquire multiple locks on the
+    // same or overlapping ranges. This is called "lock stacking" and is tracked
+    // via Open.LockCount.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lock_stacking_same_handle_allowed() {
+        use rustsmb_state::DistributedLock;
+
+        // Create two locks from the SAME handle on the SAME range
+        let handle_id: u128 = 12345;
+        let lock1 = DistributedLock::new(
+            1,
+            handle_id, // Same handle
+            100,       // session_id
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            0,    // offset
+            1024, // length
+            true, // exclusive
+        );
+
+        let lock2 = DistributedLock::new(
+            2,
+            handle_id, // Same handle (lock stacking)
+            100,
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            0,    // Same offset
+            1024, // Same length
+            true, // exclusive
+        );
+
+        // Per MS-SMB2 3.3.5.14.2: Same handle should NOT conflict (lock stacking)
+        let conflicts = lock1.conflicts_with(&lock2);
+        assert!(
+            !conflicts,
+            "MS-SMB2 3.3.5.14.2: Same handle should allow lock stacking (no conflict)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.14.2 - Cross-handle exclusive lock conflict
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.14.2: If an exclusive lock is already held by a
+    // different Open, a new lock request on the same range must fail.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lock_conflict_different_handles_exclusive() {
+        use rustsmb_state::DistributedLock;
+
+        // Existing exclusive lock from handle 1
+        let existing_lock = DistributedLock::new(
+            1,
+            111, // handle_id 1
+            100,
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            0,    // offset
+            1024, // length
+            true, // exclusive
+        );
+
+        // New exclusive lock request from handle 2 on same range
+        let new_lock = DistributedLock::new(
+            2,
+            222, // different handle_id
+            100,
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            0,    // same offset
+            1024, // same length
+            true, // exclusive
+        );
+
+        // Per MS-SMB2: Different handles with overlapping exclusive locks conflict
+        let conflicts = existing_lock.conflicts_with(&new_lock);
+        assert!(
+            conflicts,
+            "MS-SMB2 3.3.5.14.2: Different handles with overlapping exclusive locks MUST conflict"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.14.2 - Shared locks from different handles allowed
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.14.2: Multiple shared (read) locks from different Opens
+    // are allowed on the same range.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lock_conflict_shared_locks_allowed() {
+        use rustsmb_state::DistributedLock;
+
+        // Existing shared lock from handle 1
+        let existing_lock = DistributedLock::new(
+            1,
+            111, // handle_id 1
+            100,
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            0,     // offset
+            1024,  // length
+            false, // shared (not exclusive)
+        );
+
+        // New shared lock request from handle 2 on same range
+        let new_lock = DistributedLock::new(
+            2,
+            222, // different handle_id
+            100,
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            0,     // same offset
+            1024,  // same length
+            false, // shared (not exclusive)
+        );
+
+        // Per MS-SMB2: Shared locks don't conflict with each other
+        let conflicts = existing_lock.conflicts_with(&new_lock);
+        assert!(
+            !conflicts,
+            "MS-SMB2 3.3.5.14.2: Shared locks from different handles should NOT conflict"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.14.2 - Shared vs exclusive lock conflict
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.14.2: A shared lock conflicts with an exclusive lock
+    // request from a different Open, and vice versa.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lock_conflict_shared_vs_exclusive() {
+        use rustsmb_state::DistributedLock;
+
+        // Existing shared lock
+        let shared_lock = DistributedLock::new(
+            1,
+            111,
+            100,
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            0,
+            1024,
+            false, // shared
+        );
+
+        // New exclusive lock request from different handle
+        let exclusive_lock = DistributedLock::new(
+            2,
+            222, // different handle
+            100,
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            0,
+            1024,
+            true, // exclusive
+        );
+
+        // Per MS-SMB2: Shared and exclusive locks conflict
+        let conflicts = shared_lock.conflicts_with(&exclusive_lock);
+        assert!(
+            conflicts,
+            "MS-SMB2 3.3.5.14.2: Shared lock conflicts with exclusive lock from different handle"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Test: MS-SMB2 3.3.5.14.2 - Non-overlapping ranges don't conflict
+    // -------------------------------------------------------------------------
+    // Per MS-SMB2 3.3.5.14.2: Locks on non-overlapping byte ranges do not
+    // conflict, even if both are exclusive.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_lock_no_conflict_non_overlapping_ranges() {
+        use rustsmb_state::DistributedLock;
+
+        // Lock on range [0, 1024]
+        let lock1 = DistributedLock::new(
+            1,
+            111,
+            100,
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            0,    // offset
+            1024, // length [0-1024)
+            true, // exclusive
+        );
+
+        // Lock on range [2048, 1024] - completely separate
+        let lock2 = DistributedLock::new(
+            2,
+            222, // different handle
+            100,
+            "server1".to_string(),
+            "/test/file.txt".to_string(),
+            2048, // different offset
+            1024, // [2048-3072)
+            true, // exclusive
+        );
+
+        // Per MS-SMB2: Non-overlapping ranges don't conflict
+        let conflicts = lock1.conflicts_with(&lock2);
+        assert!(
+            !conflicts,
+            "MS-SMB2 3.3.5.14.2: Non-overlapping ranges should NOT conflict"
+        );
     }
 
     // ==========================================================================
