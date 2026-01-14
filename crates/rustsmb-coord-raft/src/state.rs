@@ -436,6 +436,7 @@ mod tests {
             "srv1".to_string(),
             "/file.txt".to_string(),
             LeaseEntry::READ_CACHING,
+            false,
         );
 
         state.apply(CoordRequest::CreateLease(lease.clone()));
@@ -571,6 +572,7 @@ mod tests {
             "srv1".to_string(),
             "/file1.txt".to_string(),
             LeaseEntry::READ_CACHING,
+            false,
         );
         let lease2 = LeaseEntry::new(
             [2u8; 16],
@@ -579,6 +581,7 @@ mod tests {
             "srv1".to_string(),
             "/file1.txt".to_string(),
             LeaseEntry::READ_CACHING,
+            false,
         );
         let lease3 = LeaseEntry::new(
             [3u8; 16],
@@ -587,6 +590,7 @@ mod tests {
             "srv1".to_string(),
             "/file2.txt".to_string(),
             LeaseEntry::READ_CACHING,
+            false,
         );
 
         state.apply(CoordRequest::CreateLease(lease1));
@@ -637,6 +641,7 @@ mod tests {
             "srv1".to_string(),
             "/file.txt".to_string(),
             LeaseEntry::READ_CACHING,
+            false,
         );
         state.apply(CoordRequest::CreateLease(lease1));
 
@@ -660,6 +665,7 @@ mod tests {
             "srv1".to_string(),
             "/file.txt".to_string(),
             LeaseEntry::WRITE_CACHING,
+            false,
         );
         state.apply(CoordRequest::CreateLease(lease1.clone()));
 
@@ -683,6 +689,7 @@ mod tests {
             "srv1".to_string(),
             "/file.txt".to_string(),
             LeaseEntry::READ_CACHING,
+            false,
         );
         state.apply(CoordRequest::CreateLease(lease1.clone()));
 
@@ -711,6 +718,7 @@ mod tests {
             "srv1".to_string(),
             "/file.txt".to_string(),
             LeaseEntry::READ_CACHING | LeaseEntry::WRITE_CACHING,
+            false,
         );
         state.apply(CoordRequest::CreateLease(lease1.clone()));
 
@@ -737,6 +745,7 @@ mod tests {
             "srv1".to_string(),
             "/file.txt".to_string(),
             LeaseEntry::READ_CACHING,
+            false,
         );
         state.apply(CoordRequest::CreateLease(lease1));
 
@@ -762,6 +771,7 @@ mod tests {
             "srv1".to_string(),
             "/file.txt".to_string(),
             LeaseEntry::READ_CACHING,
+            false,
         );
         state.apply(CoordRequest::CreateLease(lease1));
 

@@ -2357,7 +2357,38 @@ where
             existing_handles
         };
 
+        // Per MS-SMB2 3.3.5.9: If opening with DELETE_ON_CLOSE and there are disconnected
+        // durable handles, purge them since DELETE_ON_CLOSE is incompatible with durable
+        // handle reconnection. The file must be deleted since the durable handle's
+        // pending state is being abandoned.
+        let has_delete_on_close = (request.create_options & 0x00001000) != 0;
+        let mut should_delete_file_for_purge = false;
+
         for existing in &existing_handles {
+            // Per MS-SMB2 3.3.5.9: Handle disconnected durable handles (session_id=0)
+            if existing.session_id == 0 {
+                if has_delete_on_close {
+                    // Purge the disconnected handle since DELETE_ON_CLOSE will delete the file
+                    debug!(
+                        conn_id = self.connection.id,
+                        persistent_id = existing.persistent_id,
+                        "Purging disconnected durable handle due to DELETE_ON_CLOSE"
+                    );
+                    let _ = self
+                        .session_manager
+                        .delete_handle(existing.persistent_id)
+                        .await;
+                    should_delete_file_for_purge = true;
+                } else {
+                    debug!(
+                        conn_id = self.connection.id,
+                        persistent_id = existing.persistent_id,
+                        "Skipping disconnected durable handle in sharing check"
+                    );
+                }
+                continue;
+            }
+
             // Check if our requested access conflicts with existing handle's share mode
             // If existing handle doesn't share READ and we want READ -> conflict
             if (existing.share_access & FILE_SHARE_READ) == 0 && wants_read(requested_access) {
@@ -2409,6 +2440,17 @@ where
                 );
                 return Err(HandlerError::Status(NtStatus::SharingViolation));
             }
+        }
+
+        // If we purged disconnected durable handles due to DELETE_ON_CLOSE, delete the file
+        // so that the new open creates a fresh file (create_action = FILE_CREATED)
+        if should_delete_file_for_purge {
+            debug!(
+                conn_id = self.connection.id,
+                path = %filename,
+                "Deleting file after purging disconnected durable handles"
+            );
+            let _ = backend.unlink(&filename).await;
         }
 
         // Check if file exists before opening (needed to determine create_action)
@@ -2507,6 +2549,7 @@ where
         );
         let mut lease_key: Option<[u8; 16]> = None;
         let mut lease_state: u32 = 0;
+        let mut lease_is_v2: bool = false;
         let mut requested_allocation_size: u64 = 0;
         let mut query_maximal_access = false;
 
@@ -2576,6 +2619,7 @@ where
                 } => {
                     lease_key = Some(*key);
                     lease_state = *state;
+                    lease_is_v2 = true;
                     if *state & 0x01 != 0 {
                         requested_oplock = OplockLevel::Lease;
                     }
@@ -2695,6 +2739,7 @@ where
                 self.server_id.clone(),
                 file_path.clone(),
                 lease_state,
+                lease_is_v2,
             );
 
             // Check for conflicts and create lease atomically
@@ -2791,6 +2836,7 @@ where
                                             breaking: false,
                                             break_to_state: 0,
                                             break_started_at: None,
+                                            is_v2: conflict.is_v2,
                                         };
 
                                         if let Err(e) = self
@@ -3049,8 +3095,21 @@ where
 
         // Add lease response if requested (with conflict-detected grant)
         if let Some(key) = lease_key {
+            debug!(
+                conn_id = self.connection.id,
+                lease_key = ?key,
+                granted_lease_state,
+                lease_is_v2,
+                "Adding lease response to CREATE"
+            );
             // Use the granted_lease_state from check_and_create_lease (may be reduced)
-            ctx_builder = ctx_builder.add_lease_response(key, granted_lease_state, 0);
+            if lease_is_v2 {
+                // V2 response includes parent_lease_key and epoch
+                ctx_builder =
+                    ctx_builder.add_lease_response_v2(key, granted_lease_state, 0, [0u8; 16], 1);
+            } else {
+                ctx_builder = ctx_builder.add_lease_response(key, granted_lease_state, 0);
+            }
         }
 
         // Add maximal access response if requested (MxAc)
@@ -3350,13 +3409,19 @@ where
         };
 
         // Build response contexts
+        // Per MS-SMB2 3.3.5.9.7: If handle has DELETE_ON_CLOSE, don't return durable
+        // response since the file will be deleted when closed, making further reconnect
+        // impossible.
         let mut ctx_builder = CreateContextBuilder::new();
-        if handle.is_persistent {
-            ctx_builder = ctx_builder.add_durable_handle_response_v2(handle.durable_timeout, 0x02);
-        } else if create_guid.is_some() {
-            ctx_builder = ctx_builder.add_durable_handle_response_v2(handle.durable_timeout, 0);
-        } else {
-            ctx_builder = ctx_builder.add_durable_handle_response();
+        if !handle.delete_on_close {
+            if handle.is_persistent {
+                ctx_builder =
+                    ctx_builder.add_durable_handle_response_v2(handle.durable_timeout, 0x02);
+            } else if create_guid.is_some() {
+                ctx_builder = ctx_builder.add_durable_handle_response_v2(handle.durable_timeout, 0);
+            } else {
+                ctx_builder = ctx_builder.add_durable_handle_response();
+            }
         }
 
         // Add lease response if handle had a lease (MS-SMB2 3.3.5.9.7 Step 15)
@@ -3364,16 +3429,59 @@ where
         if let Some(key) = handle.get_lease_key() {
             if let Some(ref lease_key_hex) = handle.lease_key {
                 // Fetch actual lease state from state store
-                let (lease_state, epoch) = match self
+                let (lease_state, epoch, is_v2) = match self
                     .session_manager
                     .state_store()
                     .get_lease(lease_key_hex)
                     .await
                 {
-                    Ok(Some(lease_entry)) => (lease_entry.lease_state, lease_entry.epoch),
-                    _ => (0x01, 0), // Fallback to READ_CACHING if lease not found
+                    Ok(Some(lease_entry)) => {
+                        debug!(
+                            conn_id = self.connection.id,
+                            lease_key_hex = %lease_key_hex,
+                            lease_state = lease_entry.lease_state,
+                            epoch = lease_entry.epoch,
+                            is_v2 = lease_entry.is_v2,
+                            "Found lease in state store for reconnect"
+                        );
+                        (
+                            lease_entry.lease_state,
+                            lease_entry.epoch,
+                            lease_entry.is_v2,
+                        )
+                    }
+                    Ok(None) => {
+                        debug!(
+                            conn_id = self.connection.id,
+                            lease_key_hex = %lease_key_hex,
+                            "Lease not found in state store for reconnect, using fallback"
+                        );
+                        (0x01, 0, false) // Fallback to READ_CACHING
+                    }
+                    Err(e) => {
+                        debug!(
+                            conn_id = self.connection.id,
+                            lease_key_hex = %lease_key_hex,
+                            error = %e,
+                            "Error fetching lease from state store, using fallback"
+                        );
+                        (0x01, 0, false)
+                    }
                 };
-                ctx_builder = ctx_builder.add_lease_response(key, lease_state, epoch.into());
+                debug!(
+                    conn_id = self.connection.id,
+                    lease_key = ?key,
+                    lease_state,
+                    epoch,
+                    is_v2,
+                    "Adding lease response to durable reconnect"
+                );
+                if is_v2 {
+                    ctx_builder =
+                        ctx_builder.add_lease_response_v2(key, lease_state, 0, [0u8; 16], epoch);
+                } else {
+                    ctx_builder = ctx_builder.add_lease_response(key, lease_state, epoch.into());
+                }
             }
         }
 
@@ -3386,6 +3494,9 @@ where
 
         let oplock_level = OplockLevel::from_u8(handle.oplock_level);
 
+        // Compute allocation size from blocks (blocks are always 512-byte units on POSIX)
+        let allocation_size = file_metadata.blocks * 512;
+
         let response = CreateResponse {
             structure_size: 89,
             oplock_level,
@@ -3395,7 +3506,7 @@ where
             last_access_time: current_filetime(),
             last_write_time: current_filetime(),
             change_time: current_filetime(),
-            allocation_size: file_metadata.size,
+            allocation_size,
             end_of_file: file_metadata.size,
             file_attributes: response_file_attributes,
             reserved2: 0,

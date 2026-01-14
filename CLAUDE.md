@@ -807,9 +807,24 @@ Improve durable handle reconnection per MS-SMB2 specification.
   - Return STATUS_FILE_CLOSED for disconnected durable handles (session_id=0)
   - Return STATUS_FILE_CLOSED for session mismatch
   - Enables proper client reconnect flow
+- [x] Phase 25H: Fix DELETE_ON_CLOSE with disconnected durable handles (MS-SMB2 3.3.5.9)
+  - Skip disconnected handles in sharing violation check
+  - Purge disconnected handles when new open has DELETE_ON_CLOSE
+  - Delete file when purging to ensure create_action=FILE_CREATED
+- [x] Phase 25I: Fix durable reconnect response with DELETE_ON_CLOSE
+  - Don't return durable handle response if handle has delete_on_close flag
+  - File will be deleted on close, making further reconnect impossible
+- [x] Phase 25J: Fix lease V2 response format
+  - Added `is_v2` field to LeaseEntry to track V1 vs V2 lease requests
+  - CREATE handler uses `add_lease_response_v2()` when client requests V2 lease
+  - Durable reconnect handler checks `lease_entry.is_v2` for correct response format
+  - Fixed allocation_size in reconnect to use `blocks * 512` (POSIX standard)
+  - Added debug logging to trace lease response generation
 
-**Results**: 11/23 smb2.durable-open tests pass (up from 10/22 in Phase 24).
+**Results**: 13/23 smb2.durable-open tests pass (up from 10/22 in Phase 24).
 - file-position test now passes (file offset tracking and proper disconnected handle status)
+- delete_on_close1/2 tests now pass (disconnected handle purging with DELETE_ON_CLOSE)
+- Remaining failures (reopen2*, open2*) require sharing mode enforcement for disconnected handles
 
 ## smbtorture Test Analysis
 
@@ -825,7 +840,7 @@ Improve durable handle reconnection per MS-SMB2 specification.
 | smb2.lock | **FAIL** | Lock stacking, error codes, cross-handle conflicts |
 | smb2.lease | **PASS** | - |
 | smb2.oplock | **PARTIAL (17/42)** | brl3 (lock error codes), levelii500 (break failure), statopen1 |
-| smb2.durable-open | **PARTIAL (11/23)** | Phase 25 fixed file-position; reconnect tests pass; remaining need oplock breaks |
+| smb2.durable-open | **PARTIAL (13/23)** | Phase 25 fixed file-position, delete_on_close, lease V2; remaining need sharing mode enforcement |
 | smb2.durable-v2-open | **FAIL** | Client crash (smbtorture bug) |
 | smb2.compound | **PARTIAL** | related1, compound-break, create-write-close pass; others need IOCTL |
 

@@ -95,6 +95,9 @@ pub struct LeaseEntry {
     /// When break started (Unix timestamp, for timeout tracking).
     #[serde(default)]
     pub break_started_at: Option<u64>,
+    /// Whether this is a V2 lease (affects response format).
+    #[serde(default)]
+    pub is_v2: bool,
 }
 
 impl LeaseEntry {
@@ -113,6 +116,7 @@ impl LeaseEntry {
         server_id: String,
         file_path: String,
         lease_state: u32,
+        is_v2: bool,
     ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -130,6 +134,7 @@ impl LeaseEntry {
             breaking: false,
             break_to_state: 0,
             break_started_at: None,
+            is_v2,
         }
     }
 
@@ -369,6 +374,7 @@ mod tests {
             "srv1".to_string(),
             "/share/file.txt".to_string(),
             LeaseEntry::READ_CACHING | LeaseEntry::WRITE_CACHING,
+            false,
         );
         assert_eq!(lease.get_lease_key(), Some(key));
         assert_eq!(lease.lease_state, 0x03);
