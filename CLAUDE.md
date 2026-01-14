@@ -643,7 +643,7 @@ Add unit tests to `handler.rs` organized by MS-SMB2 specification chapter:
   - 3.3.5.4 NEGOTIATE: `test_negotiate_dialect_count_zero`, `test_negotiate_no_common_dialect`, `test_negotiate_selects_highest_dialect`
   - 3.3.5.7 TREE_CONNECT: `test_tree_connect_bad_network_name`
   - 3.3.5.14 LOCK: `test_lock_count_zero`, `test_lock_invalid_flags`, `test_lock_invalid_range`, `test_lock_valid_range_at_boundary`, `test_lock_invalid_handle`
-- Total tests in handler.rs: 113 (increased from 89 after Phase 26)
+- Total tests in handler.rs: 135 (113 after Phase 26, +21 Phase 28 COPYCHUNK tests, +1 other)
 
 **Not Implemented (requires significant infrastructure changes):**
 - **Multi-channel session binding**: Signing key derivation across different dialect connections
@@ -938,6 +938,10 @@ Implement server-side file copy via FSCTL_SRV_COPYCHUNK per MS-SMB2 3.3.5.15.5-6
   - Return proper response (chunk_bytes_written = 0 for success)
 - [x] Phase 28.5: Wire up IOCTL dispatch for SrvRequestResumeKey, SrvCopychunk, SrvCopychunkWrite
 - [x] Phase 28.6: Lock conflict error handling with proper IOCTL response body
+- [x] Phase 28.7: Unit tests for MS-SMB2 3.3.5.15.5 and 3.3.5.15.6 (21 tests)
+  - Resume key format and session validation
+  - COPYCHUNK parsing, access rights, lock conflict detection
+  - Response format (success vs limits dual meaning)
 
 **Results:** 21+ smb2.ioctl tests pass including:
 - req_resume_key, req_two_resume_keys

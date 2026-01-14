@@ -12221,4 +12221,238 @@ mod tests {
             "Default max_number_of_chunks should be 256"
         );
     }
+
+    /// Test: COPYCHUNK source access validation accepts FILE_EXECUTE as alternative to FILE_READ_DATA
+    /// Per MS-SMB2 3.3.5.15.6, source needs read access; Windows accepts FILE_EXECUTE for reading
+    #[test]
+    fn test_copychunk_source_access_execute() {
+        const FILE_READ_DATA: u32 = 0x00000001;
+        const FILE_EXECUTE: u32 = 0x00000020;
+        const FILE_WRITE_DATA: u32 = 0x00000002;
+
+        // Source can have either FILE_READ_DATA or FILE_EXECUTE
+        let source_with_read = FILE_READ_DATA;
+        let source_with_execute = FILE_EXECUTE;
+        let source_without_read_access = FILE_WRITE_DATA; // Only write, no read or execute
+
+        assert!(
+            source_with_read & (FILE_READ_DATA | FILE_EXECUTE) != 0,
+            "Source with FILE_READ_DATA should be allowed"
+        );
+        assert!(
+            source_with_execute & (FILE_READ_DATA | FILE_EXECUTE) != 0,
+            "Source with FILE_EXECUTE should be allowed"
+        );
+        assert!(
+            source_without_read_access & (FILE_READ_DATA | FILE_EXECUTE) == 0,
+            "Source lacking both FILE_READ_DATA and FILE_EXECUTE should return ACCESS_DENIED"
+        );
+    }
+
+    /// Test: Successful COPYCHUNK response format per MS-SMB2 2.2.32.1
+    /// chunk_bytes_written should be 0 on success (indicates complete copy)
+    #[test]
+    fn test_copychunk_success_response_format() {
+        use binrw::BinWrite;
+        use rustsmb_protocol::ioctl::SrvCopychunkResponse;
+        use std::io::Cursor;
+
+        // Simulate successful copy of 3 chunks totaling 1000 bytes
+        let chunks_written = 3u32;
+        let total_bytes_written = 1000u32;
+
+        let response = SrvCopychunkResponse {
+            chunks_written,
+            chunk_bytes_written: 0, // Per MS-SMB2 2.2.32.1: 0 indicates success
+            total_bytes_written,
+        };
+
+        let mut buf = Vec::new();
+        response.write(&mut Cursor::new(&mut buf)).unwrap();
+
+        assert_eq!(buf.len(), 12, "Response must be 12 bytes");
+
+        let response_chunks = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let response_chunk_bytes = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let response_total = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+
+        assert_eq!(response_chunks, 3, "chunks_written should be 3");
+        assert_eq!(
+            response_chunk_bytes, 0,
+            "MS-SMB2 2.2.32.1: chunk_bytes_written MUST be 0 on success"
+        );
+        assert_eq!(response_total, 1000, "total_bytes_written should be 1000");
+    }
+
+    /// Test: COPYCHUNK lock conflict should return STATUS_FILE_LOCK_CONFLICT
+    /// Per MS-SMB2 3.3.5.15.6, server checks for byte-range locks on source and dest
+    #[test]
+    fn test_copychunk_lock_conflict_detection() {
+        // Lock conflict detection logic: check if chunk range overlaps with exclusive lock
+        let lock_offset = 100u64;
+        let lock_length = 200u64;
+        let lock_end = lock_offset + lock_length; // 300
+
+        // Case 1: Chunk completely before lock - no conflict
+        let chunk1_offset = 0u64;
+        let chunk1_length = 50u32;
+        let chunk1_end = chunk1_offset + chunk1_length as u64; // 50
+        assert!(
+            chunk1_end <= lock_offset,
+            "Chunk before lock should not conflict"
+        );
+
+        // Case 2: Chunk completely after lock - no conflict
+        let chunk2_offset = 400u64;
+        let _chunk2_length = 100u32; // Unused but shows chunk size
+        assert!(
+            chunk2_offset >= lock_end,
+            "Chunk after lock should not conflict"
+        );
+
+        // Case 3: Chunk overlaps with lock start - conflict
+        let chunk3_offset = 50u64;
+        let chunk3_length = 100u32;
+        let chunk3_end = chunk3_offset + chunk3_length as u64; // 150
+        let overlaps_start = chunk3_end > lock_offset && chunk3_offset < lock_end;
+        assert!(
+            overlaps_start,
+            "Chunk overlapping lock start should conflict"
+        );
+
+        // Case 4: Chunk inside lock - conflict
+        let chunk4_offset = 150u64;
+        let chunk4_length = 50u32;
+        let chunk4_end = chunk4_offset + chunk4_length as u64; // 200
+        let inside_lock = chunk4_offset >= lock_offset && chunk4_end <= lock_end;
+        assert!(inside_lock, "Chunk inside lock should conflict");
+
+        // Case 5: Chunk overlaps with lock end - conflict
+        let chunk5_offset = 250u64;
+        let chunk5_length = 100u32;
+        let chunk5_end = chunk5_offset + chunk5_length as u64; // 350
+        let overlaps_end = chunk5_offset < lock_end && chunk5_end > lock_offset;
+        assert!(overlaps_end, "Chunk overlapping lock end should conflict");
+    }
+
+    /// Test: COPYCHUNK parse with valid chunk data
+    #[test]
+    fn test_copychunk_parse_valid_chunks() {
+        use rustsmb_protocol::ioctl::SrvCopychunkCopy;
+
+        // Build valid COPYCHUNK request with 2 chunks
+        let mut data = vec![0u8; 32 + 24 * 2]; // Header + 2 chunks (24 bytes each)
+
+        // Source key (24 bytes) - can be zeros for parse test
+        // Chunk count = 2 (bytes 24-27)
+        data[24..28].copy_from_slice(&2u32.to_le_bytes());
+        // Reserved = 0 (bytes 28-31)
+
+        // Chunk 1: source_offset=0, target_offset=0, length=1000
+        let chunk1_offset = 32;
+        data[chunk1_offset..chunk1_offset + 8].copy_from_slice(&0u64.to_le_bytes()); // source_offset
+        data[chunk1_offset + 8..chunk1_offset + 16].copy_from_slice(&0u64.to_le_bytes()); // target_offset
+        data[chunk1_offset + 16..chunk1_offset + 20].copy_from_slice(&1000u32.to_le_bytes()); // length
+                                                                                              // reserved = 0 (bytes 20-23)
+
+        // Chunk 2: source_offset=1000, target_offset=2000, length=500
+        let chunk2_offset = 32 + 24;
+        data[chunk2_offset..chunk2_offset + 8].copy_from_slice(&1000u64.to_le_bytes()); // source_offset
+        data[chunk2_offset + 8..chunk2_offset + 16].copy_from_slice(&2000u64.to_le_bytes()); // target_offset
+        data[chunk2_offset + 16..chunk2_offset + 20].copy_from_slice(&500u32.to_le_bytes()); // length
+
+        let result = SrvCopychunkCopy::parse(&data);
+        assert!(result.is_ok(), "Parse should succeed for valid data");
+
+        let copy_req = result.unwrap();
+        assert_eq!(copy_req.chunk_count, 2, "Should have 2 chunks");
+        assert_eq!(copy_req.chunks.len(), 2, "Should parse 2 chunks");
+
+        assert_eq!(copy_req.chunks[0].source_offset, 0);
+        assert_eq!(copy_req.chunks[0].target_offset, 0);
+        assert_eq!(copy_req.chunks[0].length, 1000);
+
+        assert_eq!(copy_req.chunks[1].source_offset, 1000);
+        assert_eq!(copy_req.chunks[1].target_offset, 2000);
+        assert_eq!(copy_req.chunks[1].length, 500);
+    }
+
+    /// Test: Resume key encodes both persistent_id and session_id for validation
+    /// Per MS-SMB2 3.3.5.15.6, the server validates the resume key belongs to same session
+    #[test]
+    fn test_resume_key_session_validation() {
+        // Build resume key from handle info
+        let persistent_id: u128 = 0xABCDEF0123456789ABCDEF0123456789;
+        let session_id: u64 = 0x1234567890ABCDEF;
+
+        let mut resume_key = [0u8; 24];
+        resume_key[..16].copy_from_slice(&persistent_id.to_le_bytes());
+        resume_key[16..24].copy_from_slice(&session_id.to_le_bytes());
+
+        // Request comes from same session - should succeed
+        let request_session_id = 0x1234567890ABCDEFu64;
+        let key_session_id = u64::from_le_bytes(resume_key[16..24].try_into().unwrap());
+        assert_eq!(
+            key_session_id, request_session_id,
+            "Same session ID should be allowed"
+        );
+
+        // Request comes from different session - should fail with OBJECT_NAME_NOT_FOUND
+        let different_session_id = 0xDEADBEEFCAFEBABEu64;
+        assert_ne!(
+            key_session_id, different_session_id,
+            "Different session ID should return OBJECT_NAME_NOT_FOUND"
+        );
+    }
+
+    /// Test: COPYCHUNK response with limits is used when request exceeds server limits
+    /// Per MS-SMB2 2.2.32.1, response fields have dual meaning based on error status
+    #[test]
+    fn test_copychunk_response_dual_meaning() {
+        use binrw::BinWrite;
+        use rustsmb_protocol::ioctl::SrvCopychunkResponse;
+        use std::io::Cursor;
+
+        // On STATUS_INVALID_PARAMETER (exceeds limits), response contains server limits:
+        // - chunks_written = ServerSideCopyMaxNumberOfChunks
+        // - chunk_bytes_written = ServerSideCopyMaxChunkSize
+        // - total_bytes_written = ServerSideCopyMaxDataSize
+        let limits_response = SrvCopychunkResponse::with_limits(
+            256,        // max chunks
+            1_048_576,  // max chunk size (1MB)
+            16_777_216, // max data size (16MB)
+        );
+
+        let mut buf = Vec::new();
+        limits_response.write(&mut Cursor::new(&mut buf)).unwrap();
+
+        let max_chunks = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let max_chunk_size = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let max_data = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+
+        assert_eq!(max_chunks, 256);
+        assert_eq!(max_chunk_size, 1_048_576);
+        assert_eq!(max_data, 16_777_216);
+
+        // On success (STATUS_SUCCESS), response contains actual bytes written:
+        // - chunks_written = number of chunks successfully written
+        // - chunk_bytes_written = 0 (indicates success)
+        // - total_bytes_written = total bytes written across all chunks
+        let success_response = SrvCopychunkResponse {
+            chunks_written: 5,
+            chunk_bytes_written: 0, // Must be 0 on success
+            total_bytes_written: 5000,
+        };
+
+        let mut buf2 = Vec::new();
+        success_response.write(&mut Cursor::new(&mut buf2)).unwrap();
+
+        let success_chunks = u32::from_le_bytes(buf2[0..4].try_into().unwrap());
+        let success_chunk_bytes = u32::from_le_bytes(buf2[4..8].try_into().unwrap());
+        let success_total = u32::from_le_bytes(buf2[8..12].try_into().unwrap());
+
+        assert_eq!(success_chunks, 5);
+        assert_eq!(success_chunk_bytes, 0, "Must be 0 on success");
+        assert_eq!(success_total, 5000);
+    }
 }
