@@ -167,10 +167,11 @@ impl Capabilities {
     pub const DFS: u32 = 0x00000001;
     /// Leasing support.
     pub const LEASING: u32 = 0x00000002;
-    /// Large MTU support.
+    /// Large MTU support (implies multi-credit operations).
     pub const LARGE_MTU: u32 = 0x00000004;
-    /// Multi-credit support.
-    pub const MULTI_CREDIT: u32 = 0x00000008;
+    /// Multi-channel support (SMB 3.x only).
+    /// Per MS-SMB2 2.2.4: SMB2_GLOBAL_CAP_MULTI_CHANNEL = 0x00000008
+    pub const MULTI_CHANNEL: u32 = 0x00000008;
     /// Persistent handles.
     pub const PERSISTENT_HANDLES: u32 = 0x00000010;
     /// Directory leasing.

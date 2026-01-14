@@ -1349,14 +1349,14 @@ where
         );
 
         // Build capabilities per MS-SMB2 2.2.4
-        // - LARGE_MTU (0x04): Always advertise for all dialects
-        // - MULTI_CREDIT (0x08): SMB 2.1+ supports multi-credit operations
+        // - LARGE_MTU (0x04): Always advertise (implies multi-credit operations)
         // - LEASING (0x02): SMB 2.1+ supports file leases
+        // - MULTI_CHANNEL (0x08): SMB 3.0+ supports multiple channels per session
         // - DIRECTORY_LEASING (0x20): SMB 3.0+ supports directory leases
         // - ENCRYPTION (0x40): SMB 3.0+ supports encryption
         let mut caps_value = Capabilities::LARGE_MTU;
         if selected_dialect >= SmbDialect::Smb210 {
-            caps_value |= Capabilities::MULTI_CREDIT | Capabilities::LEASING;
+            caps_value |= Capabilities::LEASING;
         }
         if selected_dialect >= SmbDialect::Smb300 {
             caps_value |= Capabilities::ENCRYPTION | Capabilities::DIRECTORY_LEASING;
@@ -4343,7 +4343,7 @@ where
         // Server capabilities (must match NEGOTIATE response per MS-SMB2 3.3.5.15.12)
         let mut server_caps = Capabilities::LARGE_MTU;
         if negotiated_dialect >= SmbDialect::Smb210 {
-            server_caps |= Capabilities::MULTI_CREDIT | Capabilities::LEASING;
+            server_caps |= Capabilities::LEASING;
         }
         if negotiated_dialect >= SmbDialect::Smb300 {
             server_caps |= Capabilities::ENCRYPTION | Capabilities::DIRECTORY_LEASING;
@@ -5856,8 +5856,9 @@ mod tests {
     // Test: MS-SMB2 2.2.4 - NEGOTIATE Response Capabilities
     // -------------------------------------------------------------------------
     // Per MS-SMB2 2.2.4, the NEGOTIATE response includes Capabilities:
+    // - SMB2_GLOBAL_CAP_LARGE_MTU (0x00000004): Large MTU (implies multi-credit)
     // - SMB2_GLOBAL_CAP_LEASING (0x00000002): Leasing support
-    // - SMB2_GLOBAL_CAP_MULTI_CREDIT (0x00000008): Multi-credit operations
+    // - SMB2_GLOBAL_CAP_MULTI_CHANNEL (0x00000008): Multi-channel (SMB 3.x only)
     // - SMB2_GLOBAL_CAP_DIRECTORY_LEASING (0x00000020): Directory leasing
     // -------------------------------------------------------------------------
 
@@ -5877,17 +5878,17 @@ mod tests {
     }
 
     #[test]
-    fn test_negotiate_capabilities_multi_credit() {
+    fn test_negotiate_capabilities_multi_channel() {
         use rustsmb_protocol::negotiate::Capabilities;
 
-        // Per MS-SMB2 2.2.4: MULTI_CREDIT capability value
+        // Per MS-SMB2 2.2.4: MULTI_CHANNEL capability value
         assert_eq!(
-            Capabilities::MULTI_CREDIT,
+            Capabilities::MULTI_CHANNEL,
             0x00000008,
-            "SMB2_GLOBAL_CAP_MULTI_CREDIT = 0x00000008"
+            "SMB2_GLOBAL_CAP_MULTI_CHANNEL = 0x00000008"
         );
 
-        // MULTI_CREDIT should be advertised for SMB 2.1+
+        // MULTI_CHANNEL is only valid for SMB 3.x dialects per MS-SMB2 2.2.4
     }
 
     #[test]
@@ -5916,18 +5917,14 @@ mod tests {
             "SMB 2.0.2 should NOT advertise LEASING"
         );
 
-        // SMB 2.1+: LARGE_MTU, MULTI_CREDIT, LEASING
-        let caps_210 = Capabilities::LARGE_MTU | Capabilities::MULTI_CREDIT | Capabilities::LEASING;
+        // SMB 2.1+: LARGE_MTU, LEASING
+        let caps_210 = Capabilities::LARGE_MTU | Capabilities::LEASING;
         assert!(
             caps_210 & Capabilities::LEASING != 0,
             "SMB 2.1 should advertise LEASING"
         );
-        assert!(
-            caps_210 & Capabilities::MULTI_CREDIT != 0,
-            "SMB 2.1 should advertise MULTI_CREDIT"
-        );
 
-        // SMB 3.0+: Add ENCRYPTION, DIRECTORY_LEASING
+        // SMB 3.0+: Add ENCRYPTION, DIRECTORY_LEASING, optionally MULTI_CHANNEL
         let caps_300 = caps_210 | Capabilities::ENCRYPTION | Capabilities::DIRECTORY_LEASING;
         assert!(
             caps_300 & Capabilities::DIRECTORY_LEASING != 0,

@@ -210,7 +210,7 @@ impl DialectNegotiator {
             capabilities: Capabilities::new(
                 Capabilities::LEASING
                     | Capabilities::LARGE_MTU
-                    | Capabilities::MULTI_CREDIT
+                    | Capabilities::MULTI_CHANNEL
                     | Capabilities::DIRECTORY_LEASING,
             ),
             security_mode: SecurityMode::new(SecurityMode::SIGNING_ENABLED),
