@@ -1,103 +1,47 @@
-# Dockerfile for running smbtorture tests against RustSMB
+# Dockerfile for smbtorture client only
 #
-# Uses multi-stage build:
-#   - Stage 1 (builder): Compiles RustSMB binary
-#   - Stage 2 (runtime): Runs smbtorture tests
+# This image contains only the smbtorture test tools.
+# The SMB server runs on the host for faster iteration.
 #
-# Build (requires --build-context for test scripts):
-#   docker build -f tests/Dockerfile.smbtorture \
-#     --build-context scripts=tests/scripts \
-#     -t rustsmb-smbtorture .
+# Build:
+#   docker build -f tests/Dockerfile.smbtorture -t smbtorture-client tests/
 #
-# Run (runs smbtorture tests):
-#   docker run --rm rustsmb-smbtorture
+# Run (connect to host SMB server):
+#   docker run --rm --add-host=host.docker.internal:host-gateway \
+#     smbtorture-client smb2.connect
 #
-# Run specific test suite:
-#   docker run --rm rustsmb-smbtorture smb2.session
-#
-# Run with debug output:
-#   docker run --rm -e RUST_LOG=debug rustsmb-smbtorture
+# Run all tests:
+#   docker run --rm --add-host=host.docker.internal:host-gateway \
+#     smbtorture-client all
 
-# =============================================================================
-# Stage 1: Builder - compile the RustSMB binary
-# =============================================================================
-FROM ubuntu:22.04 AS builder
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Install build dependencies (with retry logic for transient apt issues)
-RUN rm -rf /var/lib/apt/lists/* && \
-    apt-get update && \
-    apt-get install -y --fix-missing \
-    protobuf-compiler \
-    curl \
-    build-essential \
-    pkg-config \
-    libssl-dev \
-    || (sleep 5 && apt-get update && apt-get install -y --fix-missing \
-    protobuf-compiler \
-    curl \
-    build-essential \
-    pkg-config \
-    libssl-dev) \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-WORKDIR /app
-
-# Copy source code (uses .dockerignore to exclude tests/, benches/, docs/, etc.)
-COPY Cargo.toml Cargo.lock ./
-COPY src src
-COPY crates crates
-
-# Remove bench references from Cargo.toml to allow build without benches dir
-RUN sed -i '/\[\[bench\]\]/,/^$/d' Cargo.toml
-
-# Build release binary
-RUN cargo build --release --package rustsmb
-
-# =============================================================================
-# Stage 2: Runtime - run smbtorture tests
-# =============================================================================
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install only runtime dependencies and test tools
-# Use retry logic to handle transient mirror issues
+# Install smbtorture and smbclient
 RUN rm -rf /var/lib/apt/lists/* && \
     apt-get update && \
     apt-get install -y --fix-missing \
     samba-testsuite \
     smbclient \
-    libssl3 \
-    || (sleep 5 && apt-get update && apt-get install -y --fix-missing \
-    samba-testsuite \
-    smbclient \
-    libssl3) \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy binary from builder stage
-COPY --from=builder /app/target/release/rustsmb /app/rustsmb
-
-# Copy test runner script from build context (--build-context scripts=tests/scripts)
-COPY --from=scripts smbtorture.sh /usr/local/bin/run-smbtorture
+# Copy test runner script
+COPY smbtorture.sh /usr/local/bin/run-smbtorture
 RUN chmod +x /usr/local/bin/run-smbtorture
 
-# Create test share directory
-RUN mkdir -p /tmp/share
+# Create results directory
+RUN mkdir -p /app/test-results
 
-# Default environment
-ENV RUST_LOG=info
-ENV SMB_PORT=445
+# Default environment - connect to host
+ENV SMB_HOST=host.docker.internal
+ENV SMB_PORT=4450
 ENV SMB_SHARE=test
-ENV RUSTSMB_BIN=/app/rustsmb
+ENV SMB_USER=testuser
+ENV SMB_PASS=testpass
+ENV RESULTS_DIR=/app/test-results
 
-# Run smbtorture tests
 ENTRYPOINT ["/usr/local/bin/run-smbtorture"]
 CMD ["all"]

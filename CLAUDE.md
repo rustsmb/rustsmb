@@ -285,13 +285,15 @@ make clippy    # Run clippy
 make fmt       # Format code
 make ci        # Run fmt-check + clippy + test (full CI)
 
-# Run smbtorture tests (requires Docker)
-docker build -f tests/Dockerfile.smbtorture \
-  --build-context scripts=tests/scripts \
-  -t rustsmb-smbtorture .
-docker run --rm rustsmb-smbtorture              # Run all test suites
-docker run --rm rustsmb-smbtorture smb2.session # Run specific suite
-docker run --rm -e RUST_LOG=debug rustsmb-smbtorture smb2.connect  # With debug output
+# Run smbtorture tests (host server + Docker client)
+./tests/scripts/run_smbtorture.sh              # Run all test suites
+./tests/scripts/run_smbtorture.sh smb2.session # Run specific suite
+./tests/scripts/run_smbtorture.sh smb2.durable-open  # Run durable handle tests
+
+# Or manually: build Docker image once, then run against host server
+docker build -f tests/Dockerfile.smbtorture -t smbtorture-client tests/
+cargo run --release -- --listen 0.0.0.0:4450 --share-path /tmp/share &
+docker run --rm --add-host=host.docker.internal:host-gateway smbtorture-client smb2.connect
 ```
 
 ## Development Workflow
