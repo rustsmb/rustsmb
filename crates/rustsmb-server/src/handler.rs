@@ -2584,7 +2584,7 @@ where
             file_attributes: request.file_attributes,
         };
 
-        let _file_handle = backend
+        let file_handle = backend
             .open(&filename, &create_params)
             .await
             .map_err(|e| HandlerError::Vfs(e.to_string()))?;
@@ -2818,6 +2818,7 @@ where
             bound_server_id: None,
             delete_on_close: (request.create_options & 0x00001000) != 0, // FILE_DELETE_ON_CLOSE
             is_directory,
+            backend_internal_id: file_handle.backend_internal_id,
         };
 
         // Set create GUID if durable
@@ -3461,6 +3462,23 @@ where
             HandlerError::Status(NtStatus::ObjectNameNotFound)
         })?;
 
+        // Verify file identity via backend_internal_id (inode)
+        // If the handle has a stored inode, verify it matches the current file
+        // This detects if the original file was deleted and a new file created with same name
+        if let Some(expected_id) = handle.backend_internal_id {
+            if file_metadata.ino != expected_id {
+                warn!(
+                    conn_id = self.connection.id,
+                    persistent_id,
+                    expected_inode = expected_id,
+                    actual_inode = file_metadata.ino,
+                    path = %handle.path,
+                    "Durable handle reconnect failed: file was replaced (inode mismatch)"
+                );
+                return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+            }
+        }
+
         // Update handle state for new connection
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3841,18 +3859,13 @@ where
             .get_share(&tree.share_name)
             .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
 
-        // Re-open file for reading (stateless approach)
-        let read_params = CreateParams {
-            desired_access: rustsmb_vfs::access_mask::GENERIC_READ,
-            share_access: 0,
-            create_disposition: rustsmb_vfs::disposition::OPEN,
-            create_options: 0,
-            file_attributes: 0,
-        };
-        let file_handle = backend
-            .open(&handle.path, &read_params)
-            .await
-            .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+        // Build FileHandle from HandleState's backend_internal_id (no re-open needed)
+        // The backend uses backend_internal_id to locate the file directly
+        let file_handle = FileHandle::with_backend_id(
+            handle.persistent_id,
+            handle.volatile_id,
+            handle.backend_internal_id,
+        );
 
         // Read data
         let data = backend
@@ -3958,18 +3971,13 @@ where
             .get_share(&tree.share_name)
             .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
 
-        // Re-open file for writing (stateless approach)
-        let write_params = CreateParams {
-            desired_access: rustsmb_vfs::access_mask::GENERIC_WRITE,
-            share_access: 0,
-            create_disposition: rustsmb_vfs::disposition::OPEN,
-            create_options: 0,
-            file_attributes: 0,
-        };
-        let file_handle = backend
-            .open(&handle.path, &write_params)
-            .await
-            .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+        // Build FileHandle from HandleState's backend_internal_id (no re-open needed)
+        // The backend uses backend_internal_id to locate the file directly
+        let file_handle = FileHandle::with_backend_id(
+            handle.persistent_id,
+            handle.volatile_id,
+            handle.backend_internal_id,
+        );
 
         // Parse write data from body
         let data_offset = request.data_offset as usize;
@@ -4097,6 +4105,7 @@ where
             id: handle_id as u64,
             persistent_id: handle_id,
             volatile_id: handle_id,
+            backend_internal_id: handle.backend_internal_id,
         };
 
         // Track successfully acquired locks for rollback on failure
@@ -4791,31 +4800,19 @@ where
             .get_share(&tree.share_name)
             .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
 
-        // Open source file for reading
-        let source_open_params = CreateParams {
-            desired_access: rustsmb_vfs::access_mask::GENERIC_READ,
-            share_access: 0,
-            create_disposition: rustsmb_vfs::disposition::OPEN,
-            create_options: 0,
-            file_attributes: 0,
-        };
-        let source_file = backend
-            .open(&source_handle.path, &source_open_params)
-            .await
-            .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+        // Build FileHandle for source file from HandleState's backend_internal_id (no re-open needed)
+        let source_file = FileHandle::with_backend_id(
+            source_handle.persistent_id,
+            source_handle.volatile_id,
+            source_handle.backend_internal_id,
+        );
 
-        // Open dest file for writing
-        let dest_open_params = CreateParams {
-            desired_access: rustsmb_vfs::access_mask::GENERIC_WRITE,
-            share_access: 0,
-            create_disposition: rustsmb_vfs::disposition::OPEN,
-            create_options: 0,
-            file_attributes: 0,
-        };
-        let dest_file = backend
-            .open(&dest_handle.path, &dest_open_params)
-            .await
-            .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+        // Build FileHandle for dest file from HandleState's backend_internal_id (no re-open needed)
+        let dest_file = FileHandle::with_backend_id(
+            dest_handle.persistent_id,
+            dest_handle.volatile_id,
+            dest_handle.backend_internal_id,
+        );
 
         // Check for lock conflicts per MS-SMB2 3.3.5.15.6
         // "If the Source Open is locked by another open in a way that would prevent a read,
@@ -5557,11 +5554,20 @@ where
                     .await
                     .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 
+                // Update HandleState.path after successful rename
+                // This ensures subsequent I/O operations use the correct path
+                let mut updated_handle = handle.clone();
+                updated_handle.path = new_path.clone();
+                self.session_manager
+                    .update_handle(updated_handle)
+                    .await
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
                 debug!(
                     old_path = %handle.path,
                     new_path = %new_path,
                     replace_if_exists,
-                    "SET_INFO: FileRenameInformation"
+                    "SET_INFO: FileRenameInformation (handle path updated)"
                 );
             }
             Some(SetFileInfoClass::FileEndOfFileInformation) => {

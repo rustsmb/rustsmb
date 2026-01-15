@@ -7,12 +7,16 @@ use std::time::SystemTime;
 /// Unique file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileHandle {
-    /// Unique internal ID.
+    /// Unique internal ID (used as key in backend handles HashMap).
     pub id: u64,
     /// SMB persistent file ID.
     pub persistent_id: u128,
     /// SMB volatile file ID.
     pub volatile_id: u128,
+    /// Backend-specific stable identifier (e.g., inode on local filesystem).
+    /// Used to verify file identity after rename or on durable reconnect.
+    #[serde(default)]
+    pub backend_internal_id: Option<u64>,
 }
 
 impl FileHandle {
@@ -24,6 +28,7 @@ impl FileHandle {
             id,
             persistent_id: id as u128,
             volatile_id: id as u128,
+            backend_internal_id: None,
         }
     }
 
@@ -34,6 +39,22 @@ impl FileHandle {
             id: COUNTER.fetch_add(1, Ordering::Relaxed),
             persistent_id,
             volatile_id,
+            backend_internal_id: None,
+        }
+    }
+
+    /// Create a handle with specific IDs and backend internal ID.
+    pub fn with_backend_id(
+        persistent_id: u128,
+        volatile_id: u128,
+        backend_internal_id: Option<u64>,
+    ) -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: COUNTER.fetch_add(1, Ordering::Relaxed),
+            persistent_id,
+            volatile_id,
+            backend_internal_id,
         }
     }
 }

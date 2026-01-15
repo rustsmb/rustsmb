@@ -190,6 +190,12 @@ pub struct HandleState {
     /// Used to reject READ operations per MS-SMB2 3.3.5.12.
     #[serde(default)]
     pub is_directory: bool,
+
+    /// Backend-specific stable identifier (e.g., inode on local filesystem).
+    /// Used to verify file identity after rename or on durable reconnect.
+    /// Stored as Option to support backends without stable IDs.
+    #[serde(default)]
+    pub backend_internal_id: Option<u64>,
 }
 
 impl Default for HandleState {
@@ -224,6 +230,7 @@ impl Default for HandleState {
             bound_server_id: None,
             delete_on_close: false,
             is_directory: false,
+            backend_internal_id: None,
         }
     }
 }

@@ -289,6 +289,114 @@ Client                    RustSMB                   StateStore
    │   (SessionId)           │                          │
 ```
 
+## Handle ID Architecture
+
+The system uses `backend_internal_id` to identify files across components.
+
+### Key Concept: backend_internal_id
+
+| Property | Value |
+|----------|-------|
+| Meaning | File's stable identity (inode on local FS, node_id in memory FS) |
+| Managed by | Filesystem/Backend |
+| Lifetime | Persists while file exists |
+| Cross-server | Yes (on shared storage) |
+
+### Design Principle: Separation of Concerns
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Handler/StateStore Layer                                       │
+│  - Manages multiple open instances (HandleState)                │
+│  - Tracks session, tree, access rights per open                 │
+│  - Uses backend_internal_id to identify which file              │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │
+                               ▼ FileHandle { backend_internal_id }
+┌─────────────────────────────────────────────────────────────────┐
+│  VFS/Backend Layer                                              │
+│  - Uses backend_internal_id to locate file                      │
+│  - Manages ref_count for shared opens                           │
+│  - No knowledge of sessions or SMB protocol                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Multiple Opens to Same File
+
+```
+Client A: open("file.txt", READ)  → HandleState { session=1, backend_internal_id=12345 }
+Client B: open("file.txt", WRITE) → HandleState { session=2, backend_internal_id=12345 }
+
+Both HandleState entries:
+- Are different open instances (tracked in StateStore)
+- Share the same backend_internal_id (same file)
+- Backend uses backend_internal_id to find file, ref_count tracks opens
+```
+
+### Backend Implementation
+
+**LocalBackend:**
+```rust
+struct LocalBackend {
+    // inode → open file info (includes fd and ref_count)
+    open_files: HashMap<u64, OpenFileInfo>,
+}
+
+fn read(&self, handle: &FileHandle) -> Result<Vec<u8>> {
+    let inode = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+    let info = self.open_files.get(&inode)?;
+    // Use info.fd to read data
+}
+```
+
+**MemoryBackend:**
+```rust
+struct MemoryBackend {
+    // node_id → open file info
+    open_files: HashMap<u64, OpenFileInfo>,
+}
+
+fn read(&self, handle: &FileHandle) -> Result<Vec<u8>> {
+    let node_id = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+    let info = self.open_files.get(&node_id)?;
+    // Navigate to file and return content
+}
+```
+
+### Handler Data Flow
+
+```
+CREATE request
+  │
+  ▼
+backend.open(path) → FileHandle { backend_internal_id: 12345 }
+  │
+  ▼
+HandleState { session=A, path, backend_internal_id=12345 }
+  │
+  ▼
+Store to StateStore
+```
+
+```
+READ request
+  │
+  ▼
+Get HandleState from StateStore
+  │
+  ▼
+Rebuild FileHandle { backend_internal_id: 12345 }  (no re-open!)
+  │
+  ▼
+backend.read(file_handle) → uses backend_internal_id to find file
+```
+
+### Benefits
+
+1. **No re-open for I/O**: Handler doesn't need to re-open files for each operation
+2. **HA compatibility**: backend_internal_id is stable across server restarts (for shared storage)
+3. **Identity verification**: Durable reconnect can verify file hasn't been replaced
+
 ## SMB2 Protocol Handling
 
 ### Header Structure (64 bytes)

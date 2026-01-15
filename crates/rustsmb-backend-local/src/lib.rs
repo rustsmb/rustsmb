@@ -30,27 +30,37 @@ use tokio::sync::RwLock;
 /// Provides access to a local directory as an SMB share.
 /// All paths are resolved relative to the configured root directory,
 /// with strict validation to prevent directory traversal attacks.
+///
+/// ## Handle ID Architecture
+///
+/// This backend uses `backend_internal_id` (inode) as the primary identifier:
+/// - `open_files` is keyed by inode, not by `FileHandle.id`
+/// - Multiple opens of the same file share the same `OpenFileInfo` via ref_count
+/// - This allows any server in an HA cluster to use the same inode to find the file
 pub struct LocalBackend {
     /// Root directory for this share.
     root: PathBuf,
     /// Canonicalized root path for comparison.
     root_canonical: PathBuf,
-    /// Open file handles mapping to file info.
-    handles: Arc<RwLock<HashMap<u64, OpenFile>>>,
+    /// Open files indexed by inode (backend_internal_id).
+    /// Multiple HandleState entries may reference the same inode.
+    open_files: Arc<RwLock<HashMap<u64, OpenFileInfo>>>,
     /// Whether to follow symlinks.
     follow_symlinks: bool,
 }
 
-/// Information about an open file.
-struct OpenFile {
+/// Information about an open file, indexed by inode.
+struct OpenFileInfo {
     /// The open file handle.
     file: File,
-    /// Path relative to root.
+    /// Path relative to root (for reference, may become stale after rename).
     path: String,
     /// Raw file descriptor for locking.
     fd: RawFd,
-    /// Whether opened for writing.
+    /// Whether opened with write permission.
     writable: bool,
+    /// Reference count: how many HandleState entries reference this file.
+    ref_count: u32,
 }
 
 impl LocalBackend {
@@ -81,7 +91,7 @@ impl LocalBackend {
         Ok(Self {
             root,
             root_canonical,
-            handles: Arc::new(RwLock::new(HashMap::new())),
+            open_files: Arc::new(RwLock::new(HashMap::new())),
             follow_symlinks: true,
         })
     }
@@ -105,7 +115,7 @@ impl LocalBackend {
         Ok(Self {
             root,
             root_canonical,
-            handles: Arc::new(RwLock::new(HashMap::new())),
+            open_files: Arc::new(RwLock::new(HashMap::new())),
             follow_symlinks: true,
         })
     }
@@ -343,8 +353,6 @@ impl StorageBackend for LocalBackend {
 
                 // For directories, we still create a handle but don't open a file
                 // We'll handle directory operations specially
-                let handle = FileHandle::new();
-                let mut handles = self.handles.write().await;
 
                 // Open the directory just to get a file descriptor
                 let file = OpenOptions::new()
@@ -355,20 +363,33 @@ impl StorageBackend for LocalBackend {
 
                 let fd = file.as_raw_fd();
 
+                // Get inode from file metadata
+                let meta = file.metadata().await.map_err(VfsError::from)?;
+                let inode = meta.ino();
+
                 // Path was already validated in resolve_path, unwrap is safe here
                 let normalized_path =
                     Self::normalize_path(path).unwrap_or_else(|_| path.to_string());
 
-                handles.insert(
-                    handle.id,
-                    OpenFile {
-                        file,
-                        path: normalized_path,
-                        fd,
-                        writable: false,
-                    },
-                );
+                // Index by inode: if already open, increment ref_count
+                let mut open_files = self.open_files.write().await;
+                if let Some(info) = open_files.get_mut(&inode) {
+                    info.ref_count += 1;
+                } else {
+                    open_files.insert(
+                        inode,
+                        OpenFileInfo {
+                            file,
+                            path: normalized_path,
+                            fd,
+                            writable: false,
+                            ref_count: 1,
+                        },
+                    );
+                }
 
+                // Create handle with backend internal ID (inode)
+                let handle = FileHandle::with_backend_id(0, 0, Some(inode));
                 return Ok(handle);
             }
 
@@ -377,22 +398,37 @@ impl StorageBackend for LocalBackend {
             let file = options.open(&validated).await.map_err(VfsError::from)?;
 
             let fd = file.as_raw_fd();
-            let handle = FileHandle::new();
+
+            // Get inode from file metadata
+            let meta = file.metadata().await.map_err(VfsError::from)?;
+            let inode = meta.ino();
 
             // Path was already validated in resolve_path, unwrap is safe here
             let normalized_path = Self::normalize_path(path).unwrap_or_else(|_| path.to_string());
 
-            let mut handles = self.handles.write().await;
-            handles.insert(
-                handle.id,
-                OpenFile {
-                    file,
-                    path: normalized_path,
-                    fd,
-                    writable: flags.is_write(),
-                },
-            );
+            // Index by inode: if already open, increment ref_count
+            let mut open_files = self.open_files.write().await;
+            if let Some(info) = open_files.get_mut(&inode) {
+                info.ref_count += 1;
+                // Upgrade to writable if needed
+                if flags.is_write() && !info.writable {
+                    info.writable = true;
+                }
+            } else {
+                open_files.insert(
+                    inode,
+                    OpenFileInfo {
+                        file,
+                        path: normalized_path,
+                        fd,
+                        writable: flags.is_write(),
+                        ref_count: 1,
+                    },
+                );
+            }
 
+            // Create handle with backend internal ID (inode)
+            let handle = FileHandle::with_backend_id(0, 0, Some(inode));
             Ok(handle)
         })
     }
@@ -404,8 +440,10 @@ impl StorageBackend for LocalBackend {
         length: u32,
     ) -> BoxFuture<'a, Result<Vec<u8>, VfsError>> {
         Box::pin(async move {
-            let mut handles = self.handles.write().await;
-            let open_file = handles.get_mut(&handle.id).ok_or(VfsError::InvalidHandle)?;
+            // Look up by backend_internal_id (inode)
+            let inode = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let mut open_files = self.open_files.write().await;
+            let open_file = open_files.get_mut(&inode).ok_or(VfsError::InvalidHandle)?;
 
             // Seek to offset
             open_file
@@ -434,8 +472,10 @@ impl StorageBackend for LocalBackend {
         data: &'a [u8],
     ) -> BoxFuture<'a, Result<u32, VfsError>> {
         Box::pin(async move {
-            let mut handles = self.handles.write().await;
-            let open_file = handles.get_mut(&handle.id).ok_or(VfsError::InvalidHandle)?;
+            // Look up by backend_internal_id (inode)
+            let inode = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let mut open_files = self.open_files.write().await;
+            let open_file = open_files.get_mut(&inode).ok_or(VfsError::InvalidHandle)?;
 
             if !open_file.writable {
                 return Err(VfsError::AccessDenied(
@@ -463,16 +503,26 @@ impl StorageBackend for LocalBackend {
 
     fn close(&self, handle: FileHandle) -> BoxFuture<'_, Result<(), VfsError>> {
         Box::pin(async move {
-            let mut handles = self.handles.write().await;
-            handles.remove(&handle.id);
+            // Look up by backend_internal_id (inode)
+            let inode = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let mut open_files = self.open_files.write().await;
+
+            if let Some(info) = open_files.get_mut(&inode) {
+                info.ref_count -= 1;
+                if info.ref_count == 0 {
+                    open_files.remove(&inode);
+                }
+            }
             Ok(())
         })
     }
 
     fn fsync<'a>(&'a self, handle: &'a FileHandle) -> BoxFuture<'a, Result<(), VfsError>> {
         Box::pin(async move {
-            let handles = self.handles.read().await;
-            let open_file = handles.get(&handle.id).ok_or(VfsError::InvalidHandle)?;
+            // Look up by backend_internal_id (inode)
+            let inode = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            let open_file = open_files.get(&inode).ok_or(VfsError::InvalidHandle)?;
 
             open_file.file.sync_all().await.map_err(VfsError::from)
         })
@@ -497,8 +547,10 @@ impl StorageBackend for LocalBackend {
 
     fn fstat<'a>(&'a self, handle: &'a FileHandle) -> BoxFuture<'a, Result<Metadata, VfsError>> {
         Box::pin(async move {
-            let handles = self.handles.read().await;
-            let open_file = handles.get(&handle.id).ok_or(VfsError::InvalidHandle)?;
+            // Look up by backend_internal_id (inode)
+            let inode = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            let open_file = open_files.get(&inode).ok_or(VfsError::InvalidHandle)?;
 
             let resolved = self.resolve_path(&open_file.path)?;
             let meta = fs::metadata(&resolved).await.map_err(VfsError::from)?;
@@ -734,8 +786,10 @@ impl StorageBackend for LocalBackend {
         lock: FileLock,
     ) -> BoxFuture<'a, Result<(), VfsError>> {
         Box::pin(async move {
-            let handles = self.handles.read().await;
-            let open_file = handles.get(&handle.id).ok_or(VfsError::InvalidHandle)?;
+            // Look up by backend_internal_id (inode)
+            let inode = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            let open_file = open_files.get(&inode).ok_or(VfsError::InvalidHandle)?;
 
             // Use flock for whole-file locking
             // Note: SMB supports byte-range locking, but flock only does whole-file
@@ -767,8 +821,10 @@ impl StorageBackend for LocalBackend {
         _lock: FileLock,
     ) -> BoxFuture<'a, Result<(), VfsError>> {
         Box::pin(async move {
-            let handles = self.handles.read().await;
-            let open_file = handles.get(&handle.id).ok_or(VfsError::InvalidHandle)?;
+            // Look up by backend_internal_id (inode)
+            let inode = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            let open_file = open_files.get(&inode).ok_or(VfsError::InvalidHandle)?;
 
             let fd = open_file.fd;
             tokio::task::spawn_blocking(move || {

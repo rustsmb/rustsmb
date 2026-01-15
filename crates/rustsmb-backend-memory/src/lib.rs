@@ -6,7 +6,7 @@
 use rustsmb_core::VfsError;
 use rustsmb_vfs::{
     BackendCapabilities, BoxFuture, CreateParams, DirEntry, FileHandle, FileLock, FileType,
-    FsStats, LockType, Metadata, OpenFlags, StorageBackend,
+    FsStats, LockType, Metadata, StorageBackend,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,25 +15,32 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 
 /// In-memory filesystem backend.
+///
+/// ## Handle ID Architecture
+///
+/// This backend uses `backend_internal_id` (node_id/inode) as the primary identifier:
+/// - `open_files` is keyed by node_id, not by `FileHandle.id`
+/// - Multiple HandleState entries can reference the same file via ref_count
+/// - This allows any server in an HA cluster to use the same node_id to find the file
 pub struct MemoryBackend {
     /// Root of the filesystem tree.
     root: Arc<RwLock<MemoryNode>>,
-    /// Open file handles mapping to paths.
-    handles: Arc<RwLock<HashMap<u64, HandleInfo>>>,
+    /// Open files indexed by node_id (backend_internal_id).
+    /// Multiple HandleState entries may reference the same node_id.
+    open_files: Arc<RwLock<HashMap<u64, OpenFileInfo>>>,
     /// Inode counter for unique IDs.
     inode_counter: AtomicU64,
-    /// Lock tracking per handle.
+    /// Lock tracking per node_id.
     locks: Arc<RwLock<HashMap<u64, Vec<FileLock>>>>,
 }
 
-/// Information about an open file handle.
+/// Information about an open file, indexed by node_id.
 #[derive(Debug, Clone)]
-struct HandleInfo {
-    /// Path to the file.
+struct OpenFileInfo {
+    /// Path to the file (for navigating the tree).
     path: String,
-    /// Open flags used (preserved for potential future use).
-    #[allow(dead_code)]
-    flags: OpenFlags,
+    /// Reference count: how many HandleState entries reference this file.
+    ref_count: u32,
 }
 
 /// A node in the in-memory filesystem.
@@ -168,7 +175,7 @@ impl MemoryBackend {
                 metadata: NodeMetadata::new(0o755, 1),
                 xattrs: HashMap::new(),
             })),
-            handles: Arc::new(RwLock::new(HashMap::new())),
+            open_files: Arc::new(RwLock::new(HashMap::new())),
             inode_counter: AtomicU64::new(2),
             locks: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -271,18 +278,26 @@ impl StorageBackend for MemoryBackend {
                         if flags.is_create() && flags.is_excl() {
                             return Err(VfsError::AlreadyExists(path));
                         }
-                        // Open existing directory
-                        let handle = FileHandle::new();
-                        let mut handles = self.handles.write().await;
-                        handles.insert(handle.id, HandleInfo { path, flags });
+                        // Open existing directory - index by node_id
+                        let node_id = node.metadata().ino;
+                        let mut open_files = self.open_files.write().await;
+                        if let Some(info) = open_files.get_mut(&node_id) {
+                            info.ref_count += 1;
+                        } else {
+                            open_files.insert(node_id, OpenFileInfo { path, ref_count: 1 });
+                        }
+                        let handle = FileHandle::with_backend_id(0, 0, Some(node_id));
                         return Ok(handle);
                     }
                     Err(VfsError::NotFound(_)) if flags.is_create() => {
                         // Directory doesn't exist, create it
                         self.mkdir(&path, 0o755).await?;
-                        let handle = FileHandle::new();
-                        let mut handles = self.handles.write().await;
-                        handles.insert(handle.id, HandleInfo { path, flags });
+                        // Get the newly created directory's inode
+                        let node = self.get_node(&path).await?;
+                        let node_id = node.metadata().ino;
+                        let mut open_files = self.open_files.write().await;
+                        open_files.insert(node_id, OpenFileInfo { path, ref_count: 1 });
+                        let handle = FileHandle::with_backend_id(0, 0, Some(node_id));
                         return Ok(handle);
                     }
                     Err(e) => return Err(e),
@@ -323,6 +338,8 @@ impl StorageBackend for MemoryBackend {
             // Check if file exists
             let exists = children.contains_key(filename);
 
+            let node_id: u64;
+
             if exists {
                 if flags.is_create() && flags.is_excl() {
                     return Err(VfsError::AlreadyExists(path));
@@ -332,6 +349,9 @@ impl StorageBackend for MemoryBackend {
                 if matches!(node, MemoryNode::Directory { .. }) {
                     return Err(VfsError::IsADirectory(path));
                 }
+
+                // Get inode from existing node
+                node_id = node.metadata().ino;
 
                 // Truncate if requested
                 if flags.is_trunc() {
@@ -347,12 +367,12 @@ impl StorageBackend for MemoryBackend {
             } else if flags.is_create() {
                 // Create new file - use default mode since SMB uses file_attributes instead
                 let mode = 0o644;
-                let ino = self.next_inode();
+                node_id = self.next_inode();
                 children.insert(
                     filename.to_string(),
                     MemoryNode::File {
                         content: Vec::new(),
-                        metadata: NodeMetadata::new(mode, ino),
+                        metadata: NodeMetadata::new(mode, node_id),
                         xattrs: HashMap::new(),
                     },
                 );
@@ -360,13 +380,17 @@ impl StorageBackend for MemoryBackend {
                 return Err(VfsError::NotFound(path));
             }
 
-            // Create handle
-            let handle = FileHandle::new();
+            // Index by node_id: if already open, increment ref_count
             drop(root);
+            let mut open_files = self.open_files.write().await;
+            if let Some(info) = open_files.get_mut(&node_id) {
+                info.ref_count += 1;
+            } else {
+                open_files.insert(node_id, OpenFileInfo { path, ref_count: 1 });
+            }
 
-            let mut handles = self.handles.write().await;
-            handles.insert(handle.id, HandleInfo { path, flags });
-
+            // Create handle with backend internal ID (node ID)
+            let handle = FileHandle::with_backend_id(0, 0, Some(node_id));
             Ok(handle)
         })
     }
@@ -378,11 +402,13 @@ impl StorageBackend for MemoryBackend {
         length: u32,
     ) -> BoxFuture<'a, Result<Vec<u8>, VfsError>> {
         Box::pin(async move {
-            let handles = self.handles.read().await;
-            let info = handles.get(&handle.id).ok_or(VfsError::InvalidHandle)?;
+            // Look up by backend_internal_id (node_id)
+            let node_id = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            let info = open_files.get(&node_id).ok_or(VfsError::InvalidHandle)?;
 
             let path = info.path.clone();
-            drop(handles);
+            drop(open_files);
 
             let node = self.get_node(&path).await?;
 
@@ -408,11 +434,13 @@ impl StorageBackend for MemoryBackend {
         data: &'a [u8],
     ) -> BoxFuture<'a, Result<u32, VfsError>> {
         Box::pin(async move {
-            let handles = self.handles.read().await;
-            let info = handles.get(&handle.id).ok_or(VfsError::InvalidHandle)?;
+            // Look up by backend_internal_id (node_id)
+            let node_id = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            let info = open_files.get(&node_id).ok_or(VfsError::InvalidHandle)?;
 
             let path = info.path.clone();
-            drop(handles);
+            drop(open_files);
 
             let mut root = self.root.write().await;
 
@@ -460,12 +488,20 @@ impl StorageBackend for MemoryBackend {
 
     fn close(&self, handle: FileHandle) -> BoxFuture<'_, Result<(), VfsError>> {
         Box::pin(async move {
-            let mut handles = self.handles.write().await;
-            handles.remove(&handle.id);
+            // Look up by backend_internal_id (node_id)
+            let node_id = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let mut open_files = self.open_files.write().await;
 
-            // Remove any locks held by this handle
+            if let Some(info) = open_files.get_mut(&node_id) {
+                info.ref_count -= 1;
+                if info.ref_count == 0 {
+                    open_files.remove(&node_id);
+                }
+            }
+
+            // Remove any locks held by this node
             let mut locks = self.locks.write().await;
-            locks.remove(&handle.id);
+            locks.remove(&node_id);
 
             Ok(())
         })
@@ -473,9 +509,10 @@ impl StorageBackend for MemoryBackend {
 
     fn fsync<'a>(&'a self, handle: &'a FileHandle) -> BoxFuture<'a, Result<(), VfsError>> {
         Box::pin(async move {
-            // Verify handle exists
-            let handles = self.handles.read().await;
-            if !handles.contains_key(&handle.id) {
+            // Verify handle exists by backend_internal_id (node_id)
+            let node_id = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            if !open_files.contains_key(&node_id) {
                 return Err(VfsError::InvalidHandle);
             }
             // No-op for in-memory filesystem
@@ -492,11 +529,13 @@ impl StorageBackend for MemoryBackend {
 
     fn fstat<'a>(&'a self, handle: &'a FileHandle) -> BoxFuture<'a, Result<Metadata, VfsError>> {
         Box::pin(async move {
-            let handles = self.handles.read().await;
-            let info = handles.get(&handle.id).ok_or(VfsError::InvalidHandle)?;
+            // Look up by backend_internal_id (node_id)
+            let node_id = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            let info = open_files.get(&node_id).ok_or(VfsError::InvalidHandle)?;
 
             let path = info.path.clone();
-            drop(handles);
+            drop(open_files);
 
             let node = self.get_node(&path).await?;
             Ok(node.to_vfs_metadata())
@@ -984,17 +1023,19 @@ impl StorageBackend for MemoryBackend {
         lock: FileLock,
     ) -> BoxFuture<'a, Result<(), VfsError>> {
         Box::pin(async move {
-            let handles = self.handles.read().await;
-            if !handles.contains_key(&handle.id) {
+            // Verify handle exists by backend_internal_id (node_id)
+            let node_id = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            if !open_files.contains_key(&node_id) {
                 return Err(VfsError::InvalidHandle);
             }
-            drop(handles);
+            drop(open_files);
 
             let mut locks = self.locks.write().await;
-            let handle_locks = locks.entry(handle.id).or_default();
+            let node_locks = locks.entry(node_id).or_default();
 
             // Check for conflicts with existing locks
-            for existing in handle_locks.iter() {
+            for existing in node_locks.iter() {
                 // Check overlap
                 let existing_end = if existing.length == 0 {
                     u64::MAX
@@ -1017,7 +1058,7 @@ impl StorageBackend for MemoryBackend {
                 }
             }
 
-            handle_locks.push(lock);
+            node_locks.push(lock);
             Ok(())
         })
     }
@@ -1028,15 +1069,17 @@ impl StorageBackend for MemoryBackend {
         lock: FileLock,
     ) -> BoxFuture<'a, Result<(), VfsError>> {
         Box::pin(async move {
-            let handles = self.handles.read().await;
-            if !handles.contains_key(&handle.id) {
+            // Verify handle exists by backend_internal_id (node_id)
+            let node_id = handle.backend_internal_id.ok_or(VfsError::InvalidHandle)?;
+            let open_files = self.open_files.read().await;
+            if !open_files.contains_key(&node_id) {
                 return Err(VfsError::InvalidHandle);
             }
-            drop(handles);
+            drop(open_files);
 
             let mut locks = self.locks.write().await;
-            if let Some(handle_locks) = locks.get_mut(&handle.id) {
-                handle_locks.retain(|l| !(l.start == lock.start && l.length == lock.length));
+            if let Some(node_locks) = locks.get_mut(&node_id) {
+                node_locks.retain(|l| !(l.start == lock.start && l.length == lock.length));
             }
 
             Ok(())
@@ -1547,6 +1590,202 @@ mod tests {
         assert!(
             matches!(result, Err(VfsError::NotADirectory(_))),
             "Expected NotADirectory error, got: {:?}",
+            result
+        );
+    }
+
+    // ==========================================================================
+    // Phase 29: backend_internal_id Architecture Tests
+    // ==========================================================================
+    // These tests verify the new architecture where:
+    // - backend_internal_id (node_id/inode) is the primary file identifier
+    // - Multiple opens to the same file share the same backend_internal_id
+    // - Backend uses backend_internal_id to locate files directly (no re-open needed)
+
+    #[tokio::test]
+    async fn test_backend_internal_id_stored() {
+        // Phase 29: CREATE stores node_id in FileHandle.backend_internal_id
+        let backend = MemoryBackend::new();
+        let params = create_params_rw_create();
+
+        let handle = backend.open("test.txt", &params).await.unwrap();
+
+        // backend_internal_id should be set
+        assert!(
+            handle.backend_internal_id.is_some(),
+            "backend_internal_id should be set after open"
+        );
+
+        // Get the file's inode from metadata and verify it matches
+        let meta = backend.stat("test.txt").await.unwrap();
+        assert_eq!(
+            handle.backend_internal_id,
+            Some(meta.ino),
+            "backend_internal_id should match file's inode"
+        );
+
+        backend.close(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_same_file_multiple_opens_share_inode() {
+        // Phase 29: Multiple opens to the same file share the same backend_internal_id
+        let backend = MemoryBackend::new();
+        let params = create_params_rw_create();
+
+        // First open
+        let handle1 = backend.open("shared.txt", &params).await.unwrap();
+        let id1 = handle1.backend_internal_id;
+
+        // Second open (same file)
+        let handle2 = backend.open("shared.txt", &params).await.unwrap();
+        let id2 = handle2.backend_internal_id;
+
+        // Both should have the same backend_internal_id
+        assert!(
+            id1.is_some(),
+            "First handle should have backend_internal_id"
+        );
+        assert!(
+            id2.is_some(),
+            "Second handle should have backend_internal_id"
+        );
+        assert_eq!(
+            id1, id2,
+            "Multiple opens to same file should share backend_internal_id"
+        );
+
+        // Both handles should work for I/O
+        backend
+            .write(&handle1, 0, b"Hello from handle1")
+            .await
+            .unwrap();
+        let data = backend.read(&handle2, 0, 100).await.unwrap();
+        assert_eq!(data, b"Hello from handle1");
+
+        // Close first handle - second should still work
+        backend.close(handle1).await.unwrap();
+        let data = backend.read(&handle2, 0, 100).await.unwrap();
+        assert_eq!(data, b"Hello from handle1");
+
+        // Close second handle
+        backend.close(handle2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_uses_backend_internal_id() {
+        // Phase 29: READ uses backend_internal_id to locate file (no re-open)
+        let backend = MemoryBackend::new();
+        let params = create_params_rw_create();
+
+        // Create and write to file
+        let handle = backend.open("data.txt", &params).await.unwrap();
+        backend.write(&handle, 0, b"Test data").await.unwrap();
+
+        // Read should work using backend_internal_id
+        let data = backend.read(&handle, 0, 100).await.unwrap();
+        assert_eq!(data, b"Test data");
+
+        // Create a new FileHandle with just the backend_internal_id
+        // (simulating what handler does when reconstructing from HandleState)
+        let reconstructed = FileHandle::with_backend_id(0, 0, handle.backend_internal_id);
+        let data = backend.read(&reconstructed, 0, 100).await.unwrap();
+        assert_eq!(data, b"Test data");
+
+        backend.close(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_uses_backend_internal_id() {
+        // Phase 29: WRITE uses backend_internal_id to locate file (no re-open)
+        let backend = MemoryBackend::new();
+        let params = create_params_rw_create();
+
+        // Create file
+        let handle = backend.open("write_test.txt", &params).await.unwrap();
+
+        // Create a new FileHandle with just the backend_internal_id
+        let reconstructed = FileHandle::with_backend_id(0, 0, handle.backend_internal_id);
+
+        // Write using reconstructed handle
+        backend
+            .write(&reconstructed, 0, b"Written via reconstructed handle")
+            .await
+            .unwrap();
+
+        // Read back to verify
+        let data = backend.read(&handle, 0, 100).await.unwrap();
+        assert_eq!(data, b"Written via reconstructed handle");
+
+        backend.close(handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ref_count_increments_on_multiple_opens() {
+        // Phase 29: Verify ref_count mechanism works correctly
+        let backend = MemoryBackend::new();
+        let params = create_params_rw_create();
+
+        // Open file 3 times
+        let handle1 = backend.open("refcount.txt", &params).await.unwrap();
+        let handle2 = backend.open("refcount.txt", &params).await.unwrap();
+        let handle3 = backend.open("refcount.txt", &params).await.unwrap();
+
+        // All should share same backend_internal_id
+        assert_eq!(handle1.backend_internal_id, handle2.backend_internal_id);
+        assert_eq!(handle2.backend_internal_id, handle3.backend_internal_id);
+
+        // Close two handles
+        backend.close(handle1).await.unwrap();
+        backend.close(handle2).await.unwrap();
+
+        // Third handle should still work
+        backend.write(&handle3, 0, b"Still working").await.unwrap();
+        let data = backend.read(&handle3, 0, 100).await.unwrap();
+        assert_eq!(data, b"Still working");
+
+        // Close last handle
+        backend.close(handle3).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_invalid_backend_internal_id_returns_error() {
+        // Phase 29: Operations with invalid backend_internal_id should fail
+        let backend = MemoryBackend::new();
+
+        // Create handle with non-existent backend_internal_id
+        let fake_handle = FileHandle::with_backend_id(0, 0, Some(999999));
+
+        // Read should fail with InvalidHandle
+        let result = backend.read(&fake_handle, 0, 100).await;
+        assert!(
+            matches!(result, Err(VfsError::InvalidHandle)),
+            "Read with invalid backend_internal_id should return InvalidHandle, got: {:?}",
+            result
+        );
+
+        // Write should also fail
+        let result = backend.write(&fake_handle, 0, b"test").await;
+        assert!(
+            matches!(result, Err(VfsError::InvalidHandle)),
+            "Write with invalid backend_internal_id should return InvalidHandle, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_backend_internal_id_returns_error() {
+        // Phase 29: Operations with None backend_internal_id should fail
+        let backend = MemoryBackend::new();
+
+        // Create handle without backend_internal_id
+        let handle_without_id = FileHandle::with_backend_id(0, 0, None);
+
+        // Read should fail with InvalidHandle
+        let result = backend.read(&handle_without_id, 0, 100).await;
+        assert!(
+            matches!(result, Err(VfsError::InvalidHandle)),
+            "Read with None backend_internal_id should return InvalidHandle, got: {:?}",
             result
         );
     }

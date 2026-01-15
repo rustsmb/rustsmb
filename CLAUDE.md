@@ -952,3 +952,34 @@ Implement server-side file copy via FSCTL_SRV_COPYCHUNK per MS-SMB2 3.3.5.15.5-6
 - copy_chunk_limits, copy_chunk_across_shares*, etc.
 
 For detailed smbtorture test results and analysis, see [docs/smbtorture-test-analysis.md](./docs/smbtorture-test-analysis.md).
+
+### Phase 29: FileHandle ID Architecture - COMPLETED
+
+Refactored the handle ID architecture to use `backend_internal_id` as the primary file identifier. This enables:
+- Stable file identity across server restarts (for HA/clustering)
+- No re-open needed for I/O operations (improved performance)
+- Proper identity verification on durable handle reconnect
+
+**Key Design:**
+- `backend_internal_id` = file's inode (LocalBackend) or node_id (MemoryBackend)
+- Multiple HandleState entries can reference the same file via `backend_internal_id`
+- Handler rebuilds FileHandle from HandleState using `backend_internal_id` for I/O
+- Backend uses `backend_internal_id` to locate file directly (no path-based re-open)
+
+- [x] Phase 29A: Add `backend_internal_id` field to `FileHandle` (rustsmb-vfs)
+- [x] Phase 29B: Add `backend_internal_id` field to `HandleState` (rustsmb-state)
+- [x] Phase 29C: Update LocalBackend to use inode mapping (`open_files: HashMap<u64, OpenFileInfo>`)
+- [x] Phase 29D: Update MemoryBackend to use node_id indexing
+- [x] Phase 29E: Update Handler to rebuild FileHandle from `backend_internal_id` (no re-open)
+- [x] Phase 29F: Update HandleState.path after rename operations
+- [x] Phase 29G: Verify file identity via `backend_internal_id` on durable reconnect
+- [x] Phase 29H: Unit tests (7 new tests in MemoryBackend)
+  - test_backend_internal_id_stored
+  - test_same_file_multiple_opens_share_inode
+  - test_read_uses_backend_internal_id
+  - test_write_uses_backend_internal_id
+  - test_ref_count_increments_on_multiple_opens
+  - test_invalid_backend_internal_id_returns_error
+  - test_missing_backend_internal_id_returns_error
+- [x] Phase 29I: Update CLAUDE.md (this section)
+- [x] Phase 29J: Update docs/architecture.md (Handle ID Architecture section)
