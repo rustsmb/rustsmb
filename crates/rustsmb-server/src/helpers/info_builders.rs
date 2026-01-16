@@ -6,6 +6,32 @@
 use super::time::current_filetime;
 use rustsmb_vfs::FileType;
 
+const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+fn file_attributes_from_metadata(metadata: &rustsmb_vfs::Metadata) -> u32 {
+    let mut attrs = 0u32;
+    let is_dir = metadata.file_type == FileType::Directory;
+
+    if is_dir {
+        attrs |= FILE_ATTRIBUTE_DIRECTORY;
+    } else {
+        attrs |= FILE_ATTRIBUTE_ARCHIVE;
+    }
+
+    if (metadata.mode & 0o222) == 0 {
+        attrs |= FILE_ATTRIBUTE_READONLY;
+    }
+
+    if attrs == 0 {
+        FILE_ATTRIBUTE_NORMAL
+    } else {
+        attrs
+    }
+}
+
 /// Build directory info buffer from entries.
 ///
 /// Builds FileBothDirectoryInformation structures per MS-SMB2 2.4.8.
@@ -34,8 +60,7 @@ pub fn build_directory_info(entries: &[rustsmb_vfs::DirEntry]) -> Vec<u8> {
         buf.extend_from_slice(&entry.metadata.size.to_le_bytes()); // EndOfFile
         buf.extend_from_slice(&entry.metadata.size.to_le_bytes()); // AllocationSize
 
-        let is_dir = entry.metadata.file_type == FileType::Directory;
-        let attrs = if is_dir { 0x10u32 } else { 0x80u32 }; // Directory or Normal
+        let attrs = file_attributes_from_metadata(&entry.metadata);
         buf.extend_from_slice(&attrs.to_le_bytes()); // FileAttributes
         buf.extend_from_slice(&(name_len as u32).to_le_bytes()); // FileNameLength
         buf.extend_from_slice(&0u32.to_le_bytes()); // EaSize
@@ -84,7 +109,7 @@ pub fn build_file_info(
             buf.extend_from_slice(&current_filetime().to_le_bytes()); // LastAccessTime
             buf.extend_from_slice(&current_filetime().to_le_bytes()); // LastWriteTime
             buf.extend_from_slice(&current_filetime().to_le_bytes()); // ChangeTime
-            let attrs = if is_dir { 0x10u32 } else { 0x80u32 };
+            let attrs = file_attributes_from_metadata(metadata);
             buf.extend_from_slice(&attrs.to_le_bytes()); // FileAttributes
             buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved
         }
@@ -104,7 +129,7 @@ pub fn build_file_info(
             buf.extend_from_slice(&current_filetime().to_le_bytes()); // LastAccessTime
             buf.extend_from_slice(&current_filetime().to_le_bytes()); // LastWriteTime
             buf.extend_from_slice(&current_filetime().to_le_bytes()); // ChangeTime
-            let attrs = if is_dir { 0x10u32 } else { 0x80u32 };
+            let attrs = file_attributes_from_metadata(metadata);
             buf.extend_from_slice(&attrs.to_le_bytes()); // FileAttributes
             buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved
 

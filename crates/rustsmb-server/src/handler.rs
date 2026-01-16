@@ -287,7 +287,22 @@ where
         let response = match self.process_message(message).await {
             Ok(resp) => resp,
             Err(e) => {
-                warn!(conn_id = self.connection.id, error = %e, "Error processing message");
+                match &e {
+                    HandlerError::Vfs(msg)
+                        if msg.starts_with("Not found:")
+                            || msg.starts_with("Already exists:")
+                            || msg.starts_with("Is a directory:") =>
+                    {
+                        debug!(
+                            conn_id = self.connection.id,
+                            error = %e,
+                            "Error processing message"
+                        );
+                    }
+                    _ => {
+                        warn!(conn_id = self.connection.id, error = %e, "Error processing message");
+                    }
+                }
                 // Build error response
                 self.build_error_response(message, e.status())?
             }
@@ -2284,6 +2299,8 @@ where
             return Err(HandlerError::Status(NtStatus::InvalidParameter));
         }
 
+        let filename = filename.replace('\\', "/");
+
         // Parse CREATE contexts if present
         let contexts = if request.create_contexts_length > 0 {
             let ctx_offset = request.create_contexts_offset as usize;
@@ -2364,6 +2381,12 @@ where
         const FILE_SHARE_READ: u32 = 0x01;
         const FILE_SHARE_WRITE: u32 = 0x02;
         const FILE_SHARE_DELETE: u32 = 0x04;
+
+        // File attribute constants
+        const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
         // Helper to check if access implies read
         let wants_read = |access: u32| -> bool {
@@ -2633,6 +2656,12 @@ where
             create_action,
             "CREATE: calculated create_action"
         );
+
+        if create_action != 1 {
+            let readonly = (request.file_attributes & FILE_ATTRIBUTE_READONLY) != 0;
+            self.apply_readonly_attribute(&backend, &filename, readonly)
+                .await?;
+        }
 
         // Generate handle IDs
         let handle_id = self
@@ -3241,36 +3270,46 @@ where
 
         // Get file metadata for response attributes and sizes
         let file_metadata = backend.stat(&filename).await.ok();
+        let file_is_dir = file_metadata
+            .as_ref()
+            .map(|m| m.file_type == rustsmb_vfs::FileType::Directory)
+            .unwrap_or(false);
 
         // Determine file_attributes for response
         // Per MS-SMB2: FILE_ATTRIBUTE_ARCHIVE (0x20) should be set for new files
         // FILE_ATTRIBUTE_NORMAL (0x80) is only valid when NO other attributes are set
         // For opened files, get actual attributes; for created, use requested or default
         let response_file_attributes = if create_action == 2 {
-            // FILE_CREATED - use requested attributes, but ensure ARCHIVE is set
+            // FILE_CREATED - use requested attributes, add ARCHIVE for files only
             // Strip NORMAL (0x80) as it conflicts with having other attributes
-            let requested = request.file_attributes & !0x80; // Remove NORMAL if present
-            if requested == 0 {
-                0x20 // Just FILE_ATTRIBUTE_ARCHIVE for new files
+            let requested = request.file_attributes & !FILE_ATTRIBUTE_NORMAL;
+            let mut attrs = requested;
+            if file_is_dir
+                || (request.create_options & rustsmb_vfs::create_options::FILE_DIRECTORY_FILE) != 0
+                || (requested & FILE_ATTRIBUTE_DIRECTORY) != 0
+            {
+                attrs |= FILE_ATTRIBUTE_DIRECTORY;
             } else {
-                requested | 0x20 // Add ARCHIVE to requested (excluding NORMAL)
+                attrs |= FILE_ATTRIBUTE_ARCHIVE;
             }
+            attrs
         } else {
             // FILE_OPENED/OVERWRITTEN/SUPERSEDED - get actual file attributes
             file_metadata
                 .as_ref()
                 .map(|m| {
                     // Convert file type to SMB attributes
-                    let mut attrs = 0x20u32; // FILE_ATTRIBUTE_ARCHIVE
-                    if m.file_type == rustsmb_vfs::FileType::Directory {
-                        attrs |= 0x10; // FILE_ATTRIBUTE_DIRECTORY
-                    }
+                    let mut attrs = if m.file_type == rustsmb_vfs::FileType::Directory {
+                        FILE_ATTRIBUTE_DIRECTORY
+                    } else {
+                        FILE_ATTRIBUTE_ARCHIVE
+                    };
                     if (m.mode & 0o200) == 0 {
-                        attrs |= 0x01; // FILE_ATTRIBUTE_READONLY
+                        attrs |= FILE_ATTRIBUTE_READONLY;
                     }
                     attrs
                 })
-                .unwrap_or(0x20) // Default to ARCHIVE if stat fails
+                .unwrap_or(FILE_ATTRIBUTE_ARCHIVE) // Default to ARCHIVE if stat fails
         };
 
         // Determine allocation_size for response
@@ -5399,6 +5438,32 @@ where
         self.serialize_response(&resp_header, &response)
     }
 
+    async fn apply_readonly_attribute(
+        &self,
+        backend: &rustsmb_vfs::DynStorageBackend,
+        path: &str,
+        readonly: bool,
+    ) -> Result<(), HandlerError> {
+        let metadata = backend
+            .stat(path)
+            .await
+            .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+
+        let mut mode = metadata.mode;
+        if readonly {
+            mode &= !0o222;
+        } else {
+            mode |= 0o200;
+        }
+
+        backend
+            .chmod(path, mode)
+            .await
+            .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+
+        Ok(())
+    }
+
     /// Handle SET_INFO for file info classes.
     async fn handle_set_file_info(
         &self,
@@ -5425,7 +5490,7 @@ where
                 let last_access_time = u64::from_le_bytes(buffer[8..16].try_into().unwrap());
                 let last_write_time = u64::from_le_bytes(buffer[16..24].try_into().unwrap());
                 let _change_time = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
-                let _attributes = u32::from_le_bytes(buffer[32..36].try_into().unwrap());
+                let attributes = u32::from_le_bytes(buffer[32..36].try_into().unwrap());
 
                 // Convert FILETIME to SystemTime if non-zero
                 // A FILETIME of 0 or -1 means "don't change"
@@ -5460,6 +5525,13 @@ where
                         .utimes(&handle.path, access_time, modify_time)
                         .await
                         .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+                }
+
+                if attributes != 0 {
+                    const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
+                    let readonly = (attributes & FILE_ATTRIBUTE_READONLY) != 0;
+                    self.apply_readonly_attribute(backend, &handle.path, readonly)
+                        .await?;
                 }
 
                 debug!(
@@ -8831,12 +8903,18 @@ mod tests {
 
     /// Helper to compute response file_attributes for a created file.
     /// This mirrors the logic in handle_create for create_action == 2.
-    fn compute_created_file_attributes(requested_attrs: u32) -> u32 {
+    fn compute_created_file_attributes(requested_attrs: u32, is_directory: bool) -> u32 {
         let requested = requested_attrs & !FILE_ATTRIBUTE_NORMAL; // Remove NORMAL if present
-        if requested == 0 {
-            FILE_ATTRIBUTE_ARCHIVE // Just ARCHIVE for new files
+        let mut attrs = requested;
+        if is_directory || (requested & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+            attrs |= FILE_ATTRIBUTE_DIRECTORY;
         } else {
-            requested | FILE_ATTRIBUTE_ARCHIVE // Add ARCHIVE to requested (excluding NORMAL)
+            attrs |= FILE_ATTRIBUTE_ARCHIVE;
+        }
+        if attrs == 0 {
+            FILE_ATTRIBUTE_NORMAL
+        } else {
+            attrs
         }
     }
 
@@ -8844,7 +8922,7 @@ mod tests {
     fn test_file_attributes_new_file_default() {
         // Per MS-SMB2: Newly created files should have ARCHIVE attribute
         // When no attributes requested, return just ARCHIVE
-        let attrs = compute_created_file_attributes(0);
+        let attrs = compute_created_file_attributes(0, false);
         assert_eq!(
             attrs, FILE_ATTRIBUTE_ARCHIVE,
             "MS-SMB2: New file with no requested attrs → FILE_ATTRIBUTE_ARCHIVE (0x20)"
@@ -8855,7 +8933,7 @@ mod tests {
     fn test_file_attributes_new_file_with_normal() {
         // Per MS-SMB2: FILE_ATTRIBUTE_NORMAL (0x80) is only valid alone
         // When client requests NORMAL, we should return ARCHIVE instead
-        let attrs = compute_created_file_attributes(FILE_ATTRIBUTE_NORMAL);
+        let attrs = compute_created_file_attributes(FILE_ATTRIBUTE_NORMAL, false);
         assert_eq!(
             attrs, FILE_ATTRIBUTE_ARCHIVE,
             "MS-SMB2: NORMAL alone should become ARCHIVE for new files"
@@ -8867,7 +8945,7 @@ mod tests {
         // Per MS-SMB2: NORMAL (0x80) cannot be combined with other attributes
         // If client sends NORMAL | HIDDEN, we strip NORMAL and add ARCHIVE
         let requested = FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_HIDDEN;
-        let attrs = compute_created_file_attributes(requested);
+        let attrs = compute_created_file_attributes(requested, false);
         assert_eq!(
             attrs,
             FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE,
@@ -8884,7 +8962,7 @@ mod tests {
     fn test_file_attributes_preserves_requested() {
         // Requested attributes (except NORMAL) should be preserved, with ARCHIVE added
         let requested = FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN;
-        let attrs = compute_created_file_attributes(requested);
+        let attrs = compute_created_file_attributes(requested, false);
         assert_eq!(
             attrs,
             FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE,
@@ -8895,9 +8973,9 @@ mod tests {
     #[test]
     fn test_file_attributes_archive_always_set_for_new_files() {
         // ARCHIVE should always be set for newly created files
-        let attrs1 = compute_created_file_attributes(0);
-        let attrs2 = compute_created_file_attributes(FILE_ATTRIBUTE_READONLY);
-        let attrs3 = compute_created_file_attributes(FILE_ATTRIBUTE_NORMAL);
+        let attrs1 = compute_created_file_attributes(0, false);
+        let attrs2 = compute_created_file_attributes(FILE_ATTRIBUTE_READONLY, false);
+        let attrs3 = compute_created_file_attributes(FILE_ATTRIBUTE_NORMAL, false);
 
         assert!(
             (attrs1 & FILE_ATTRIBUTE_ARCHIVE) != 0,
@@ -8910,6 +8988,15 @@ mod tests {
         assert!(
             (attrs3 & FILE_ATTRIBUTE_ARCHIVE) != 0,
             "ARCHIVE must be set for new file (NORMAL)"
+        );
+    }
+
+    #[test]
+    fn test_file_attributes_directory_no_archive() {
+        let attrs = compute_created_file_attributes(0, true);
+        assert_eq!(
+            attrs, FILE_ATTRIBUTE_DIRECTORY,
+            "Directories should not force ARCHIVE"
         );
     }
 
