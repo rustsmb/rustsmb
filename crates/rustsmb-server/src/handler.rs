@@ -5,7 +5,8 @@
 
 use crate::helpers::{
     build_directory_info, build_file_info, build_fs_info, build_security_info, current_filetime,
-    decode_utf16le, extract_share_name, filetime_to_unix, parse_utf16_string,
+    decode_utf16le, extract_share_name, file_info_min_size, filetime_to_unix, fs_info_min_size,
+    parse_utf16_string,
 };
 use crate::lease_break::{
     LeaseBreakEvent, LeaseBreakRegistry, OplockBreakEvent, OplockConnectionEntry,
@@ -2269,11 +2270,112 @@ where
         let request = CreateRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse create: {}", e)))?;
 
-        // Per MS-SMB2 3.3.5.9: Impersonation level validation only applies to named pipes.
-        // "When opening a named pipe, if the ImpersonationLevel level is Delegate,
-        // the server MUST fail the request with STATUS_BAD_IMPERSONATION_LEVEL."
-        // For regular files, any impersonation level value should be accepted.
-        // Named pipes are typically on IPC$ share, so we skip validation for disk shares.
+        // Validate SecurityFlags per MS-SMB2 2.2.13
+        // SecurityFlags MUST be set to 0 (reserved bits)
+        if request.security_flags != 0 {
+            debug!(
+                conn_id = self.connection.id,
+                security_flags = format!("0x{:02X}", request.security_flags),
+                "CREATE: Reserved security_flags must be 0"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Validate RequestedOplockLevel per MS-SMB2 2.2.13
+        // Valid values: 0x00=NONE, 0x01=II, 0x08=EXCLUSIVE, 0x09=BATCH, 0xFF=LEASE
+        // Note: Must validate raw byte since OplockLevel::from_u8() maps invalid to None
+        let raw_oplock_byte = if body.len() >= 4 { body[3] } else { 0 };
+        if !matches!(raw_oplock_byte, 0x00 | 0x01 | 0x08 | 0x09 | 0xFF) {
+            debug!(
+                conn_id = self.connection.id,
+                requested_oplock_level = format!("0x{:02X}", raw_oplock_byte),
+                "CREATE: Invalid requested_oplock_level value"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Validate SmbCreateFlags per MS-SMB2 2.2.13
+        // SmbCreateFlags is reserved and MUST be set to 0
+        if request.smb_create_flags != 0 {
+            debug!(
+                conn_id = self.connection.id,
+                smb_create_flags = format!("0x{:016X}", request.smb_create_flags),
+                "CREATE: Reserved smb_create_flags must be 0"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Validate Reserved field per MS-SMB2 2.2.13
+        // Reserved (8 bytes at offset 16) MUST be set to 0
+        if request.reserved != 0 {
+            debug!(
+                conn_id = self.connection.id,
+                reserved = format!("0x{:016X}", request.reserved),
+                "CREATE: Reserved field must be 0"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Validate CreateOptions per MS-SMB2 2.2.13
+        // Valid CreateOptions are bits 0-13 per spec. Bits 14+ return INVALID_PARAMETER.
+        // Some bits within 0-13 may still fail with specific errors depending on context.
+        const VALID_CREATE_OPTIONS_MASK: u32 = 0x00003FFF;
+        if (request.create_options & !VALID_CREATE_OPTIONS_MASK) != 0 {
+            debug!(
+                conn_id = self.connection.id,
+                create_options = format!("0x{:08X}", request.create_options),
+                invalid_bits = format!(
+                    "0x{:08X}",
+                    request.create_options & !VALID_CREATE_OPTIONS_MASK
+                ),
+                "CREATE: Invalid create_options flags"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // DesiredAccess: Most SMB servers ignore reserved/undefined bits for forward compatibility.
+        // ACCESS_SYSTEM_SECURITY (0x01000000) requires SeSecurityPrivilege which we don't support,
+        // but the request will just be processed with the privilege check happening at file access time.
+
+        // FileAttributes: Most SMB servers ignore invalid attribute bits for forward compatibility.
+        // We skip validation here and let invalid attributes be silently ignored.
+
+        // Validate ImpersonationLevel per MS-SMB2 2.2.13
+        // Valid values: 0=Anonymous, 1=Identification, 2=Impersonation, 3=Delegate
+        // Values > 3 are invalid and return INVALID_PARAMETER.
+        if request.impersonation_level > 3 {
+            debug!(
+                conn_id = self.connection.id,
+                impersonation_level = request.impersonation_level,
+                "CREATE: Invalid impersonation_level value"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Validate ShareAccess per MS-SMB2 2.2.13
+        // Valid bits: 0=FILE_SHARE_READ, 1=FILE_SHARE_WRITE, 2=FILE_SHARE_DELETE
+        // Bits 3-31 are reserved and must be 0.
+        const VALID_SHARE_ACCESS_MASK: u32 = 0x07;
+        if (request.share_access & !VALID_SHARE_ACCESS_MASK) != 0 {
+            debug!(
+                conn_id = self.connection.id,
+                share_access = format!("0x{:08X}", request.share_access),
+                "CREATE: Invalid share_access flags"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+
+        // Validate CreateDisposition per MS-SMB2 2.2.13
+        // Valid values: 0=FILE_SUPERSEDE, 1=FILE_OPEN, 2=FILE_CREATE, 3=FILE_OPEN_IF,
+        // 4=FILE_OVERWRITE, 5=FILE_OVERWRITE_IF. Values 6+ are invalid.
+        if request.create_disposition > 5 {
+            debug!(
+                conn_id = self.connection.id,
+                create_disposition = request.create_disposition,
+                "CREATE: Invalid create_disposition value"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
 
         // Parse filename from after the fixed structure
         let name_offset = request.name_offset as usize;
@@ -2386,7 +2488,6 @@ where
         const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
         const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
-        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
         // Helper to check if access implies read
         let wants_read = |access: u32| -> bool {
@@ -2610,7 +2711,7 @@ where
         let file_handle = backend
             .open(&filename, &create_params)
             .await
-            .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+            .map_err(|e| HandlerError::Status(NtStatus::from(&e)))?;
 
         // Check if opened file is a directory (for is_directory in HandleState)
         let is_directory = backend
@@ -3276,26 +3377,41 @@ where
             .unwrap_or(false);
 
         // Determine file_attributes for response
-        // Per MS-SMB2: FILE_ATTRIBUTE_ARCHIVE (0x20) should be set for new files
-        // FILE_ATTRIBUTE_NORMAL (0x80) is only valid when NO other attributes are set
-        // For opened files, get actual attributes; for created, use requested or default
+        // Per MS-SMB2/MS-FSCC: Response reflects actual file attributes set on the file.
+        // For newly created files:
+        //   - Preserve only attributes that CAN be set via CREATE (READONLY, HIDDEN, SYSTEM, etc.)
+        //   - DIRECTORY or ARCHIVE based on actual file type, not request
+        //   - Attributes requiring FSCTL or special setup are NOT preserved
+        // For opened files: get actual attributes from filesystem stat
+        // Per MS-FSCC 2.6: Attributes settable via CREATE request:
+        const SETTABLE_ATTRS_MASK: u32 = FILE_ATTRIBUTE_READONLY  // 0x01
+            | 0x02    // FILE_ATTRIBUTE_HIDDEN
+            | 0x04    // FILE_ATTRIBUTE_SYSTEM
+            | 0x100   // FILE_ATTRIBUTE_TEMPORARY
+            | 0x1000  // FILE_ATTRIBUTE_OFFLINE
+            | 0x2000; // FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
         let response_file_attributes = if create_action == 2 {
-            // FILE_CREATED - use requested attributes, add ARCHIVE for files only
-            // Strip NORMAL (0x80) as it conflicts with having other attributes
-            let requested = request.file_attributes & !FILE_ATTRIBUTE_NORMAL;
-            let mut attrs = requested;
-            if file_is_dir
-                || (request.create_options & rustsmb_vfs::create_options::FILE_DIRECTORY_FILE) != 0
-                || (requested & FILE_ATTRIBUTE_DIRECTORY) != 0
-            {
-                attrs |= FILE_ATTRIBUTE_DIRECTORY;
+            // FILE_CREATED - return preserved attributes + actual file type attribute
+            let has_dir_option =
+                (request.create_options & rustsmb_vfs::create_options::FILE_DIRECTORY_FILE) != 0;
+            let preserved = request.file_attributes & SETTABLE_ATTRS_MASK;
+            debug!(
+                conn_id = self.connection.id,
+                file_is_dir,
+                has_dir_option,
+                request_file_attributes = format!("0x{:08X}", request.file_attributes),
+                preserved = format!("0x{:08X}", preserved),
+                "CREATE: Computing file_attributes for new file"
+            );
+            // Set DIRECTORY or ARCHIVE based on actual file type or create_options
+            if file_is_dir || has_dir_option {
+                preserved | FILE_ATTRIBUTE_DIRECTORY
             } else {
-                attrs |= FILE_ATTRIBUTE_ARCHIVE;
+                preserved | FILE_ATTRIBUTE_ARCHIVE
             }
-            attrs
         } else {
             // FILE_OPENED/OVERWRITTEN/SUPERSEDED - get actual file attributes
-            file_metadata
+            let attrs = file_metadata
                 .as_ref()
                 .map(|m| {
                     // Convert file type to SMB attributes
@@ -3309,7 +3425,15 @@ where
                     }
                     attrs
                 })
-                .unwrap_or(FILE_ATTRIBUTE_ARCHIVE) // Default to ARCHIVE if stat fails
+                .unwrap_or(FILE_ATTRIBUTE_ARCHIVE); // Default to ARCHIVE if stat fails
+            debug!(
+                conn_id = self.connection.id,
+                create_action,
+                file_type = ?file_metadata.as_ref().map(|m| &m.file_type),
+                response_attrs = format!("0x{:08X}", attrs),
+                "CREATE: Computing file_attributes for opened file"
+            );
+            attrs
         };
 
         // Determine allocation_size for response
@@ -5260,6 +5384,26 @@ where
 
         // Validate credit charge for multi-credit operations (MS-SMB2 3.3.5.2.5)
         self.validate_credit_charge(header, request.output_buffer_length)?;
+
+        // Validate minimum buffer size per MS-SMB2 3.3.5.20.1
+        let min_size = match request.info_type {
+            InfoType::File => file_info_min_size(request.file_info_class),
+            InfoType::FileSystem => fs_info_min_size(request.file_info_class),
+            InfoType::Security => 20, // Minimal security descriptor
+            InfoType::Quota => 0,
+        };
+
+        if min_size > 0 && request.output_buffer_length < min_size {
+            debug!(
+                conn_id = self.connection.id,
+                info_type = ?request.info_type,
+                info_class = request.file_info_class,
+                requested_size = request.output_buffer_length,
+                min_size = min_size,
+                "QUERY_INFO: Buffer too small for info class"
+            );
+            return Err(HandlerError::Status(NtStatus::InfoLengthMismatch));
+        }
 
         // Reconstruct handle ID
         let handle_id =
@@ -8898,6 +9042,7 @@ mod tests {
     /// File attribute constants for testing
     const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x02;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
     const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 

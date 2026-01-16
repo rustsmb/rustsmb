@@ -11,6 +11,75 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
+// File info class fixed sizes (MS-FSCC 2.4.x)
+/// FileBasicInformation (4): 40 bytes
+pub const FILE_BASIC_INFO_SIZE: u32 = 40;
+/// FileStandardInformation (5): 24 bytes
+pub const FILE_STANDARD_INFO_SIZE: u32 = 24;
+/// FileInternalInformation (6): 8 bytes
+pub const FILE_INTERNAL_INFO_SIZE: u32 = 8;
+/// FileEaInformation (7): 4 bytes
+pub const FILE_EA_INFO_SIZE: u32 = 4;
+/// FileAccessInformation (8): 4 bytes
+pub const FILE_ACCESS_INFO_SIZE: u32 = 4;
+/// FilePositionInformation (14): 8 bytes
+pub const FILE_POSITION_INFO_SIZE: u32 = 8;
+/// FileModeInformation (16): 4 bytes
+pub const FILE_MODE_INFO_SIZE: u32 = 4;
+/// FileAlignmentInformation (17): 4 bytes
+pub const FILE_ALIGNMENT_INFO_SIZE: u32 = 4;
+/// FileAllInformation (18): 96 bytes fixed portion (variable name excluded)
+pub const FILE_ALL_INFO_MIN_SIZE: u32 = 96;
+/// FileNetworkOpenInformation (34): 56 bytes
+pub const FILE_NETWORK_OPEN_INFO_SIZE: u32 = 56;
+
+// FS info class fixed sizes (MS-FSCC 2.5.x)
+/// FileFsVolumeInformation (1): 18 bytes fixed portion
+pub const FS_VOLUME_INFO_MIN_SIZE: u32 = 18;
+/// FileFsSizeInformation (3): 24 bytes
+pub const FS_SIZE_INFO_SIZE: u32 = 24;
+/// FileFsDeviceInformation (4): 8 bytes
+pub const FS_DEVICE_INFO_SIZE: u32 = 8;
+/// FileFsAttributeInformation (5): 12 bytes fixed portion
+pub const FS_ATTRIBUTE_INFO_MIN_SIZE: u32 = 12;
+/// FileFsFullSizeInformation (7): 32 bytes
+pub const FS_FULL_SIZE_INFO_SIZE: u32 = 32;
+
+/// Get minimum buffer size for file info class.
+///
+/// Returns the minimum required buffer size per MS-FSCC 2.4.x for each file information class.
+/// Returns 0 for unknown classes (will fail differently in handler).
+pub fn file_info_min_size(info_class: u8) -> u32 {
+    match info_class {
+        4 => FILE_BASIC_INFO_SIZE,
+        5 => FILE_STANDARD_INFO_SIZE,
+        6 => FILE_INTERNAL_INFO_SIZE,
+        7 => FILE_EA_INFO_SIZE,
+        8 => FILE_ACCESS_INFO_SIZE,
+        14 => FILE_POSITION_INFO_SIZE,
+        16 => FILE_MODE_INFO_SIZE,
+        17 => FILE_ALIGNMENT_INFO_SIZE,
+        18 => FILE_ALL_INFO_MIN_SIZE,
+        34 => FILE_NETWORK_OPEN_INFO_SIZE,
+        _ => 0, // Unknown class - will fail differently
+    }
+}
+
+/// Get minimum buffer size for FS info class.
+///
+/// Returns the minimum required buffer size per MS-FSCC 2.5.x for each filesystem information class.
+/// Returns 0 for unknown classes (will fail differently in handler).
+pub fn fs_info_min_size(info_class: u8) -> u32 {
+    match info_class {
+        1 => FS_VOLUME_INFO_MIN_SIZE,
+        3 => FS_SIZE_INFO_SIZE,
+        4 => FS_DEVICE_INFO_SIZE,
+        5 => FS_ATTRIBUTE_INFO_MIN_SIZE,
+        7 => FS_FULL_SIZE_INFO_SIZE,
+        _ => 0,
+    }
+}
+
 fn file_attributes_from_metadata(metadata: &rustsmb_vfs::Metadata) -> u32 {
     let mut attrs = 0u32;
     let is_dir = metadata.file_type == FileType::Directory;
@@ -572,8 +641,10 @@ mod tests {
         assert_eq!(buf.len(), 40, "FileBasicInformation should be 40 bytes");
 
         // Check attributes at offset 32 (after 4 timestamps)
+        // Per MS-SMB2: regular files get ARCHIVE attribute (0x20), not NORMAL
+        // NORMAL (0x80) is only valid when NO other attributes are set
         let attrs = u32::from_le_bytes(buf[32..36].try_into().unwrap());
-        assert_eq!(attrs, 0x80, "File should have NORMAL attribute");
+        assert_eq!(attrs, 0x20, "File should have ARCHIVE attribute");
     }
 
     #[test]

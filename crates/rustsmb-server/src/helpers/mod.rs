@@ -12,7 +12,8 @@ pub mod time;
 
 // Re-export commonly used functions
 pub use info_builders::{
-    build_directory_info, build_file_info, build_fs_info, build_security_info,
+    build_directory_info, build_file_info, build_fs_info, build_security_info, file_info_min_size,
+    fs_info_min_size,
 };
 pub use strings::{decode_utf16le, extract_share_name, parse_utf16_string};
 pub use time::{current_filetime, filetime_to_unix};

@@ -26,6 +26,8 @@ pub enum NtStatus {
     // Error codes
     /// The request is not supported.
     NotImplemented = 0xC0000002,
+    /// The specified information record length does not match the required length.
+    InfoLengthMismatch = 0xC0000004,
     /// An invalid parameter was passed to a function.
     InvalidParameter = 0xC000000D,
     /// The file does not exist.
@@ -145,6 +147,7 @@ impl NtStatus {
             0x80000006 => Self::NoMoreFiles,
             0xC0000016 => Self::MoreProcessingRequired,
             0xC0000002 => Self::NotImplemented,
+            0xC0000004 => Self::InfoLengthMismatch,
             0xC000000D => Self::InvalidParameter,
             0xC000000F => Self::NoSuchFile,
             0xC0000008 => Self::InvalidHandle,

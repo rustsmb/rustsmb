@@ -42,24 +42,33 @@
 |------|--------|-------|
 | tcon | PASS | - |
 
-### smb2.create (5/14 PASS)
+### smb2.create (4/13 PASS)
 
 | Test | Status | Issue |
 |------|--------|-------|
-| gentest | FAIL | Generic test infrastructure |
+| gentest | FAIL | Generic protocol compliance test - requires strict field validation |
 | blob | FAIL | Extended attribute blobs |
-| open | FAIL | Create disposition status handling |
-| brlocked | PASS | - |
-| multi | FAIL | Multi-connection create semantics |
-| delete | PASS | - |
+| brlocked | FAIL | Byte-range lock interaction with create |
+| multi | PASS | - |
+| delete | FAIL | Delete-on-close interaction |
 | leading-slash | PASS | - |
-| impersonation | FAIL | Impersonation level handling |
+| impersonation | FAIL | Impersonation level handling for named pipes |
 | aclfile | FAIL | ACL support not implemented |
 | acldir | FAIL | ACL support not implemented |
 | nulldacl | FAIL | ACL support not implemented |
 | mkdir-dup | PASS | - |
 | dir-alloc-size | PASS | - |
 | quota-fake-file | FAIL | Quota support not implemented |
+
+**Note:** Phase 30 added comprehensive CREATE request field validation:
+- SecurityFlags (must be 0)
+- RequestedOplockLevel (0x00, 0x01, 0x08, 0x09, 0xFF only)
+- SmbCreateFlags (must be 0)
+- Reserved field (must be 0)
+- CreateOptions (bits 0-13 only)
+- ImpersonationLevel (0-3 only)
+- ShareAccess (bits 0-2 only)
+- CreateDisposition (0-5 only)
 
 ### smb2.read (4/4 PASS)
 
