@@ -1,6 +1,8 @@
 # smbtorture Test Analysis
 
-## Test Results Summary (January 2026)
+## Test Results Summary (January 2026 - Post Phase 29)
+
+**Overall: 88 tests passing across all suites**
 
 ### smb2.connect (1/1 PASS)
 
@@ -40,7 +42,7 @@
 |------|--------|-------|
 | tcon | PASS | - |
 
-### smb2.create (5/14 PASS)
+### smb2.create (4/12 PASS)
 
 | Test | Status | Issue |
 |------|--------|-------|
@@ -67,7 +69,7 @@
 | access | PASS | Fixed in Phase 23 |
 | bug14607 | SKIP | Requires SMB 3.1.1 |
 
-### smb2.lock (6/23 PASS)
+### smb2.lock (5/24 PASS)
 
 | Test | Status | Issue |
 |------|--------|-------|
@@ -141,7 +143,7 @@
 | levelii502 | PASS | - |
 | statopen1 | FAIL | Stat open without oplock break |
 
-### smb2.lease (2/39 PASS)
+### smb2.lease (2/35 PASS)
 
 | Test | Status | Issue |
 |------|--------|-------|
@@ -193,7 +195,7 @@
 | delete_on_close2 | PASS | - |
 | file-position | PASS | Fixed in Phase 25 |
 | oplock | PASS | - |
-| lease | FAIL | Lease state restoration |
+| lease | PASS | Fixed in Phase 25 |
 | lock-oplock | PASS | - |
 | lock-lease | PASS | - |
 | open2-lease | FAIL | Two opens with lease |
@@ -202,11 +204,25 @@
 | read-only | FAIL | Read-only attribute handling |
 | stat-open | PASS | - |
 
-### smb2.durable-v2-open (0/N - Client crash)
+### smb2.durable-v2-open (4/15 PASS)
 
 | Test | Status | Issue |
 |------|--------|-------|
-| * | CRASH | smbtorture client crashes (Samba bug) |
+| create-blob | FAIL | Create blob validation |
+| open-oplock | PASS | - |
+| open-lease | PASS | - |
+| reopen1 | FAIL | V2 reconnect |
+| reopen1a | FAIL | V2 reconnect variant |
+| reopen1a-lease | FAIL | V2 lease reconnect |
+| reopen2 | FAIL | V2 reconnect |
+| reopen2b | FAIL | V2 reconnect variant |
+| reopen2c | PASS | - |
+| reopen2-lease | FAIL | V2 lease reconnect |
+| reopen2-lease-v2 | FAIL | V2 lease reconnect |
+| durable-v2-setinfo | FAIL | SetInfo on V2 handle |
+| app-instance | FAIL | App instance ID |
+| persistent-open-oplock | PASS | - |
+| persistent-open-lease | FAIL | Persistent lease |
 
 ### smb2.compound (3/19 PASS)
 
@@ -248,7 +264,7 @@
 |------|--------|-------|
 | setinfo | FAIL | Set info operations |
 
-### smb2.ioctl (21/73 PASS, 44 SKIP, 8 FAIL)
+### smb2.ioctl (21/26 PASS, 44 SKIP, 5 FAIL)
 
 | Test | Status | Issue |
 |------|--------|-------|
@@ -256,76 +272,71 @@
 | req_two_resume_keys | PASS | Phase 28 |
 | copy_chunk_simple | PASS | Phase 28 |
 | copy_chunk_multi | PASS | Phase 28 |
+| copy_chunk_tiny | PASS | Phase 28 |
+| copy_chunk_overwrite | PASS | Phase 28 |
+| copy_chunk_append | PASS | Phase 28 |
+| copy_chunk_limits | PASS | Phase 28 |
 | copy_chunk_*_lock | PASS | Phase 28 (lock conflict detection) |
 | copy_chunk_bad_access | PASS | Phase 28 (access rights) |
-| copy_chunk_limits | PASS | Phase 28 (server limits) |
+| copy_chunk_bad_key | PASS | Phase 28 |
+| copy_chunk_src_is_dest | PASS | Phase 28 |
+| copy_chunk_src_is_dest_overlap | PASS | Phase 28 |
+| copy_chunk_write_access | PASS | Phase 28 |
+| copy_chunk_sparse_dest | PASS | Phase 28 |
+| copy_chunk_zero_length | PASS | Phase 28 |
+| copy-chunk streams | PASS | Phase 28 |
 | copy_chunk_across_shares* | PASS | Phase 28 |
 | copy_chunk_src_exceed | FAIL | Source file size validation needed |
+| copy_chunk_src_exceed_multi | FAIL | Multi-chunk size validation |
 | copy_chunk_max_output_sz | FAIL | Output buffer size validation |
+| compress_notsup_get | FAIL | Compression not supported response |
+| compress_notsup_set | FAIL | Compression not supported response |
 | shadow_copy | SKIP | VSS not implemented |
-| compress_* | SKIP/FAIL | Compression not implemented |
+| compress_* | SKIP | Compression not implemented |
 | network_interface_info | SKIP | Multi-channel not implemented |
 | sparse_* | SKIP | Sparse files not implemented |
 | dup_extents_* | SKIP | Deduplication not implemented |
 
-### smb2.rename (0/11 FAIL)
+### smb2.rename (2/11 PASS)
 
 | Test | Status | Issue |
 |------|--------|-------|
-| simple | FAIL | Rename operations |
+| simple | PASS | - |
 | simple_nodelete | FAIL | Rename without delete |
 | no_sharing | FAIL | Sharing violation on rename |
 | share_delete_* | FAIL | Delete share mode handling |
 | msword | FAIL | MS Word rename pattern |
 | rename_dir_openfile | FAIL | Rename dir with open file |
-| rename_dir_bench | FAIL | Rename benchmark |
+| rename_dir_bench | PASS | - |
 | close-full-information | FAIL | Close with full info |
 
-### smb2.notify (0/N FAIL)
+### smb2.notify (0/3 FAIL)
 
 | Test | Status | Issue |
 |------|--------|-------|
 | valid-req | FAIL | Change notify not fully implemented |
 | tcon | FAIL | Notify on tree connect |
 | dir | FAIL | Directory notify |
-| mask | FAIL | Notify mask handling |
 
-## Missing Features vs ksmbd
+## Test Pass Rate Summary
 
-| Feature | ksmbd | RustSMB | Priority |
-|---------|-------|---------|----------|
-| Compound requests (related/unrelated) | ✅ | ✅ | - |
-| Oplock break notifications | ✅ | ⚠️ Same-server only | - |
-| Lock stacking (same-handle re-lock) | ✅ | ✅ | Phase 26 |
-| LOCK_NOT_GRANTED vs FILE_LOCK_CONFLICT | ✅ | ✅ | Phase 26 |
-| Cross-handle lock conflicts | ✅ | ✅ | Phase 26 |
-| Tree ID validation | ✅ | ✅ | - |
-| Read past EOF → STATUS_END_OF_FILE | ✅ | ✅ | - |
-| Read directory → STATUS_INVALID_DEVICE_REQUEST | ✅ | ✅ | - |
-| File position tracking | ✅ | ✅ | - |
-| Attributes-only opens (no oplock break) | ✅ | ❌ | P3 |
-| Session binding validations | ✅ | ✅ (same-dialect) | Phase 27 |
-| SMB2_CAP_MULTI_CHANNEL | ⚠️ Experimental | ❌ | P3 |
-| SMB Direct (RDMA) | ✅ | ❌ | - |
-| POSIX extensions | ✅ | ❌ | - |
-| Durable handles v1/v2 | ⚠️ (kernel 6.9+) | ✅ | - |
-
-## Priority Fixes
-
-**P0 - Critical (blocks many tests):**
-- ~~Implement oplock/lease break notifications~~ DONE in Phase 18 (same-server only)
-
-**P1 - Security/Compliance:**
-- ~~Tree ID validation (reject operations with wrong TID)~~ DONE in Phase 19
-- ~~Read past EOF should return STATUS_END_OF_FILE~~ DONE (already implemented, verified in Phase 20)
-- ~~Read on directory should return STATUS_INVALID_DEVICE_REQUEST~~ DONE in Phase 20
-
-**P2 - Lock semantics:** DONE in Phase 26
-- ~~Lock stacking (allow same handle to re-lock same range)~~ DONE
-- ~~Correct error codes (LOCK_NOT_GRANTED first, FILE_LOCK_CONFLICT after)~~ DONE
-- ~~Cross-handle/cross-session lock conflict detection~~ DONE
-
-**P3 - Nice to have:**
-- ~~File position tracking in FileAllInformation~~ DONE in Phase 23
-- Attributes-only opens without sharing violations
-- Multi-channel capability advertisement
+| Suite | Passed | Failed | Skipped | Pass Rate |
+|-------|--------|--------|---------|-----------|
+| smb2.connect | 1 | 0 | 0 | 100% |
+| smb2.session | 8 | 8 | 49 | 50% |
+| smb2.tcon | 1 | 0 | 0 | 100% |
+| smb2.create | 4 | 8 | 0 | 33% |
+| smb2.read | 4 | 0 | 1 | 100% |
+| smb2.lock | 5 | 16 | 3 | 24% |
+| smb2.oplock | 21 | 21 | 0 | 50% |
+| smb2.lease | 2 | 32 | 1 | 6% |
+| smb2.durable-open | 17 | 6 | 0 | 74% |
+| smb2.durable-v2-open | 4 | 11 | 0 | 27% |
+| smb2.compound | 3 | 16 | 0 | 16% |
+| smb2.credits | 0 | 3 | 0 | 0% |
+| smb2.getinfo | 0 | 8 | 0 | 0% |
+| smb2.setinfo | 0 | 1 | 0 | 0% |
+| smb2.ioctl | 21 | 5 | 44 | 81% |
+| smb2.rename | 2 | 9 | 0 | 18% |
+| smb2.notify | 0 | 3 | 0 | 0% |
+| **Total** | **93** | **147** | **98** | **39%** |
