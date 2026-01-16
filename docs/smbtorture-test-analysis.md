@@ -2,7 +2,7 @@
 
 ## Test Results Summary (January 2026 - Post Phase 29)
 
-**Overall: 88 tests passing across all suites**
+**Overall: 94 tests passing across all suites**
 
 ### smb2.connect (1/1 PASS)
 
@@ -42,14 +42,16 @@
 |------|--------|-------|
 | tcon | PASS | - |
 
-### smb2.create (4/12 PASS)
+### smb2.create (5/14 PASS)
 
 | Test | Status | Issue |
 |------|--------|-------|
 | gentest | FAIL | Generic test infrastructure |
 | blob | FAIL | Extended attribute blobs |
+| open | FAIL | Create disposition status handling |
 | brlocked | PASS | - |
-| delete | FAIL | Delete semantics |
+| multi | FAIL | Multi-connection create semantics |
+| delete | PASS | - |
 | leading-slash | PASS | - |
 | impersonation | FAIL | Impersonation level handling |
 | aclfile | FAIL | ACL support not implemented |
@@ -325,7 +327,7 @@
 | smb2.connect | 1 | 0 | 0 | 100% |
 | smb2.session | 8 | 8 | 49 | 50% |
 | smb2.tcon | 1 | 0 | 0 | 100% |
-| smb2.create | 4 | 8 | 0 | 33% |
+| smb2.create | 5 | 9 | 0 | 36% |
 | smb2.read | 4 | 0 | 1 | 100% |
 | smb2.lock | 5 | 16 | 3 | 24% |
 | smb2.oplock | 21 | 21 | 0 | 50% |
@@ -339,4 +341,4 @@
 | smb2.ioctl | 21 | 5 | 44 | 81% |
 | smb2.rename | 2 | 9 | 0 | 18% |
 | smb2.notify | 0 | 3 | 0 | 0% |
-| **Total** | **93** | **147** | **98** | **39%** |
+| **Total** | **94** | **148** | **98** | **39%** |
