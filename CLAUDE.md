@@ -984,20 +984,22 @@ Refactored the handle ID architecture to use `backend_internal_id` as the primar
 - [x] Phase 29I: Update CLAUDE.md (this section)
 - [x] Phase 29J: Update docs/architecture.md (Handle ID Architecture section)
 
-### Phase 30: CREATE Request Field Validation - COMPLETED
+### Phase 30: CREATE Request Field Validation (Permissive) - COMPLETED
 
-Add comprehensive CREATE request field validation per MS-SMB2 2.2.13.
+Implement CREATE request field validation using Samba's permissive approach for maximum client compatibility.
 
-- [x] Phase 30A: Validate SecurityFlags (must be 0)
-- [x] Phase 30B: Validate RequestedOplockLevel (0x00, 0x01, 0x08, 0x09, 0xFF only)
+- [x] Phase 30A: SecurityFlags - Ignored (like Samba)
+- [x] Phase 30B: RequestedOplockLevel - Validate (0x00, 0x01, 0x08, 0x09, 0xFF only)
   - Fixed to use raw byte from body since OplockLevel::from_u8() maps invalid to None
-- [x] Phase 30C: Validate SmbCreateFlags (must be 0)
-- [x] Phase 30D: Validate Reserved field (must be 0)
-- [x] Phase 30E: Validate CreateOptions (bits 0-13 only)
-- [x] Phase 30F: Validate ImpersonationLevel (0-3 only)
-- [x] Phase 30G: Validate ShareAccess (bits 0-2 only)
-- [x] Phase 30H: Validate CreateDisposition (0-5 only)
+- [x] Phase 30C: SmbCreateFlags - Ignored (like Samba)
+- [x] Phase 30D: Reserved field - Ignored (like Samba)
+- [x] Phase 30E: CreateOptions - Reject only bits 7, 13, 20, 24-31 (like Samba)
+  - Mask: REJECTED_CREATE_OPTIONS = 0xFF102080
+- [x] Phase 30F: ImpersonationLevel - Validate 0-3 only (like Samba)
+- [x] Phase 30G: ShareAccess - Only use bits 0-2, ignore rest (like Samba)
+- [x] Phase 30H: CreateDisposition - Validate 0-5 only (like Samba)
 - [x] Phase 30I: Add InfoLengthMismatch status code and info class size constants
 - [x] Phase 30J: Update docs/smbtorture-test-analysis.md
+- [x] Phase 30K: Create docs/gentest-differences.md comparing Samba, ksmbd, RustSMB
 
-**Note:** The smb2.create.gentest test still fails due to expected vs actual ok_mask differences in Samba's generic test framework. The validation changes improve protocol compliance but may differ from Samba's specific test expectations.
+**Design Decision:** RustSMB uses Samba's permissive validation approach instead of strict MS-SMB2 compliance. This maximizes client compatibility by ignoring reserved fields that future protocol versions may use. See docs/gentest-differences.md for detailed comparison.

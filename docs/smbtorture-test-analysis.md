@@ -42,12 +42,13 @@
 |------|--------|-------|
 | tcon | PASS | - |
 
-### smb2.create (4/13 PASS)
+### smb2.create (5/14 PASS)
 
 | Test | Status | Issue |
 |------|--------|-------|
-| gentest | FAIL | Generic protocol compliance test - requires strict field validation |
+| gentest | PASS | Fixed: Samba-compatible field validation (see gentest-differences.md) |
 | blob | FAIL | Extended attribute blobs |
+| open | FAIL | File open edge cases |
 | brlocked | FAIL | Byte-range lock interaction with create |
 | multi | PASS | - |
 | delete | FAIL | Delete-on-close interaction |
@@ -60,14 +61,12 @@
 | dir-alloc-size | PASS | - |
 | quota-fake-file | FAIL | Quota support not implemented |
 
-**Note:** Phase 30 added comprehensive CREATE request field validation:
-- SecurityFlags (must be 0)
-- RequestedOplockLevel (0x00, 0x01, 0x08, 0x09, 0xFF only)
-- SmbCreateFlags (must be 0)
-- Reserved field (must be 0)
-- CreateOptions (bits 0-13 only)
+**Note:** Phase 30 added comprehensive CREATE request field validation per Samba gentest:
+- Path validation (leading slash) - BEFORE desired_access checks
+- CreateOptions: bits 24-31 → INVALID_PARAMETER, bits 7,13,20 → NOT_SUPPORTED
+- DesiredAccess: zero → ACCESS_DENIED, mask 0x0DF0FE00 → ACCESS_DENIED
+- FileAttributes: mask 0xFFFF8048 → INVALID_PARAMETER
 - ImpersonationLevel (0-3 only)
-- ShareAccess (bits 0-2 only)
 - CreateDisposition (0-5 only)
 
 ### smb2.read (4/4 PASS)

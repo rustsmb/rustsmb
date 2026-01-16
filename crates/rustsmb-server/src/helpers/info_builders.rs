@@ -157,16 +157,20 @@ pub fn build_directory_info(entries: &[rustsmb_vfs::DirEntry]) -> Vec<u8> {
 /// Handles file info classes per MS-SMB2 2.4.1:
 /// - FileBasicInformation (4)
 /// - FileStandardInformation (5)
+/// - FileAccessInformation (8)
+/// - FilePositionInformation (14)
 /// - FileAllInformation (18)
 ///
 /// # Arguments
 /// - `metadata` - File metadata from VFS
 /// - `info_class` - File information class being requested
-/// - `position` - Optional file position for FileAllInformation (class 18)
+/// - `position` - Optional file position for FileAllInformation (class 18) and FilePositionInformation (class 14)
+/// - `access_mask` - Optional access mask for FileAccessInformation (class 8)
 pub fn build_file_info(
     metadata: &rustsmb_vfs::Metadata,
     info_class: u8,
     position: Option<u64>,
+    access_mask: Option<u32>,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     let is_dir = metadata.file_type == FileType::Directory;
@@ -231,6 +235,12 @@ pub fn build_file_info(
             // FileNameInformation (variable - just length for now)
             buf.extend_from_slice(&0u32.to_le_bytes()); // FileNameLength
                                                         // Empty name (no additional bytes needed when length is 0)
+        }
+        // FileAccessInformation (8) - per MS-FSCC 2.4.1
+        8 => {
+            // AccessFlags (4 bytes) - return the access rights granted when file was opened
+            let access = access_mask.unwrap_or(0x1F01FF); // Default to GENERIC_ALL if not provided
+            buf.extend_from_slice(&access.to_le_bytes());
         }
         // FilePositionInformation (14) - per MS-FSCC 2.4.40
         14 => {
@@ -635,7 +645,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buf = build_file_info(&metadata, 4, None); // FileBasicInformation
+        let buf = build_file_info(&metadata, 4, None, None); // FileBasicInformation
 
         // Should have: 4 timestamps (8 bytes each) + FileAttributes (4) + Reserved (4) = 40 bytes
         assert_eq!(buf.len(), 40, "FileBasicInformation should be 40 bytes");
@@ -655,7 +665,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buf = build_file_info(&metadata, 4, None); // FileBasicInformation
+        let buf = build_file_info(&metadata, 4, None, None); // FileBasicInformation
 
         // Check attributes - directory should have 0x10
         let attrs = u32::from_le_bytes(buf[32..36].try_into().unwrap());
@@ -670,7 +680,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buf = build_file_info(&metadata, 5, None); // FileStandardInformation
+        let buf = build_file_info(&metadata, 5, None, None); // FileStandardInformation
 
         // Should have: AllocationSize(8) + EndOfFile(8) + NumberOfLinks(4) +
         // DeletePending(1) + Directory(1) + Reserved(2) = 24 bytes
@@ -693,7 +703,7 @@ mod tests {
         };
 
         let position = 10u64;
-        let buf = build_file_info(&metadata, 18, Some(position)); // FileAllInformation
+        let buf = build_file_info(&metadata, 18, Some(position), None); // FileAllInformation
 
         // FileAllInformation structure (per MS-FSCC 2.4.18):
         // - FileBasicInformation (40 bytes)

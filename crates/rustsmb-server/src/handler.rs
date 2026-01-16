@@ -2270,6 +2270,26 @@ where
         let request = CreateRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse create: {}", e)))?;
 
+        // ============================================================================
+        // CREATE field validation (match Samba gentest expectations)
+        // ============================================================================
+        // See docs/gentest-differences.md for detailed comparison.
+
+        // Log all CREATE request fields for debugging
+        debug!(
+            conn_id = self.connection.id,
+            security_flags = format!("0x{:02X}", request.security_flags),
+            smb_create_flags = format!("0x{:016X}", request.smb_create_flags),
+            reserved = format!("0x{:016X}", request.reserved),
+            impersonation_level = request.impersonation_level,
+            desired_access = format!("0x{:08X}", request.desired_access),
+            file_attributes = format!("0x{:08X}", request.file_attributes),
+            share_access = format!("0x{:08X}", request.share_access),
+            create_disposition = request.create_disposition,
+            create_options = format!("0x{:08X}", request.create_options),
+            "CREATE: All request fields"
+        );
+
         // Validate SecurityFlags per MS-SMB2 2.2.13
         // SecurityFlags MUST be set to 0 (reserved bits)
         if request.security_flags != 0 {
@@ -2281,9 +2301,8 @@ where
             return Err(HandlerError::Status(NtStatus::InvalidParameter));
         }
 
-        // Validate RequestedOplockLevel per MS-SMB2 2.2.13
+        // RequestedOplockLevel: Both Samba and ksmbd validate this
         // Valid values: 0x00=NONE, 0x01=II, 0x08=EXCLUSIVE, 0x09=BATCH, 0xFF=LEASE
-        // Note: Must validate raw byte since OplockLevel::from_u8() maps invalid to None
         let raw_oplock_byte = if body.len() >= 4 { body[3] } else { 0 };
         if !matches!(raw_oplock_byte, 0x00 | 0x01 | 0x08 | 0x09 | 0xFF) {
             debug!(
@@ -2316,29 +2335,113 @@ where
             return Err(HandlerError::Status(NtStatus::InvalidParameter));
         }
 
-        // Validate CreateOptions per MS-SMB2 2.2.13
-        // Valid CreateOptions are bits 0-13 per spec. Bits 14+ return INVALID_PARAMETER.
-        // Some bits within 0-13 may still fail with specific errors depending on context.
-        const VALID_CREATE_OPTIONS_MASK: u32 = 0x00003FFF;
-        if (request.create_options & !VALID_CREATE_OPTIONS_MASK) != 0 {
+        // CreateOptions validation per Samba gentest expectations:
+        // - Bits 24-31 (0xFF000000): undefined reserved → INVALID_PARAMETER
+        // - Bits 7, 13, 20 (0x00102080): not supported → NOT_SUPPORTED
+        // Note: Bit 0 (FILE_DIRECTORY_FILE) and Bit 12 (FILE_DELETE_ON_CLOSE) are valid flags
+        // that may fail later with semantic errors (NOT_A_DIRECTORY, ACCESS_DENIED)
+        const INVALID_CREATE_OPTIONS: u32 = 0xFF000000; // bits 24-31
+        const NOT_SUPPORTED_CREATE_OPTIONS: u32 = 0x00102080; // bits 7, 13, 20
+        debug!(
+            conn_id = self.connection.id,
+            create_options = format!("0x{:08X}", request.create_options),
+            "CREATE: Validating create_options"
+        );
+        if (request.create_options & INVALID_CREATE_OPTIONS) != 0 {
             debug!(
                 conn_id = self.connection.id,
                 create_options = format!("0x{:08X}", request.create_options),
-                invalid_bits = format!(
+                rejected_bits =
+                    format!("0x{:08X}", request.create_options & INVALID_CREATE_OPTIONS),
+                "CREATE: Invalid create_options flags (bits 24-31)"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
+        if (request.create_options & NOT_SUPPORTED_CREATE_OPTIONS) != 0 {
+            debug!(
+                conn_id = self.connection.id,
+                create_options = format!("0x{:08X}", request.create_options),
+                rejected_bits = format!(
                     "0x{:08X}",
-                    request.create_options & !VALID_CREATE_OPTIONS_MASK
+                    request.create_options & NOT_SUPPORTED_CREATE_OPTIONS
                 ),
-                "CREATE: Invalid create_options flags"
+                "CREATE: Not supported create_options flags (bits 7, 13, 20)"
+            );
+            return Err(HandlerError::Status(NtStatus::NotSupported));
+        }
+
+        // Parse filename early - needed for leading slash check before other validations
+        // Per Samba gentest: path validation comes before desired_access validation
+        let name_offset = request.name_offset as usize;
+        let name_len = request.name_length as usize;
+        let body_offset_name = name_offset.saturating_sub(SMB2_HEADER_SIZE);
+        let name_bytes = if body_offset_name + name_len <= body.len() {
+            &body[body_offset_name..body_offset_name + name_len]
+        } else {
+            &[]
+        };
+        let filename_raw = decode_utf16le(name_bytes);
+
+        // Validate path (MS-SMB2 3.3.5.9) - paths starting with / or \ are invalid
+        // The path should be relative to the share root
+        // This check MUST come before desired_access validation per Samba gentest
+        if filename_raw.starts_with('/') || filename_raw.starts_with('\\') {
+            debug!(
+                conn_id = self.connection.id,
+                path = %filename_raw,
+                "Path starts with leading slash"
             );
             return Err(HandlerError::Status(NtStatus::InvalidParameter));
         }
 
-        // DesiredAccess: Most SMB servers ignore reserved/undefined bits for forward compatibility.
-        // ACCESS_SYSTEM_SECURITY (0x01000000) requires SeSecurityPrivilege which we don't support,
-        // but the request will just be processed with the privilege check happening at file access time.
+        // Validate DesiredAccess per MS-SMB2 2.2.13.1
+        // Per Samba gentest: desired_access=0 returns ACCESS_DENIED
+        // (no access rights requested means no access granted)
+        if request.desired_access == 0 {
+            debug!(
+                conn_id = self.connection.id,
+                "CREATE: desired_access=0, returning ACCESS_DENIED"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
 
-        // FileAttributes: Most SMB servers ignore invalid attribute bits for forward compatibility.
-        // We skip validation here and let invalid attributes be silently ignored.
+        // Reserved/privileged bits that should return ACCESS_DENIED per Samba gentest:
+        // - Bits 9-15 (0x0000FE00): Reserved
+        // - Bits 20-23 (0x00F00000): Reserved (includes SYNCHRONIZE per Samba)
+        // - Bit 24 (0x01000000): ACCESS_SYSTEM_SECURITY (requires SeSecurityPrivilege)
+        // - Bits 26-27 (0x0C000000): Reserved
+        // Note: Samba rejects SYNCHRONIZE (bit 20), unlike MS-SMB2 spec which allows it
+        const ACCESS_DENIED_BITS: u32 = 0x0df0fe00;
+        if (request.desired_access & ACCESS_DENIED_BITS) != 0 {
+            debug!(
+                conn_id = self.connection.id,
+                desired_access = format!("0x{:08X}", request.desired_access),
+                "CREATE: Reserved bits in desired_access"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
+
+        // Validate FileAttributes per MS-FSCC 2.6 and Samba gentest
+        // Valid bits (accepted as input, not rejected):
+        // - Bits 0-2: READONLY, HIDDEN, SYSTEM
+        // - Bit 4: DIRECTORY
+        // - Bits 5,7: ARCHIVE, NORMAL
+        // - Bits 8-14: TEMPORARY, SPARSE_FILE, REPARSE_POINT, COMPRESSED, OFFLINE, NOT_CONTENT_INDEXED, ENCRYPTED
+        // Invalid bits that return INVALID_PARAMETER:
+        // - Bit 3: undefined
+        // - Bit 6: DEVICE (system-managed)
+        // - Bits 15-31: reserved/undefined
+        // Note: ok_mask 0x00003fb7 tests validation, but ENCRYPTED (0x4000) is accepted as input
+        // even though it's not in ok_mask - it just doesn't get preserved in response.
+        const INVALID_FILE_ATTRIBUTES: u32 = 0xffff8048;
+        if (request.file_attributes & INVALID_FILE_ATTRIBUTES) != 0 {
+            debug!(
+                conn_id = self.connection.id,
+                file_attributes = format!("0x{:08X}", request.file_attributes),
+                "CREATE: Invalid file_attributes (DEVICE)"
+            );
+            return Err(HandlerError::Status(NtStatus::InvalidParameter));
+        }
 
         // Validate ImpersonationLevel per MS-SMB2 2.2.13
         // Valid values: 0=Anonymous, 1=Identification, 2=Impersonation, 3=Delegate
@@ -2352,18 +2455,8 @@ where
             return Err(HandlerError::Status(NtStatus::InvalidParameter));
         }
 
-        // Validate ShareAccess per MS-SMB2 2.2.13
-        // Valid bits: 0=FILE_SHARE_READ, 1=FILE_SHARE_WRITE, 2=FILE_SHARE_DELETE
-        // Bits 3-31 are reserved and must be 0.
-        const VALID_SHARE_ACCESS_MASK: u32 = 0x07;
-        if (request.share_access & !VALID_SHARE_ACCESS_MASK) != 0 {
-            debug!(
-                conn_id = self.connection.id,
-                share_access = format!("0x{:08X}", request.share_access),
-                "CREATE: Invalid share_access flags"
-            );
-            return Err(HandlerError::Status(NtStatus::InvalidParameter));
-        }
+        // ShareAccess: Samba may ignore reserved bits 3-31 for forward compatibility.
+        // We follow the permissive approach and only use bits 0-2.
 
         // Validate CreateDisposition per MS-SMB2 2.2.13
         // Valid values: 0=FILE_SUPERSEDE, 1=FILE_OPEN, 2=FILE_CREATE, 3=FILE_OPEN_IF,
@@ -2377,31 +2470,9 @@ where
             return Err(HandlerError::Status(NtStatus::InvalidParameter));
         }
 
-        // Parse filename from after the fixed structure
-        let name_offset = request.name_offset as usize;
-        let name_len = request.name_length as usize;
-
-        let body_offset = name_offset.saturating_sub(SMB2_HEADER_SIZE);
-        let name_bytes = if body_offset + name_len <= body.len() {
-            &body[body_offset..body_offset + name_len]
-        } else {
-            &[]
-        };
-
-        let filename = decode_utf16le(name_bytes);
-
-        // Validate path (MS-SMB2 3.3.5.9) - paths starting with / or \ are invalid
-        // The path should be relative to the share root
-        if filename.starts_with('/') || filename.starts_with('\\') {
-            debug!(
-                conn_id = self.connection.id,
-                path = %filename,
-                "Path starts with leading slash"
-            );
-            return Err(HandlerError::Status(NtStatus::InvalidParameter));
-        }
-
-        let filename = filename.replace('\\', "/");
+        // Use the filename parsed earlier (before desired_access validation)
+        // Just normalize backslashes to forward slashes
+        let filename = filename_raw.replace('\\', "/");
 
         // Parse CREATE contexts if present
         let contexts = if request.create_contexts_length > 0 {
@@ -2719,6 +2790,16 @@ where
             .await
             .map(|m| m.file_type == rustsmb_vfs::FileType::Directory)
             .unwrap_or(false);
+
+        // Validate FILE_DIRECTORY_FILE flag vs actual file type
+        // Per MS-SMB2 3.3.5.9: If FILE_DIRECTORY_FILE is set but the object is not a directory,
+        // return STATUS_NOT_A_DIRECTORY
+        const FILE_DIRECTORY_FILE: u32 = 0x00000001;
+        if (request.create_options & FILE_DIRECTORY_FILE) != 0 && !is_directory {
+            // Close the handle we just opened
+            let _ = backend.close(file_handle).await;
+            return Err(HandlerError::Status(NtStatus::NotADirectory));
+        }
 
         // Determine create_action based on disposition and whether file existed
         // Per MS-SMB2 2.2.13 (CreateDisposition) and 2.2.14 (CreateAction):
@@ -3383,13 +3464,14 @@ where
         //   - DIRECTORY or ARCHIVE based on actual file type, not request
         //   - Attributes requiring FSCTL or special setup are NOT preserved
         // For opened files: get actual attributes from filesystem stat
-        // Per MS-FSCC 2.6: Attributes settable via CREATE request:
+        // Per MS-FSCC 2.6: Attributes settable via CREATE request (reflected in response):
         const SETTABLE_ATTRS_MASK: u32 = FILE_ATTRIBUTE_READONLY  // 0x01
             | 0x02    // FILE_ATTRIBUTE_HIDDEN
             | 0x04    // FILE_ATTRIBUTE_SYSTEM
             | 0x100   // FILE_ATTRIBUTE_TEMPORARY
             | 0x1000  // FILE_ATTRIBUTE_OFFLINE
-            | 0x2000; // FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+            | 0x2000  // FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+            | 0x4000; // FILE_ATTRIBUTE_ENCRYPTED
         let response_file_attributes = if create_action == 2 {
             // FILE_CREATED - return preserved attributes + actual file type attribute
             let has_dir_option =
@@ -5382,6 +5464,14 @@ where
         let request = QueryInfoRequest::read(&mut Cursor::new(body))
             .map_err(|e| HandlerError::Protocol(format!("Failed to parse query_info: {}", e)))?;
 
+        debug!(
+            conn_id = self.connection.id,
+            info_type = ?request.info_type,
+            info_class = request.file_info_class,
+            output_buffer_length = request.output_buffer_length,
+            "QUERY_INFO: parsed request"
+        );
+
         // Validate credit charge for multi-credit operations (MS-SMB2 3.3.5.2.5)
         self.validate_credit_charge(header, request.output_buffer_length)?;
 
@@ -5442,7 +5532,12 @@ where
                     .await
                     .map_err(|e| HandlerError::Vfs(e.to_string()))?;
                 // Pass handle.file_offset for FileAllInformation (class 18) position field
-                build_file_info(&metadata, request.file_info_class, Some(handle.file_offset))
+                build_file_info(
+                    &metadata,
+                    request.file_info_class,
+                    Some(handle.file_offset),
+                    Some(handle.access_mask),
+                )
             }
             InfoType::FileSystem => {
                 // Get filesystem info
