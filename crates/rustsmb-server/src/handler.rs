@@ -2544,11 +2544,8 @@ where
 
         // Access mask constants
         const FILE_READ_DATA: u32 = 0x00000001;
-        const FILE_WRITE_DATA: u32 = 0x00000002;
         const DELETE: u32 = 0x00010000;
         const GENERIC_READ: u32 = 0x80000000;
-        const GENERIC_WRITE: u32 = 0x40000000;
-        const GENERIC_ALL: u32 = 0x10000000;
 
         // Share access constants
         const FILE_SHARE_READ: u32 = 0x01;
@@ -2570,6 +2567,7 @@ where
         // Helper to check if access implies write
         let wants_write = |access: u32| -> bool {
             (access & FILE_WRITE_DATA) != 0
+                || (access & FILE_APPEND_DATA) != 0
                 || (access & GENERIC_WRITE) != 0
                 || (access & GENERIC_ALL) != 0
         };
@@ -2672,7 +2670,7 @@ where
             if existing.session_id == 0 {
                 // Step 1: Check for HANDLE_CACHING (oplock break requirement)
                 const SMB2_OPLOCK_LEVEL_BATCH: u8 = 0x09;
-                const SMB2_LEASE_HANDLE_CACHING: u32 = 0x02;
+                const SMB2_LEASE_HANDLE_CACHING: u32 = 0x04;
 
                 let has_handle_caching = if existing.oplock_level == SMB2_OPLOCK_LEVEL_BATCH {
                     true
@@ -2699,6 +2697,18 @@ where
                         oplock_level = existing.oplock_level,
                         "Invalidating disconnected durable handle (can't send oplock break)"
                     );
+
+                    // If DELETE_ON_CLOSE was set, delete the file when invalidating the handle.
+                    if existing.delete_on_close {
+                        if let Err(e) = backend.unlink(&existing.path).await {
+                            debug!(
+                                conn_id = self.connection.id,
+                                path = %existing.path,
+                                error = %e,
+                                "Failed to delete file for disconnected delete-on-close handle"
+                            );
+                        }
+                    }
 
                     // Delete lease if present
                     if let Some(ref lease_key_hex) = existing.lease_key {
@@ -2761,7 +2771,8 @@ where
         // - FILE_OPENED (1): An existing file was opened
         // - FILE_CREATED (2): A new file was created
         // - FILE_OVERWRITTEN (3): An existing file was overwritten
-        let file_existed = backend.stat(&filename).await.is_ok();
+        let existing_metadata = backend.stat(&filename).await.ok();
+        let file_existed = existing_metadata.is_some();
         debug!(
             conn_id = self.connection.id,
             file_existed,
@@ -2769,6 +2780,27 @@ where
             path = %filename,
             "CREATE: checking file existence for create_action"
         );
+
+        // Enforce read-only attribute for existing files when write access is requested.
+        // This must happen before backend.open to avoid mutating read-only files on
+        // backends that don't enforce permissions (e.g. memory backend).
+        const FILE_WRITE_DATA: u32 = 0x00000002;
+        const FILE_APPEND_DATA: u32 = 0x00000004;
+        const GENERIC_WRITE: u32 = 0x40000000;
+        const GENERIC_ALL: u32 = 0x10000000;
+        let wants_write_access = (request.desired_access
+            & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL))
+            != 0;
+        if file_existed
+            && wants_write_access
+            && request.create_disposition != rustsmb_vfs::disposition::CREATE
+        {
+            if let Some(meta) = existing_metadata.as_ref() {
+                if (meta.mode & 0o222) == 0 {
+                    return Err(HandlerError::Status(NtStatus::AccessDenied));
+                }
+            }
+        }
 
         // Pass SMB parameters directly to the backend - it handles the conversion
         let create_params = CreateParams {
@@ -2785,9 +2817,9 @@ where
             .map_err(|e| HandlerError::Status(NtStatus::from(&e)))?;
 
         // Check if opened file is a directory (for is_directory in HandleState)
-        let is_directory = backend
-            .stat(&filename)
-            .await
+        let opened_metadata = backend.stat(&filename).await.ok();
+        let is_directory = opened_metadata
+            .as_ref()
             .map(|m| m.file_type == rustsmb_vfs::FileType::Directory)
             .unwrap_or(false);
 
@@ -2877,7 +2909,7 @@ where
                     // Mark as durable request; actual grant depends on oplock/lease
                     // Per MS-SMB2 3.3.5.9.7, durable handles require:
                     // - Batch oplock (without lease), OR
-                    // - Lease with handle caching component (0x02)
+                    // - Lease with handle caching component (0x04)
                     // We check this after parsing all contexts
                     is_durable = true;
                     debug!(
@@ -2965,9 +2997,16 @@ where
             }
         }
 
+        // Round allocation size to 4KB blocks (common filesystem block size)
+        let allocation_size_hint = if requested_allocation_size > 0 && !is_directory {
+            ((requested_allocation_size + 4095) / 4096) * 4096
+        } else {
+            0
+        };
+
         // MS-SMB2 3.3.5.9.7: Check if durable handle can actually be granted
         // Without a lease: requires OplockLevel::Batch
-        // With a lease: requires handle caching component (0x02)
+        // With a lease: requires handle caching component (0x04)
         if is_durable && lease_key.is_none() && requested_oplock != OplockLevel::Batch {
             // Cannot grant durable handle without Batch oplock
             is_durable = false;
@@ -2976,7 +3015,7 @@ where
                 oplock_level = ?requested_oplock,
                 "Cannot grant durable handle: requires Batch oplock without lease"
             );
-        } else if is_durable && lease_key.is_some() && (lease_state & 0x02) == 0 {
+        } else if is_durable && lease_key.is_some() && (lease_state & 0x04) == 0 {
             // Cannot grant durable handle without handle caching in lease
             is_durable = false;
             debug!(
@@ -3018,6 +3057,7 @@ where
             last_access: now,
             create_guid: None, // Set below if durable
             file_offset: 0,
+            allocation_size: allocation_size_hint,
             share_name: tree.share_name.clone(),
             create_disposition: request.create_disposition,
             file_attributes: request.file_attributes,
@@ -3502,7 +3542,7 @@ where
                     } else {
                         FILE_ATTRIBUTE_ARCHIVE
                     };
-                    if (m.mode & 0o200) == 0 {
+                    if (m.mode & 0o222) == 0 {
                         attrs |= FILE_ATTRIBUTE_READONLY;
                     }
                     attrs
@@ -3519,33 +3559,33 @@ where
         };
 
         // Determine allocation_size for response
-        // If client requested allocation_size via context, use it (rounded up to 4KB block)
-        // Otherwise use actual file allocation or 0 for new files
+        // If client requested allocation_size via context, honor it (rounded up to 4KB block)
+        // Otherwise use actual file allocation (blocks * 512) or 0 for new files
         // Note: Directories should return 0 regardless of requested allocation size
         let is_directory = (response_file_attributes & 0x10) != 0; // FILE_ATTRIBUTE_DIRECTORY
+                                                                   // Get end_of_file (actual file size)
+        let response_end_of_file = file_metadata.as_ref().map(|m| m.size).unwrap_or(0);
+
         let response_allocation_size = if is_directory {
             // Directories always have 0 allocation size per MS-SMB2
             0
-        } else if requested_allocation_size > 0 {
-            // Round up to 4KB block boundary (common filesystem block size)
-            ((requested_allocation_size + 4095) / 4096) * 4096
+        } else if allocation_size_hint > 0 {
+            // Ensure allocation size is not smaller than EOF
+            std::cmp::max(allocation_size_hint, response_end_of_file)
         } else {
             file_metadata
                 .as_ref()
                 .map(|m| {
-                    // Allocation size is typically size rounded up to block size
-                    // For new/empty files, return 0
-                    if m.size > 0 {
-                        ((m.size + 4095) / 4096) * 4096
+                    // Allocation size is based on blocks (512-byte units per POSIX)
+                    let blocks_size = m.blocks.saturating_mul(512);
+                    if blocks_size == 0 {
+                        m.size
                     } else {
-                        0
+                        blocks_size
                     }
                 })
                 .unwrap_or(0)
         };
-
-        // Get end_of_file (actual file size)
-        let response_end_of_file = file_metadata.as_ref().map(|m| m.size).unwrap_or(0);
 
         let response = CreateResponse {
             structure_size: 89,
@@ -3643,8 +3683,69 @@ where
                 persistent_id, "Durable handle reconnect failed: handle expired"
             );
             // Clean up expired handle
-            let _ = self.session_manager.delete_handle(handle_id).await;
+            self.cleanup_rejected_durable_reconnect(handle_id, &handle)
+                .await;
             return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+        }
+
+        // For non-persistent handles, ensure the open still has HANDLE_CACHING.
+        // Durable handles are only valid when batch oplock or lease HANDLE_CACHING is present.
+        if !handle.is_persistent {
+            const SMB2_OPLOCK_LEVEL_BATCH: u8 = 0x09;
+            const SMB2_LEASE_HANDLE_CACHING: u32 = 0x04;
+
+            if let Some(ref lease_key_hex) = handle.lease_key {
+                match self
+                    .session_manager
+                    .state_store()
+                    .get_lease(lease_key_hex)
+                    .await
+                {
+                    Ok(Some(lease)) => {
+                        if (lease.lease_state & SMB2_LEASE_HANDLE_CACHING) == 0 {
+                            warn!(
+                                conn_id = self.connection.id,
+                                persistent_id,
+                                lease_state = lease.lease_state,
+                                "Durable handle reconnect failed: lease lacks HANDLE_CACHING"
+                            );
+                            self.cleanup_rejected_durable_reconnect(handle_id, &handle)
+                                .await;
+                            return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            conn_id = self.connection.id,
+                            persistent_id, "Durable handle reconnect failed: lease not found"
+                        );
+                        self.cleanup_rejected_durable_reconnect(handle_id, &handle)
+                            .await;
+                        return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+                    }
+                    Err(e) => {
+                        warn!(
+                            conn_id = self.connection.id,
+                            persistent_id,
+                            error = %e,
+                            "Durable handle reconnect failed: lease lookup error"
+                        );
+                        self.cleanup_rejected_durable_reconnect(handle_id, &handle)
+                            .await;
+                        return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+                    }
+                }
+            } else if handle.oplock_level != SMB2_OPLOCK_LEVEL_BATCH {
+                warn!(
+                    conn_id = self.connection.id,
+                    persistent_id,
+                    oplock_level = handle.oplock_level,
+                    "Durable handle reconnect failed: oplock no longer Batch"
+                );
+                self.cleanup_rejected_durable_reconnect(handle_id, &handle)
+                    .await;
+                return Err(HandlerError::Status(NtStatus::ObjectNameNotFound));
+            }
         }
 
         // Validate create GUID for V2 reconnect
@@ -3783,7 +3884,7 @@ where
             if file_metadata.file_type == rustsmb_vfs::FileType::Directory {
                 attrs |= 0x10; // FILE_ATTRIBUTE_DIRECTORY
             }
-            if (file_metadata.mode & 0o200) == 0 {
+            if (file_metadata.mode & 0o222) == 0 {
                 attrs |= 0x01; // FILE_ATTRIBUTE_READONLY
             }
             attrs
@@ -3876,7 +3977,16 @@ where
         let oplock_level = OplockLevel::from_u8(handle.oplock_level);
 
         // Compute allocation size from blocks (blocks are always 512-byte units on POSIX)
-        let allocation_size = file_metadata.blocks * 512;
+        let allocation_size = if handle.allocation_size > 0 {
+            std::cmp::max(handle.allocation_size, file_metadata.size)
+        } else {
+            let blocks_size = file_metadata.blocks.saturating_mul(512);
+            if blocks_size == 0 {
+                file_metadata.size
+            } else {
+                blocks_size
+            }
+        };
 
         let response = CreateResponse {
             structure_size: 89,
@@ -3903,6 +4013,62 @@ where
         }
 
         Ok(result)
+    }
+
+    async fn cleanup_rejected_durable_reconnect(&mut self, handle_id: u128, handle: &HandleState) {
+        // Delete lease if present
+        if let Some(lease_key) = &handle.lease_key {
+            self.lease_registry.unregister_lease(lease_key);
+            if let Err(e) = self
+                .session_manager
+                .state_store()
+                .delete_lease(lease_key)
+                .await
+            {
+                debug!(
+                    conn_id = self.connection.id,
+                    error = %e,
+                    lease_key = %lease_key,
+                    "Failed to delete lease on durable reconnect rejection"
+                );
+            }
+        }
+
+        // Unregister oplock if present (no lease = might have oplock)
+        if handle.lease_key.is_none() && handle.oplock_level != 0 {
+            self.lease_registry.unregister_oplock(handle_id);
+        }
+
+        // Release all locks held by this handle
+        if let Err(e) = self
+            .session_manager
+            .state_store()
+            .release_file_locks_for_handle(handle_id)
+            .await
+        {
+            debug!(
+                conn_id = self.connection.id,
+                error = %e,
+                handle_id = handle_id,
+                "Failed to release file locks on durable reconnect rejection"
+            );
+        }
+
+        // Handle delete-on-close: delete file if flag was set
+        if handle.delete_on_close {
+            if let Some(backend) = self.shares.get_share(&handle.share_name) {
+                if let Err(e) = backend.unlink(&handle.path).await {
+                    debug!(
+                        conn_id = self.connection.id,
+                        path = %handle.path,
+                        error = %e,
+                        "Failed to delete file for rejected delete-on-close handle"
+                    );
+                }
+            }
+        }
+
+        let _ = self.session_manager.delete_handle(handle_id).await;
     }
 
     async fn handle_close(
@@ -4203,6 +4369,24 @@ where
         // Validate tree_id matches (MS-SMB2 3.3.5.2.11)
         self.validate_handle_tree_id(header, &handle)?;
 
+        // Check write access per MS-SMB2 3.3.5.13
+        // Open must have FILE_WRITE_DATA or FILE_APPEND_DATA permission
+        // Also check GENERIC_WRITE and GENERIC_ALL as they imply FILE_WRITE_DATA
+        const FILE_WRITE_DATA: u32 = 0x0002;
+        const FILE_APPEND_DATA: u32 = 0x0004;
+        const GENERIC_WRITE: u32 = 0x40000000;
+        const GENERIC_ALL: u32 = 0x10000000;
+        if (handle.access_mask & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL))
+            == 0
+        {
+            debug!(
+                conn_id = self.connection.id,
+                access_mask = handle.access_mask,
+                "WRITE: Access denied - no FILE_WRITE_DATA or FILE_APPEND_DATA permission"
+            );
+            return Err(HandlerError::Status(NtStatus::AccessDenied));
+        }
+
         // Get tree and backend (use header.tree_id since we validated it matches)
         let tree = self
             .session_manager
@@ -4215,6 +4399,18 @@ where
             .shares
             .get_share(&tree.share_name)
             .ok_or(HandlerError::Status(NtStatus::BadNetworkName))?;
+
+        // Enforce read-only attribute: deny write if file has no write bits
+        if let Ok(metadata) = backend.stat(&handle.path).await {
+            if (metadata.mode & 0o222) == 0 {
+                debug!(
+                    conn_id = self.connection.id,
+                    path = %handle.path,
+                    "WRITE: Access denied - file is read-only"
+                );
+                return Err(HandlerError::Status(NtStatus::AccessDenied));
+            }
+        }
 
         // Build FileHandle from HandleState's backend_internal_id (no re-open needed)
         // The backend uses backend_internal_id to locate the file directly
@@ -5531,12 +5727,18 @@ where
                     .stat(&handle.path)
                     .await
                     .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+                let allocation_override = if handle.allocation_size > 0 {
+                    Some(handle.allocation_size)
+                } else {
+                    None
+                };
                 // Pass handle.file_offset for FileAllInformation (class 18) position field
                 build_file_info(
                     &metadata,
                     request.file_info_class,
                     Some(handle.file_offset),
                     Some(handle.access_mask),
+                    allocation_override,
                 )
             }
             InfoType::FileSystem => {
@@ -5895,6 +6097,17 @@ where
                     .await
                     .map_err(|e| HandlerError::Vfs(e.to_string()))?;
 
+                // Update allocation size hint to reflect new EOF
+                let mut updated_handle = handle.clone();
+                updated_handle.allocation_size = info.end_of_file;
+                if let Err(e) = self.session_manager.update_handle(updated_handle).await {
+                    debug!(
+                        error = %e,
+                        path = %handle.path,
+                        "Failed to update allocation_size after EOF change"
+                    );
+                }
+
                 debug!(
                     path = %handle.path,
                     size = info.end_of_file,
@@ -5909,17 +6122,36 @@ where
                 }
 
                 let allocation_size = u64::from_le_bytes(buffer[0..8].try_into().unwrap());
-
-                // For simplicity, treat allocation size as truncate
-                // Real implementations might use fallocate()
-                backend
-                    .truncate(&handle.path, allocation_size)
+                // If allocation size is smaller than EOF, truncate.
+                // If larger, keep EOF unchanged but record the allocation size hint.
+                let current_size = backend
+                    .stat(&handle.path)
                     .await
-                    .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+                    .map(|m| m.size)
+                    .unwrap_or(0);
+
+                if allocation_size < current_size {
+                    backend
+                        .truncate(&handle.path, allocation_size)
+                        .await
+                        .map_err(|e| HandlerError::Vfs(e.to_string()))?;
+                }
+
+                // Persist allocation size hint on the handle for reconnect/query-info responses
+                let mut updated_handle = handle.clone();
+                updated_handle.allocation_size = allocation_size;
+                if let Err(e) = self.session_manager.update_handle(updated_handle).await {
+                    debug!(
+                        error = %e,
+                        path = %handle.path,
+                        "Failed to update allocation_size on handle"
+                    );
+                }
 
                 debug!(
                     path = %handle.path,
                     size = allocation_size,
+                    current_size,
                     "SET_INFO: FileAllocationInformation"
                 );
             }
@@ -9334,7 +9566,7 @@ mod tests {
     #[test]
     fn test_durable_handle_oplock_requirement() {
         // Per MS-SMB2 3.3.5.9.7: Durable handles require Batch oplock or
-        // lease with handle caching (SMB2_LEASE_HANDLE_CACHING = 0x02)
+        // lease with handle caching (SMB2_LEASE_HANDLE_CACHING = 0x04)
         //
         // The server SHOULD grant a durable handle when:
         // 1. Client requests durable handle (DHnQ context)
@@ -9379,11 +9611,11 @@ mod tests {
     #[test]
     fn test_durable_handle_lease_requirement() {
         // Per MS-SMB2 3.3.5.9.7: Lease with HANDLE caching allows durable handles
-        // SMB2_LEASE_HANDLE_CACHING = 0x02
+        // SMB2_LEASE_HANDLE_CACHING = 0x04
 
         const LEASE_READ: u32 = 0x01;
-        const LEASE_HANDLE: u32 = 0x02;
-        const LEASE_WRITE: u32 = 0x04;
+        const LEASE_WRITE: u32 = 0x02;
+        const LEASE_HANDLE: u32 = 0x04;
 
         // Lease state with HANDLE caching allows durable handle
         let lease_rh = LEASE_READ | LEASE_HANDLE;
@@ -11809,7 +12041,7 @@ mod tests {
     //
     // HANDLE_CACHING can come from two sources:
     // 1. Batch oplock (oplock_level = 0x09)
-    // 2. Lease with SMB2_LEASE_HANDLE_CACHING bit (lease_state & 0x02)
+    // 2. Lease with SMB2_LEASE_HANDLE_CACHING bit (lease_state & 0x04)
     //
     // Both must be detected for proper disconnected handle handling.
     // -------------------------------------------------------------------------
@@ -11861,25 +12093,25 @@ mod tests {
     /// Test that lease with HANDLE_CACHING bit is detected
     #[test]
     fn test_lease_handle_caching_bit_detection() {
-        const SMB2_LEASE_HANDLE_CACHING: u32 = 0x02;
+        const SMB2_LEASE_HANDLE_CACHING: u32 = 0x04;
 
         // Lease state with READ + HANDLE_CACHING
-        let lease_state: u32 = 0x03; // READ (0x01) | HANDLE_CACHING (0x02)
+        let lease_state: u32 = 0x05; // READ (0x01) | HANDLE_CACHING (0x04)
         let has_handle_caching = (lease_state & SMB2_LEASE_HANDLE_CACHING) != 0;
 
         assert!(
             has_handle_caching,
-            "MS-SMB2 3.3.4.7: Lease with SMB2_LEASE_HANDLE_CACHING (0x02) has HANDLE_CACHING"
+            "MS-SMB2 3.3.4.7: Lease with SMB2_LEASE_HANDLE_CACHING (0x04) has HANDLE_CACHING"
         );
     }
 
     /// Test that lease with READ + WRITE (no HANDLE) is NOT HANDLE_CACHING
     #[test]
     fn test_lease_read_write_not_handle_caching() {
-        const SMB2_LEASE_HANDLE_CACHING: u32 = 0x02;
+        const SMB2_LEASE_HANDLE_CACHING: u32 = 0x04;
 
         // Lease state with READ + WRITE (no HANDLE_CACHING)
-        let lease_state: u32 = 0x05; // READ (0x01) | WRITE (0x04)
+        let lease_state: u32 = 0x03; // READ (0x01) | WRITE (0x02)
         let has_handle_caching = (lease_state & SMB2_LEASE_HANDLE_CACHING) != 0;
 
         assert!(
@@ -11891,10 +12123,10 @@ mod tests {
     /// Test that lease with all flags (RWH) is HANDLE_CACHING
     #[test]
     fn test_lease_rwh_is_handle_caching() {
-        const SMB2_LEASE_HANDLE_CACHING: u32 = 0x02;
+        const SMB2_LEASE_HANDLE_CACHING: u32 = 0x04;
 
         // Lease state with READ + WRITE + HANDLE_CACHING
-        let lease_state: u32 = 0x07; // READ (0x01) | HANDLE (0x02) | WRITE (0x04)
+        let lease_state: u32 = 0x07; // READ (0x01) | WRITE (0x02) | HANDLE (0x04)
         let has_handle_caching = (lease_state & SMB2_LEASE_HANDLE_CACHING) != 0;
 
         assert!(
@@ -12028,12 +12260,12 @@ mod tests {
     /// Test: Disconnected handle with lease HANDLE_CACHING should be deleted
     #[test]
     fn test_disconnected_lease_handle_caching_should_delete() {
-        const SMB2_LEASE_HANDLE_CACHING: u32 = 0x02;
+        const SMB2_LEASE_HANDLE_CACHING: u32 = 0x04;
         const SMB2_OPLOCK_LEVEL_LEASE: u8 = 0xFF;
 
         let session_id: u64 = 0; // Disconnected
         let oplock_level: u8 = SMB2_OPLOCK_LEVEL_LEASE;
-        let lease_state: u32 = 0x03; // READ | HANDLE_CACHING
+        let lease_state: u32 = 0x05; // READ | HANDLE_CACHING
 
         let is_disconnected = session_id == 0;
         let has_handle_caching_from_oplock = oplock_level == 0x09;

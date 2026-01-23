@@ -166,14 +166,27 @@ pub fn build_directory_info(entries: &[rustsmb_vfs::DirEntry]) -> Vec<u8> {
 /// - `info_class` - File information class being requested
 /// - `position` - Optional file position for FileAllInformation (class 18) and FilePositionInformation (class 14)
 /// - `access_mask` - Optional access mask for FileAccessInformation (class 8)
+/// - `allocation_size_override` - Optional allocation size hint (used for durable reconnect)
 pub fn build_file_info(
     metadata: &rustsmb_vfs::Metadata,
     info_class: u8,
     position: Option<u64>,
     access_mask: Option<u32>,
+    allocation_size_override: Option<u64>,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     let is_dir = metadata.file_type == FileType::Directory;
+    let allocation_size = allocation_size_override
+        .filter(|size| *size > 0)
+        .map(|size| std::cmp::max(size, metadata.size))
+        .unwrap_or_else(|| {
+            let blocks_size = metadata.blocks.saturating_mul(512);
+            if blocks_size == 0 {
+                metadata.size
+            } else {
+                blocks_size
+            }
+        });
 
     match info_class {
         // FileBasicInformation
@@ -188,7 +201,7 @@ pub fn build_file_info(
         }
         // FileStandardInformation
         5 => {
-            buf.extend_from_slice(&metadata.size.to_le_bytes()); // AllocationSize
+            buf.extend_from_slice(&allocation_size.to_le_bytes()); // AllocationSize
             buf.extend_from_slice(&metadata.size.to_le_bytes()); // EndOfFile
             buf.extend_from_slice(&1u32.to_le_bytes()); // NumberOfLinks
             buf.push(0); // DeletePending
@@ -207,7 +220,7 @@ pub fn build_file_info(
             buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved
 
             // FileStandardInformation (24 bytes)
-            buf.extend_from_slice(&metadata.size.to_le_bytes()); // AllocationSize
+            buf.extend_from_slice(&allocation_size.to_le_bytes()); // AllocationSize
             buf.extend_from_slice(&metadata.size.to_le_bytes()); // EndOfFile
             buf.extend_from_slice(&1u32.to_le_bytes()); // NumberOfLinks
             buf.push(0); // DeletePending
@@ -645,7 +658,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buf = build_file_info(&metadata, 4, None, None); // FileBasicInformation
+        let buf = build_file_info(&metadata, 4, None, None, None); // FileBasicInformation
 
         // Should have: 4 timestamps (8 bytes each) + FileAttributes (4) + Reserved (4) = 40 bytes
         assert_eq!(buf.len(), 40, "FileBasicInformation should be 40 bytes");
@@ -665,7 +678,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buf = build_file_info(&metadata, 4, None, None); // FileBasicInformation
+        let buf = build_file_info(&metadata, 4, None, None, None); // FileBasicInformation
 
         // Check attributes - directory should have 0x10
         let attrs = u32::from_le_bytes(buf[32..36].try_into().unwrap());
@@ -680,7 +693,7 @@ mod tests {
             ..Default::default()
         };
 
-        let buf = build_file_info(&metadata, 5, None, None); // FileStandardInformation
+        let buf = build_file_info(&metadata, 5, None, None, None); // FileStandardInformation
 
         // Should have: AllocationSize(8) + EndOfFile(8) + NumberOfLinks(4) +
         // DeletePending(1) + Directory(1) + Reserved(2) = 24 bytes
@@ -703,7 +716,7 @@ mod tests {
         };
 
         let position = 10u64;
-        let buf = build_file_info(&metadata, 18, Some(position), None); // FileAllInformation
+        let buf = build_file_info(&metadata, 18, Some(position), None, None); // FileAllInformation
 
         // FileAllInformation structure (per MS-FSCC 2.4.18):
         // - FileBasicInformation (40 bytes)

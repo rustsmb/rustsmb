@@ -317,10 +317,10 @@ impl LeaseState {
     pub const NONE: u32 = 0x00;
     /// Read caching.
     pub const READ_CACHING: u32 = 0x01;
-    /// Handle caching.
-    pub const HANDLE_CACHING: u32 = 0x02;
     /// Write caching.
-    pub const WRITE_CACHING: u32 = 0x04;
+    pub const WRITE_CACHING: u32 = 0x02;
+    /// Handle caching.
+    pub const HANDLE_CACHING: u32 = 0x04;
 
     /// Create new lease state.
     #[inline]

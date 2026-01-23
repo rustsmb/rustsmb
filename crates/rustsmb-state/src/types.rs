@@ -141,6 +141,11 @@ pub struct HandleState {
     #[serde(default)]
     pub file_offset: u64,
 
+    /// Allocation size hint in bytes (may be larger than end_of_file).
+    /// Used to preserve allocation size across durable reconnect.
+    #[serde(default)]
+    pub allocation_size: u64,
+
     /// Share name (for reopening file on reconnect).
     #[serde(default)]
     pub share_name: String,
@@ -219,6 +224,7 @@ impl Default for HandleState {
             last_access: now,
             create_guid: None,
             file_offset: 0,
+            allocation_size: 0,
             share_name: String::new(),
             create_disposition: 0,
             file_attributes: 0,

@@ -134,7 +134,7 @@ impl MemoryNode {
         Metadata {
             file_type: self.file_type(),
             size: self.size(),
-            blocks: self.size().div_ceil(4096),
+            blocks: self.size().div_ceil(512),
             block_size: 4096,
             mode: meta.mode,
             uid: meta.uid,
